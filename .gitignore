@@ -1,0 +1,27 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+compose.local.yml
+secrets/*.sops.yaml
+OpenFeedPlan.txt
+refImages.local/
+
+# Runtime and persistent service data
+data/
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local editor and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Local backups
+*.bak
+*.bak.*

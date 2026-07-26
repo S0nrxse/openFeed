@@ -1,0 +1,93 @@
+[database]
+# Compose supplies both stores through GORSE_CACHE_STORE and GORSE_DATA_STORE.
+cache_store = ""
+data_store = ""
+table_prefix = "gorse_"
+cache_table_prefix = "gorse_cache_"
+data_table_prefix = "gorse_data_"
+
+[database.postgres]
+max_open_conns = 16
+max_idle_conns = 16
+conn_max_lifetime = "1m"
+
+[master]
+host = "0.0.0.0"
+port = 8086
+http_host = "0.0.0.0"
+http_port = 8088
+http_cors_domains = []
+http_cors_methods = []
+n_jobs = 1
+meta_timeout = "10s"
+dashboard_user_name = ""
+dashboard_password = ""
+admin_api_key = ""
+
+[server]
+default_n = 30
+api_key = ""
+auto_insert_user = true
+auto_insert_item = true
+cache_expire = "10s"
+
+[recommend]
+cache_size = 1000
+cache_expire = "72h"
+context_size = 100
+active_user_ttl = 0
+
+[recommend.search]
+columns = ["item.Comment"]
+
+[recommend.data_source]
+positive_feedback_types = ["like", "subscribe", "save", "follow_topic", "complete", "rewatch", "watch>=0.65"]
+read_feedback_types = ["impression", "click", "watch", "watch_progress"]
+negative_feedback_types = ["dislike", "not_interested", "hide", "mute_topic", "block_channel"]
+positive_feedback_ttl = 0
+item_ttl = 0
+
+[[recommend.item-to-item]]
+name = "neighbors"
+type = "users"
+column = ""
+
+[[recommend.user-to-user]]
+name = "neighbors"
+type = "items"
+
+[recommend.collaborative]
+type = "mf"
+fit_period = "60m"
+fit_epoch = 100
+optimize_period = "0"
+optimize_trials = 10
+
+[recommend.collaborative.early_stopping]
+patience = 10
+
+[recommend.replacement]
+enable_replacement = false
+positive_replacement_decay = 0.8
+read_replacement_decay = 0.6
+
+[recommend.ranker]
+type = "fm"
+cache_expire = "120h"
+recommenders = ["latest", "collaborative", "item-to-item/neighbors", "user-to-user/neighbors"]
+fit_period = "60m"
+fit_epoch = 100
+optimize_period = "0"
+optimize_trials = 10
+
+[recommend.ranker.early_stopping]
+patience = 10
+
+[recommend.fallback]
+recommenders = ["latest"]
+
+[blob]
+uri = "/var/lib/gorse/blob"
+
+[tracing]
+enable_tracing = false
