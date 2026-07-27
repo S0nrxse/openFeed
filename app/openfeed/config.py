@@ -62,14 +62,16 @@ class Settings:
     secret_key: str = _env(lambda: _str_env("OPENFEED_SECRET_KEY"))
     database_url: str = _env(lambda: _str_env("DATABASE_URL"))
     redis_url: str = _env(lambda: _str_env("REDIS_URL", "redis://openfeed-redis:6379/0"))
-    gorse_base_url: str = _env(lambda: _str_env("GORSE_BASE_URL", "http://openfeed-gorse:8088", strip_slash=True))
-    gorse_server_api_key: str = _env(lambda: _str_env("GORSE_SERVER_API_KEY"))
     freshrss_base_url: str = _env(lambda: _str_env("FRESHRSS_BASE_URL", "http://freshrss", strip_slash=True))
     freshrss_username: str = _env(lambda: _str_env("FRESHRSS_USERNAME"))
     freshrss_api_password: str = _env(lambda: _str_env("FRESHRSS_API_PASSWORD"))
     freshrss_reading_list_limit: int = _env(lambda: _int_env("FRESHRSS_READING_LIST_LIMIT", 250))
     sync_interval_seconds: int = _env(lambda: _int_env("SYNC_INTERVAL_SECONDS", 1800))
-    enrich_after_sync_limit: int = _env(lambda: _int_env("ENRICH_AFTER_SYNC_LIMIT", 5))
+    # Discovered videos arrive with almost no metadata — no tags, usually no publish
+    # date — and topic-based ranking cannot see a video whose topics were never
+    # fetched. At 5 per sync the backlog grew faster than it drained, which is why the
+    # feed kept falling back on the handful of well-described subscription channels.
+    enrich_after_sync_limit: int = _env(lambda: _int_env("ENRICH_AFTER_SYNC_LIMIT", 40))
     enrichment_timeout_seconds: int = _env(lambda: _int_env("ENRICHMENT_TIMEOUT_SECONDS", 12))
     invidious_base_url: str = _env(lambda: _str_env("INVIDIOUS_BASE_URL", "http://openfeed-invidious:3000", strip_slash=True))
     invidious_public_url: str = _env(lambda: _str_env("INVIDIOUS_PUBLIC_URL", "http://localhost:8061", strip_slash=True))
@@ -78,6 +80,43 @@ class Settings:
     playback_fallback: str = _env(lambda: _str_env("OPENFEED_PLAYBACK_FALLBACK", "youtube", lower=True))
     invidious_fallback_urls: str = _env(lambda: _str_env("OPENFEED_INVIDIOUS_FALLBACKS"))
     playback_probe_timeout_seconds: float = _env(lambda: float(_int_env("OPENFEED_PLAYBACK_PROBE_TIMEOUT", 4)))
+    # yt-dlp fallback media backend. Invidious stays primary for browsing, search,
+    # channels, comments, recommendations and normal playback; yt-dlp is reached for only
+    # when Invidious cannot produce a usable stream, or when a download needs a rendition
+    # that YouTube only publishes as separate video and audio tracks.
+    ytdlp_enabled: bool = _env(lambda: _bool_env("OPENFEED_YTDLP_ENABLED", True))
+    ytdlp_binary: str = _env(lambda: _str_env("OPENFEED_YTDLP_BINARY", "yt-dlp"))
+    ytdlp_timeout_seconds: int = _env(lambda: _int_env("OPENFEED_YTDLP_TIMEOUT", 90))
+    # Extracted URLs are signed and short-lived. This cache exists only so one page load
+    # cannot spawn several extractions — never to hold a URL long enough to expire.
+    ytdlp_cache_seconds: int = _env(lambda: _int_env("OPENFEED_YTDLP_CACHE_SECONDS", 240))
+    # Path to a Netscape cookies file, if YouTube demands sign-in for some videos. Supply
+    # the file yourself; its contents are a credential and are never logged.
+    ytdlp_cookies_file: str = _env(lambda: _str_env("OPENFEED_YTDLP_COOKIES_FILE"))
+    # Escape hatch for the extractor flags that YouTube breakage usually needs, e.g.
+    # --extractor-args youtube:player_client=web_safari
+    ytdlp_extra_args: str = _env(lambda: _str_env("OPENFEED_YTDLP_EXTRA_ARGS"))
+    ytdlp_playback_fallback: bool = _env(lambda: _bool_env("OPENFEED_YTDLP_PLAYBACK", True))
+    # A real folder, not a temp dir: downloads kept on the server are a library and
+    # have to survive a container restart. Bind-mounted in compose.
+    download_dir: str = _env(lambda: _str_env("OPENFEED_DOWNLOAD_DIR", "/data/downloads"))
+    download_retention_seconds: int = _env(lambda: _int_env("OPENFEED_DOWNLOAD_RETENTION", 21600))
+    download_max_concurrent: int = _env(lambda: _int_env("OPENFEED_DOWNLOAD_CONCURRENCY", 2))
+    download_max_height: int = _env(lambda: _int_env("OPENFEED_DOWNLOAD_MAX_HEIGHT", 2160))
+    # Return YouTube Dislike. This is the deployment-level switch; each user still has to
+    # opt in individually in Settings, and both must be true before anything is fetched.
+    # Set false to make the feature unavailable no matter what a user turns on.
+    ryd_enabled: bool = _env(lambda: _bool_env("OPENFEED_RYD_ENABLED", True))
+    ryd_batch_size: int = _env(lambda: _int_env("OPENFEED_RYD_BATCH_SIZE", 40))
+    # SponsorBlock. Deployment-level switch; each user still opts in separately, and both
+    # must be true before a single request leaves the server.
+    sponsorblock_enabled: bool = _env(lambda: _bool_env("OPENFEED_SPONSORBLOCK_ENABLED", True))
+    # Segments rarely change, so this can be long — but not unbounded, because a segment
+    # can be corrected or removed by the community after we cached it.
+    sponsorblock_cache_seconds: int = _env(lambda: _int_env("OPENFEED_SPONSORBLOCK_CACHE_SECONDS", 21600))
+    # Community posts. Cached because a channel page and both feeds all read them, and a
+    # channel posts a few times a week at most.
+    posts_cache_seconds: int = _env(lambda: _int_env("OPENFEED_POSTS_CACHE_SECONDS", 1800))
     discover_after_sync_limit: int = _env(lambda: _int_env("DISCOVER_AFTER_SYNC_LIMIT", 3))
     discover_related_per_video: int = _env(lambda: _int_env("DISCOVER_RELATED_PER_VIDEO", 6))
     auth_mode: str = _env(lambda: _str_env("OPENFEED_AUTH_MODE", "disabled", lower=True))

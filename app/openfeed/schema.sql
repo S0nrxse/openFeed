@@ -185,6 +185,35 @@ ALTER TABLE videos ADD COLUMN IF NOT EXISTS duration_seconds INTEGER;
 ALTER TABLE videos ADD COLUMN IF NOT EXISTS view_count BIGINT;
 ALTER TABLE videos ADD COLUMN IF NOT EXISTS like_count BIGINT;
 ALTER TABLE videos ADD COLUMN IF NOT EXISTS dislike_count BIGINT;
+-- Where a dislike count came from. YouTube stopped publishing them in 2021, so anything
+-- present is either historical metadata or an estimate fetched from Return YouTube
+-- Dislike; the UI has to be able to say which.
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS dislike_source TEXT;
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS dislike_fetched_at TIMESTAMPTZ;
+
+-- Total seconds actually watched, accumulated across every session. furthest_seconds
+-- only records the deepest point reached in one sitting, so it cannot tell a video
+-- watched twice from one watched once — which is exactly what ranking needs to know.
+ALTER TABLE playback_progress ADD COLUMN IF NOT EXISTS total_watch_seconds DOUBLE PRECISION NOT NULL DEFAULT 0;
+-- Where to pick the video back up. Deliberately separate from current_seconds, which for
+-- a cross-origin player is only ever dwell time on the page: resuming at a made-up
+-- position is worse than not resuming, so only a real reading from the player lands here.
+ALTER TABLE playback_progress ADD COLUMN IF NOT EXISTS resume_seconds DOUBLE PRECISION;
+
+-- Comment votes are local only. Invidious reads comments; it cannot cast a vote on
+-- YouTube, so these never leave this database. They exist to keep the button state after
+-- a reload and to feed the recommender a small hint about the video.
+CREATE TABLE IF NOT EXISTS user_comment_feedback (
+  user_key TEXT NOT NULL DEFAULT 'local',
+  youtube_video_id TEXT NOT NULL,
+  comment_id TEXT NOT NULL,
+  reaction TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_key, comment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_comment_feedback_video ON user_comment_feedback (user_key, youtube_video_id);
+CREATE INDEX IF NOT EXISTS idx_playback_progress_user_watched ON playback_progress (user_key, last_watched_at DESC);
 ALTER TABLE videos ADD COLUMN IF NOT EXISTS captions_status TEXT;
 ALTER TABLE videos ADD COLUMN IF NOT EXISTS metadata_source TEXT;
 ALTER TABLE videos ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
@@ -316,6 +345,131 @@ CREATE TABLE IF NOT EXISTS gorse_sync_state (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (entity_type, entity_id)
 );
+
+-- Per-channel notification level: 'all', 'personalized', or 'none'. A channel with no
+-- row here is treated as 'all', so subscribing keeps behaving the way it always has and
+-- only an explicit choice narrows what reaches the bell.
+CREATE TABLE IF NOT EXISTS channel_notifications (
+  user_key TEXT NOT NULL DEFAULT 'local',
+  youtube_channel_id TEXT NOT NULL,
+  level TEXT NOT NULL DEFAULT 'all',
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_key, youtube_channel_id)
+);
+
+-- Videos kept on the server after a download. Separate from the transient files a
+-- browser download produces: those are swept on a timer, these are a library and stay
+-- until the user removes them.
+CREATE TABLE IF NOT EXISTS downloads (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_key TEXT NOT NULL DEFAULT 'local',
+  youtube_video_id TEXT NOT NULL,
+  video_id BIGINT REFERENCES videos(id) ON DELETE SET NULL,
+  title TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  path TEXT NOT NULL,
+  container TEXT,
+  height INTEGER,
+  quality TEXT,
+  size_bytes BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_key, youtube_video_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_downloads_user_created ON downloads (user_key, created_at DESC);
+
+-- Bearer tokens for programmatic access. Only a hash is stored: the plaintext is shown
+-- once at creation and is unrecoverable afterwards, so a database copy cannot be replayed
+-- against the API. The prefix is kept in clear purely so a lookup does not have to hash
+-- every row on every request.
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_key TEXT NOT NULL DEFAULT 'local',
+  name TEXT NOT NULL,
+  token_prefix TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  read_only BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at TIMESTAMPTZ,
+  revoked_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_tokens_prefix ON api_tokens (token_prefix);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens (user_key, created_at DESC);
+
+-- Signal imported from a Google Takeout export. Kept in its own tables rather than
+-- merged into playback_progress: those rows are keyed to videos this install actually
+-- has, while a Takeout history is mostly videos it has never heard of, and an import
+-- has to be reversible in one statement when somebody changes their mind.
+CREATE TABLE IF NOT EXISTS takeout_channel_affinity (
+  user_key TEXT NOT NULL DEFAULT 'local',
+  youtube_channel_id TEXT NOT NULL,
+  title TEXT,
+  watch_count INTEGER NOT NULL DEFAULT 0,
+  last_watched_at TIMESTAMPTZ,
+  imported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_key, youtube_channel_id)
+);
+
+CREATE TABLE IF NOT EXISTS takeout_watched_videos (
+  user_key TEXT NOT NULL DEFAULT 'local',
+  youtube_video_id TEXT NOT NULL,
+  youtube_channel_id TEXT,
+  watched_at TIMESTAMPTZ,
+  imported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_key, youtube_video_id)
+);
+
+CREATE TABLE IF NOT EXISTS takeout_imports (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_key TEXT NOT NULL DEFAULT 'local',
+  summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_takeout_affinity_count ON takeout_channel_affinity (user_key, watch_count DESC);
+CREATE INDEX IF NOT EXISTS idx_takeout_imports_user ON takeout_imports (user_key, created_at DESC);
+
+-- TF-IDF vector of a video's subject, computed at enrichment time. Stored because
+-- deriving it per request would mean loading every description on every page render.
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS topic_vector JSONB;
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS topic_vector_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_videos_topic_vector_missing ON videos (id) WHERE topic_vector IS NULL;
+
+-- Channels found in a Takeout archive's subscriptions.csv. Stored rather than acted on
+-- immediately: subscribing writes to FreshRSS, and silently creating several hundred
+-- feeds because somebody uploaded a file is not a decision this app should make alone.
+CREATE TABLE IF NOT EXISTS takeout_subscriptions (
+  user_key TEXT NOT NULL DEFAULT 'local',
+  youtube_channel_id TEXT NOT NULL,
+  title TEXT,
+  channel_url TEXT,
+  imported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  subscribed_at TIMESTAMPTZ,
+  PRIMARY KEY (user_key, youtube_channel_id)
+);
+
+-- A channel deleted on YouTube can never be subscribed to. Recording that stops it
+-- being retried on every pass and lets the UI say so instead of showing a button that
+-- silently does nothing.
+ALTER TABLE takeout_subscriptions ADD COLUMN IF NOT EXISTS failed_at TIMESTAMPTZ;
+ALTER TABLE takeout_subscriptions ADD COLUMN IF NOT EXISTS failure_reason TEXT;
+
+-- Poll votes cast in OpenFeed. Local only, and deliberately so: YouTube publishes no
+-- per-option counts and accepts no votes without an authenticated account, so these can
+-- never be sent anywhere. They exist to remember what the user picked.
+CREATE TABLE IF NOT EXISTS post_poll_votes (
+  user_key TEXT NOT NULL DEFAULT 'local',
+  post_id TEXT NOT NULL,
+  choice_index INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_key, post_id)
+);
+
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS handle TEXT;
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS verified BOOLEAN;
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS available_tabs TEXT[];
 
 CREATE INDEX IF NOT EXISTS idx_users_authentik_sub ON users (authentik_sub);
 CREATE INDEX IF NOT EXISTS idx_interactions_user_time ON interactions (user_id, occurred_at DESC);

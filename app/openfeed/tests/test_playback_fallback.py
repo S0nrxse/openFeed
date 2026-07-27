@@ -121,11 +121,17 @@ class PlaybackLadderTests(unittest.TestCase):
 
     tearDown = setUp
 
-    def _sources(self, video: str = "abc", *, response: _FakeResponse | None = None, **prefs: object):
+    def _sources(self, video: str = "abc", *, response: _FakeResponse | None = None, ytdlp: bool = False, **prefs: object):
+        """The ladder for one video.
+
+        yt-dlp is held off by default so these cases keep testing the Invidious/YouTube
+        ordering they were written for; YtdlpLadderTests covers the extra rung on its own.
+        """
         client = _FakeClient(response or _FakeResponse())
         with patch.object(db, "get_playback_preferences", return_value=_prefs(**prefs)):
             with patch.object(main, "_invidious_client", return_value=client):
-                return main._playback_sources(video)
+                with patch.object(main.ytdlp, "available", lambda: ytdlp):
+                    return main._playback_sources(video)
 
     def test_invidious_leads_when_it_can_serve_the_video(self) -> None:
         sources, _ = self._sources()
@@ -196,9 +202,10 @@ class SourceOrderingTests(unittest.TestCase):
 
     tearDown = setUp
 
-    def _all(self, **prefs: object):
+    def _all(self, ytdlp: bool = False, **prefs: object):
         with patch.object(db, "get_playback_preferences", return_value=_prefs(**prefs)):
-            return main._all_playback_sources()
+            with patch.object(main.ytdlp, "available", lambda: ytdlp):
+                return main._all_playback_sources()
 
     def test_disabled_sources_are_still_listed_so_they_can_be_switched_back_on(self) -> None:
         sources = self._all(disabled_sources=["youtube"])
@@ -207,7 +214,8 @@ class SourceOrderingTests(unittest.TestCase):
 
     def test_only_enabled_sources_reach_the_player(self) -> None:
         with patch.object(db, "get_playback_preferences", return_value=_prefs(disabled_sources=["youtube"])):
-            ids = [source["id"] for source in main._configured_playback_sources()]
+            with patch.object(main.ytdlp, "available", lambda: False):
+                ids = [source["id"] for source in main._configured_playback_sources()]
         self.assertNotIn("youtube", ids)
 
     def test_dragged_order_is_honoured(self) -> None:
@@ -225,5 +233,94 @@ class SourceOrderingTests(unittest.TestCase):
     def test_legacy_flags_migrate_into_the_disabled_list(self) -> None:
         preferences = db.normalize_playback_preferences({"youtube_fallback": False, "prefer_local": False})
         self.assertEqual(preferences["disabled_sources"], ["invidious", "youtube"])
+        # The legacy flags predate yt-dlp and say nothing about it, so this asserts the
+        # two sources they *do* cover are gone rather than that nothing is left.
         with patch.object(db, "get_playback_preferences", return_value=preferences):
-            self.assertEqual(main._configured_playback_sources(), [])
+            with patch.object(main.ytdlp, "available", lambda: False):
+                self.assertEqual(main._configured_playback_sources(), [])
+
+
+class YtdlpLadderTests(unittest.TestCase):
+    """The yt-dlp rung: present only when the binary is, and demotable like any other."""
+
+    def setUp(self) -> None:
+        _reset_playback_state()
+
+    tearDown = setUp
+
+    def _sources(self, *, response: _FakeResponse | None = None, **prefs: object):
+        client = _FakeClient(response or _FakeResponse())
+        with patch.object(db, "get_playback_preferences", return_value=_prefs(**prefs)):
+            with patch.object(main, "_invidious_client", return_value=client):
+                with patch.object(main.ytdlp, "available", lambda: True):
+                    return main._playback_sources("abc")
+
+    def test_it_is_absent_when_yt_dlp_is_not_installed(self) -> None:
+        client = _FakeClient(_FakeResponse())
+        with patch.object(db, "get_playback_preferences", return_value=_prefs()):
+            with patch.object(main, "_invidious_client", return_value=client):
+                with patch.object(main.ytdlp, "available", lambda: False):
+                    sources, _ = main._playback_sources("abc")
+        self.assertNotIn("ytdlp", [source["id"] for source in sources])
+
+    def test_invidious_still_leads_when_it_works(self) -> None:
+        sources, _ = self._sources()
+        self.assertEqual(sources[0]["id"], "invidious")
+
+    def test_it_sits_between_invidious_and_youtube(self) -> None:
+        # Extracting the stream ourselves keeps the viewer private, so it is tried before
+        # handing them to YouTube's own embed.
+        ids = [source["id"] for source in self._sources()[0]]
+        self.assertLess(ids.index("ytdlp"), ids.index("youtube"))
+
+    def test_it_leads_once_invidious_cannot_serve_the_video(self) -> None:
+        ids = [source["id"] for source in self._sources(response=_FakeResponse(404, "nope"))[0]]
+        self.assertEqual(ids[0], "ytdlp")
+        self.assertEqual(ids[-1], "invidious")
+
+    def test_it_can_be_switched_off_like_any_other_source(self) -> None:
+        ids = [source["id"] for source in self._sources(disabled_sources=["ytdlp"])[0]]
+        self.assertNotIn("ytdlp", ids)
+
+    def test_it_points_at_our_own_player_and_is_same_origin(self) -> None:
+        source = next(item for item in self._sources()[0] if item["id"] == "ytdlp")
+        self.assertTrue(source["url"].startswith("/watch/abc/ytdlp"))
+        self.assertEqual(source["same_origin"], "1")
+
+    def test_a_cooled_down_ytdlp_sinks_but_is_not_dropped(self) -> None:
+        main.mark_source_result("ytdlp", False)
+        ids = [source["id"] for source in self._sources()[0]]
+        self.assertIn("ytdlp", ids)
+        self.assertGreater(ids.index("ytdlp"), ids.index("youtube"))
+
+
+class DownloadedSourceTests(unittest.TestCase):
+    """A file on disk leads the ladder, and only exists for videos that have one."""
+
+    def setUp(self) -> None:
+        _reset_playback_state()
+
+    tearDown = setUp
+
+    def _sources(self, downloaded: bool, **prefs: object):
+        client = _FakeClient(_FakeResponse())
+        with patch.object(db, "get_playback_preferences", return_value=_prefs(**prefs)):
+            with patch.object(main, "_invidious_client", return_value=client):
+                with patch.object(main.ytdlp, "available", lambda: True):
+                    return main._playback_sources("abc", downloaded=downloaded)[0]
+
+    def test_it_is_absent_when_nothing_was_downloaded(self) -> None:
+        self.assertNotIn("downloaded", [s["id"] for s in self._sources(False)])
+
+    def test_it_leads_when_a_file_exists(self) -> None:
+        self.assertEqual(self._sources(True)[0]["id"], "downloaded")
+
+    def test_a_saved_source_order_cannot_bury_it(self) -> None:
+        # It is not a source anyone ever ranked, so it would otherwise sort to the end.
+        ids = [s["id"] for s in self._sources(True, source_order=["youtube", "invidious", "ytdlp"])]
+        self.assertEqual(ids[0], "downloaded")
+
+    def test_it_points_at_the_local_player_and_is_same_origin(self) -> None:
+        source = self._sources(True)[0]
+        self.assertTrue(source["url"].startswith("/watch/abc/local"))
+        self.assertEqual(source["same_origin"], "1")
