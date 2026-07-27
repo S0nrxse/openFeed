@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 from urllib.parse import quote
 
@@ -34,11 +35,17 @@ def _normalize_invidious(data: dict[str, Any]) -> dict[str, Any]:
         "summary": data.get("description"),
         "description": data.get("description"),
         "duration_seconds": data.get("lengthSeconds"),
+        # Only videos that arrived through the RSS feed carry a publish date; discovered
+        # ones have none, which left most of the library with no age to show. Invidious
+        # reports it as unix seconds, so this is where the gap gets filled.
+        "published_at": data.get("published"),
         "view_count": data.get("viewCount"),
         "like_count": data.get("likeCount"),
-        # YouTube stopped publishing dislikes in 2021, so this is almost always 0 or
-        # missing. Stored anyway so the UI can show it whenever a source does report one.
-        "dislike_count": data.get("dislikeCount"),
+        # YouTube stopped publishing dislikes in 2021 and now returns 0 for everything,
+        # so a zero here means "not published", not "nobody disliked it". Storing that 0
+        # made the video look like it already had a count: it rendered as no count at all
+        # and, worse, excluded the video from the RYD backfill permanently.
+        "dislike_count": data.get("dislikeCount") or None,
         "allow_ratings": data.get("allowRatings"),
         "captions_status": "available" if captions else "unknown",
         "raw": data,
@@ -144,7 +151,24 @@ def fetch_channel_metadata(youtube_channel_id: str) -> dict[str, Any]:
         # Prefer YouTube's full-width desktop crop (2560x423) so it stays sharp on wide screens.
         "banner_url": _proxied_ggpht(_pick_image(data.get("authorBanners"), 2560)),
         "subscriber_count": data.get("subCount"),
+        "description": data.get("description"),
+        # Invidious exposes no channelHandle field, so this is derived from authorUrl when
+        # YouTube happens to have given the handle form. Absent for most channels.
+        "handle": _handle_from(data.get("authorUrl")),
+        "verified": bool(data.get("authorVerified")),
+        # Which tabs the channel actually has, so we do not offer an empty Shorts tab.
+        "available_tabs": [str(tab) for tab in (data.get("tabs") or []) if str(tab).strip()],
     }
+
+
+def _handle_from(author_url: Any) -> str | None:
+    text = str(author_url or "")
+    marker = "/@"
+    index = text.find(marker)
+    if index == -1:
+        return None
+    handle = text[index + 1:].split("/")[0].strip()
+    return handle or None
 
 
 def enrich_channel(youtube_channel_id: str) -> dict[str, Any]:
@@ -185,3 +209,72 @@ def enrich_recent_videos(limit: int = 5) -> dict[str, Any]:
         "error_count": sum(1 for item in results if not item.get("ok")),
         "items": results,
     }
+
+
+# Channel art is fetched one channel at a time from Invidious, so a bulk subscribe has to
+# be paced or it turns into a burst of a hundred requests. These bounds keep a background
+# top-up polite; the worker calls it repeatedly rather than asking for everything at once.
+CHANNEL_MEDIA_BATCH = 12
+CHANNEL_MEDIA_GAP_SECONDS = 0.35
+
+_subscription_art_lock = threading.Lock()
+
+
+def backfill_subscription_art(max_channels: int = 400) -> dict[str, Any]:
+    """Fill in avatars for every subscribed channel that has none, in one pass.
+
+    `enrich_channels_paced` tops up twelve channels per worker cycle across the whole
+    library. With ten discovered channels for every subscribed one that took most of a day
+    to reach the sidebar, which is why a freshly imported subscription list stayed blank.
+    This walks only the subscribed ones and keeps going until they are done.
+
+    Guarded by a lock rather than a queue: two concurrent passes would fetch the same
+    channels twice, and there is nothing here worth a job system.
+    """
+    import time as _time
+
+    if not _subscription_art_lock.acquire(blocking=False):
+        return {"ok": True, "skipped": "already running", "updated": 0}
+    try:
+        updated = 0
+        attempted = 0
+        while attempted < max_channels:
+            batch = db.list_subscription_channels_needing_media(CHANNEL_MEDIA_BATCH)
+            if not batch:
+                break
+            for index, item in enumerate(batch):
+                if index or attempted:
+                    _time.sleep(CHANNEL_MEDIA_GAP_SECONDS)
+                attempted += 1
+                result = enrich_channel(item["youtube_channel_id"])
+                updated += 1 if result.get("ok") else 0
+            if len(batch) < CHANNEL_MEDIA_BATCH:
+                break
+            # A channel Invidious cannot resolve keeps coming back in the next batch, so
+            # stop once a full pass changed nothing rather than looping on it forever.
+            if not updated:
+                break
+        remaining = db.count_subscription_channels_missing_media()
+        logger.info("subscription art backfill: attempted=%s updated=%s remaining=%s", attempted, updated, remaining)
+        return {"ok": True, "attempted": attempted, "updated": updated, "remaining": remaining}
+    finally:
+        _subscription_art_lock.release()
+
+
+def enrich_channels_paced(limit: int = CHANNEL_MEDIA_BATCH, refresh: bool = False) -> dict[str, Any]:
+    """Fill in avatars and banners for channels that have none, slowly.
+
+    Subscribing to 70 channels at once leaves 70 blank avatars, which is what makes an
+    imported subscription list look broken. This fixes that without hammering Invidious:
+    a small batch, spaced out, resumable on the next pass.
+    """
+    import time as _time
+
+    candidates = db.list_channels_needing_media(max(1, min(limit, 40)), refresh)
+    ok = 0
+    for index, item in enumerate(candidates):
+        if index:
+            _time.sleep(CHANNEL_MEDIA_GAP_SECONDS)
+        result = enrich_channel(item["youtube_channel_id"])
+        ok += 1 if result.get("ok") else 0
+    return {"ok": True, "candidates": len(candidates), "updated": ok, "remaining_hint": len(candidates) == limit}

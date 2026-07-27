@@ -3,3 +3,8 @@ uvicorn[standard]>=0.32,<1.0
 httpx>=0.28,<1.0
 psycopg[binary]>=3.2,<4.0
 redis>=5.2,<7.0
+# Multipart form parsing, for the Takeout archive upload.
+python-multipart>=0.0.9
+# Deliberately unpinned at the top: yt-dlp breaks whenever YouTube changes its player,
+# and the fix always ships as a new release. Pinning it would guarantee it goes stale.
+yt-dlp>=2024.12

@@ -16,32 +16,89 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from html import escape, unescape
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 import redis
 
-from . import __version__, db, gorse_client
+from . import __version__, db
 from .config import get_settings
 from .discovery import discover_related_videos
 from .freshrss import FreshRSSClient
-from .enrichment import enrich_channels, enrich_recent_videos, enrich_video
-from .playback import PlaybackError, playback_for_video
+from .enrichment import (
+    backfill_subscription_art,
+    enrich_channel,
+    enrich_channels,
+    enrich_channels_paced,
+    enrich_recent_videos,
+    enrich_video,
+)
+from . import discovery, downloads, ryd, takeout, tokens, ytdlp
+from .playback import PlaybackError, download_options, playback_for_video
 from .sync import sync_freshrss_once
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    # Subscribed channels with no avatar render as blank circles in the sidebar, and the
+    # worker's slow top-up takes most of a day to reach them. Kicked here, on a thread, so
+    # a restart is enough to fix a list that came in from an import.
+    try:
+        if db.count_subscription_channels_missing_media():
+            threading.Thread(target=backfill_subscription_art, name="subscription-art", daemon=True).start()
+    except Exception as exc:  # noqa: BLE001 - never block startup on cosmetics
+        logger.info("subscription art backfill not started: %s", exc)
     yield
 
 
-app = FastAPI(title="OpenFeed", version=__version__, lifespan=lifespan)
+API_DESCRIPTION = """
+The full OpenFeed API. Everything the web interface can do is reachable here.
+
+## Authenticating
+
+Browser sessions work as you would expect. For anything else — a script, a cron job,
+another service — create a bearer token in Settings or via `POST /api/tokens`, then send
+it as `Authorization: Bearer ofd_...`. The plaintext is shown once and stored only as a
+hash, so it cannot be recovered afterwards; revoke and mint a new one instead.
+
+A token may be marked **read-only**, in which case it is refused any method other than
+GET/HEAD/OPTIONS. Token management itself always requires a signed-in session, so a
+leaked token cannot renew itself.
+
+## Conventions
+
+* Mutations answer `{"ok": true, ...}`; collections answer `{"items": [...]}`.
+* Errors use the matching HTTP status with a `detail` string.
+* `GET /api/` lists the capability groups; `/docs` and `/openapi.json` describe every route.
+"""
+
+API_TAGS = [
+    {"name": "feed", "description": "Home feed, recommendations, shorts and search."},
+    {"name": "videos", "description": "Individual videos, transcripts and metadata."},
+    {"name": "playback", "description": "Playback sources, progress and diagnostics."},
+    {"name": "downloads", "description": "Download jobs and the on-server download library."},
+    {"name": "subscriptions", "description": "Channels, subscriptions and collections."},
+    {"name": "playlists", "description": "Playlists and their contents."},
+    {"name": "preferences", "description": "Feed and playback preferences."},
+    {"name": "metadata", "description": "Enrichment, discovery and dislike estimates."},
+    {"name": "tokens", "description": "API tokens. Session-only, by design."},
+    {"name": "system", "description": "Status, sync and health."},
+]
+
+app = FastAPI(
+    title="OpenFeed",
+    version=__version__,
+    description=API_DESCRIPTION,
+    openapi_tags=API_TAGS,
+    lifespan=lifespan,
+)
 
 logger = logging.getLogger("openfeed.web")
 
@@ -136,7 +193,47 @@ def _session_from_request(request: Request) -> dict[str, Any] | None:
     return session
 
 
+def _user_from_token(request: Request | None) -> dict[str, Any] | None:
+    """Resolve an Authorization bearer token to a user, or None if there isn't a valid one.
+
+    Checked before the session cookie so a script can authenticate without one. A revoked
+    or unknown token simply falls through to the normal session path rather than erroring,
+    which keeps a stale token from locking a browser out of the UI.
+    """
+    if request is None:
+        return None
+    presented = tokens.bearer_from_header(request.headers.get("authorization"))
+    prefix = tokens.split(presented)
+    if not prefix:
+        return None
+    try:
+        record = db.find_api_token(prefix)
+    except Exception:
+        return None
+    if not record or not tokens.matches(presented, record.get("token_hash", "")):
+        return None
+    try:
+        db.touch_api_token(record["id"])
+    except Exception:
+        pass
+    user_key = str(record.get("user_key") or "local")
+    return {
+        "authenticated": True,
+        "user_key": user_key,
+        "sub": user_key,
+        "email": "",
+        "display_name": f"API token: {record.get('name') or 'unnamed'}",
+        "username": "api-token",
+        "groups": [],
+        "via_token": True,
+        "token_read_only": bool(record.get("read_only")),
+    }
+
+
 def _current_user(request: Request | None) -> dict[str, Any]:
+    token_user = _user_from_token(request)
+    if token_user:
+        return token_user
     session = _session_from_request(request) if request is not None else None
     if session:
         email = str(session.get("email") or "").strip().lower()
@@ -212,6 +309,21 @@ async def enforce_api_access(request: Request, call_next):
         if wants_json:
             return JSONResponse({"detail": "openfeed_access_denied"}, status_code=status.HTTP_403_FORBIDDEN)
         return _access_denied_response()
+
+    # A read-only token is enforced here rather than per-route, so a route added later
+    # cannot quietly become writable to a token that was never meant to change anything.
+    if user.get("token_read_only") and request.method not in {"GET", "HEAD", "OPTIONS"}:
+        return JSONResponse(
+            {"detail": "read_only_token", "message": "This API token may only perform read requests."},
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+    # Minting or revoking credentials with a credential would let a leaked token renew
+    # itself indefinitely. Token management stays a signed-in-browser operation.
+    if user.get("via_token") and path.startswith("/api/tokens"):
+        return JSONResponse(
+            {"detail": "session_required", "message": "API tokens can only be managed from a signed-in session."},
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
     if path.startswith("/admin/") and not _user_is_admin(user):
         return _access_denied_response()
     if path in {"/api/status/full", "/api/sync/runs"} and not _user_is_admin(user):
@@ -346,6 +458,33 @@ def _text_excerpt(value: str, limit: int = 700) -> str:
     return text[:limit].rsplit(" ", 1)[0] + "..."
 
 
+def _description_text(value: str, limit: int = 12000) -> str:
+    """Strip markup from a description while keeping the lines the author wrote.
+
+    _text_excerpt collapses every run of whitespace into a single space. That is right for
+    a one-line card subtitle and destructive here: chapter lists, link blocks and credits
+    are structure somebody laid out deliberately, and they only survive if the newlines do.
+    """
+    text = unescape(value or "")
+    # Markup that *is* a line break has to become one before the tags are stripped,
+    # otherwise it collapses into a space along with everything else.
+    text = re.sub(r"(?i)<\s*br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</\s*(p|div|li)\s*>", "\n", text)
+    text = TAG_RE.sub(" ", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
+    kept: list[str] = []
+    for line in lines:
+        # One blank line separates blocks; more than that is just slack.
+        if not line and (not kept or not kept[-1]):
+            continue
+        kept.append(line)
+    text = "\n".join(kept).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "..."
+
+
 def _thumbnail_for(video: dict[str, Any]) -> str:
     """Serve every thumbnail through our own /vi/ proxy.
 
@@ -369,11 +508,14 @@ def _youtube_feed_url(youtube_channel_id: str) -> str:
 
 
 def _sync_gorse_event(user_key: str, youtube_video_id: str, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    video = db.get_video_by_youtube_id(youtube_video_id)
-    if video:
-        video = dict(video)
-        video["topic_tokens"] = db._recommendation_tokens(video)
-    return gorse_client.sync_feedback_event(user_key, video, event_type, payload or {})
+    """Retained as a no-op so the feedback API keeps its shape.
+
+    Gorse was removed: collaborative filtering learns from co-occurrence across many
+    users, and a self-hosted feed reader has one. It contributed to zero of forty ranked
+    recommendations while costing two containers and a Postgres instance. Ranking is now
+    content-based, which is what actually fits this deployment.
+    """
+    return {"ok": False, "skipped": "gorse_removed"}
 
 
 ALLOWED_FEEDBACK_EVENTS = {
@@ -388,7 +530,17 @@ ALLOWED_FEEDBACK_EVENTS = {
     "clear_reaction",
     "mark_watched",
     "watch_page_open",
+    # Recorded when a comment is voted on. Weighted far below a rating of the video
+    # itself — agreeing with a comment is a hint about the video, not a verdict on it.
+    "comment_like",
+    "comment_dislike",
 }
+
+
+class CommentReactionRequest(BaseModel):
+    youtube_video_id: str
+    comment_id: str
+    reaction: str = ""
 
 
 class FeedbackRequest(BaseModel):
@@ -401,6 +553,30 @@ class SubscribeRequest(BaseModel):
     youtube_channel_id: str = ""
     title: str = ""
     feed_url: str = ""
+
+
+class ChannelNotificationRequest(BaseModel):
+    level: str = "all"
+
+
+class ApiTokenRequest(BaseModel):
+    name: str = "API token"
+    # A read-only token can call GET/HEAD only, enforced in the access middleware.
+    read_only: bool = False
+
+
+class PollVoteRequest(BaseModel):
+    # None or negative clears the answer.
+    choice_index: int | None = None
+
+
+class DownloadJobRequest(BaseModel):
+    height: int = 0
+    container: str = "mp4"
+    title: str = ""
+    needs_merge: bool = False
+    # 'local' hands the file to the browser; 'server' keeps it in the library.
+    destination: str = "local"
 
 
 class PlaybackPreferencesRequest(BaseModel):
@@ -423,6 +599,12 @@ class PlaybackProgressRequest(BaseModel):
     current_seconds: float | None = None
     duration_seconds: float | None = None
     event_type: str = "progress"
+    # Seconds watched since the previous report. Sent separately from current_seconds,
+    # which restarts at zero each page open and so cannot be differenced server-side.
+    watch_delta_seconds: float = 0.0
+    # A real reading from the player, in video time. Omitted by anything that cannot
+    # actually see the playhead, so a guess never becomes a resume point.
+    resume_seconds: float | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -445,12 +627,24 @@ class SubscriptionCollectionMemberRequest(BaseModel):
 
 
 class FeedPreferencesRequest(BaseModel):
-    preferred_topics: list[str] = Field(default_factory=list)
-    muted_topics: list[str] = Field(default_factory=list)
-    prioritize_subscriptions: bool = True
-    exclude_shorts: bool = False
-    discovery_level: float = 0.35
-    show_comments: bool = False
+    """A partial update: anything omitted keeps its stored value.
+
+    Defaulting these to concrete values instead meant every caller had to echo back the
+    whole preference set, and any caller that forgot a field silently reset it — toggling
+    Shorts would have switched off the RYD privacy setting.
+    """
+
+    preferred_topics: list[str] | None = None
+    muted_topics: list[str] | None = None
+    prioritize_subscriptions: bool | None = None
+    exclude_shorts: bool | None = None
+    discovery_level: float | None = None
+    show_comments: bool | None = None
+    ryd_enabled: bool | None = None
+    sponsorblock_enabled: bool | None = None
+    sponsorblock_actions: dict[str, str] | None = None
+    show_posts_in_feeds: bool | None = None
+    muted_channels: list[str] | None = None
 
 
 def _json_ready(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -536,24 +730,6 @@ def _check_redis() -> dict[str, Any]:
     return _redis_status()
 
 
-def _check_gorse() -> dict[str, Any]:
-    settings = get_settings()
-    if not settings.gorse_base_url:
-        return {"ok": False, "configured": False}
-    headers = {}
-    if settings.gorse_server_api_key:
-        headers["X-API-Key"] = settings.gorse_server_api_key
-    with httpx.Client(timeout=5.0, follow_redirects=False) as client:
-        response = client.get(f"{settings.gorse_base_url}/", headers=headers)
-    return {
-        "ok": response.status_code < 500,
-        "configured": True,
-        "base_url": settings.gorse_base_url,
-        "status_code": response.status_code,
-        "api_key_configured": bool(settings.gorse_server_api_key),
-    }
-
-
 def _check_freshrss() -> dict[str, Any]:
     settings = get_settings()
     if not settings.freshrss_configured:
@@ -629,13 +805,12 @@ def full_status_payload() -> dict[str, Any]:
     checks = {
         "database": _timed_check("database", _check_database),
         "redis": _timed_check("redis", _check_redis),
-        "gorse": _timed_check("gorse", _check_gorse),
         "freshrss": _timed_check("freshrss", _check_freshrss),
         "invidious_api": _timed_check("invidious_api", _check_invidious_api),
         "invidious_player": _timed_check("invidious_player", _check_invidious_player),
         "recommended_feed": _timed_check("recommended_feed", _feed_status),
     }
-    critical = ["database", "redis", "gorse", "freshrss", "invidious_api", "invidious_player", "recommended_feed"]
+    critical = ["database", "redis", "freshrss", "invidious_api", "invidious_player", "recommended_feed"]
     counts = _json_ready_value(db.system_counts())
     return {
         "ok": all(bool(checks[name].get("ok")) for name in critical),
@@ -643,6 +818,16 @@ def full_status_payload() -> dict[str, Any]:
         "version": __version__,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "checks": checks,
+        # Not a critical check: yt-dlp is a fallback, and the stack is healthy without it.
+        # It is reported so a failed high-quality download has an obvious place to look.
+        "media_backends": {
+            "invidious": bool(checks["invidious_api"].get("ok")),
+            "ytdlp_enabled": get_settings().ytdlp_enabled,
+            "ytdlp": ytdlp.version() or "",
+            "ffmpeg": downloads.ffmpeg_version() or "",
+            "downloads": downloads.disk_usage(),
+            "active_downloads": downloads.manager.active_count(),
+        },
         "counts": counts,
         "enrichment": _json_ready_value(db.enrichment_status()),
         "latest_sync_runs": _json_ready(db.list_sync_runs(5)),
@@ -740,114 +925,203 @@ def api_status_full() -> dict[str, Any]:
     return full_status_payload()
 
 
-@app.get("/admin/status", response_class=HTMLResponse)
-def admin_status() -> str:
+def _status_metric(label: str, value: Any, hint: str = "", tone: str = "") -> str:
+    tone_class = f" {tone}" if tone else ""
+    hint_html = f"<small>{escape(hint)}</small>" if hint else ""
+    return (
+        f'<div class="stat-tile{tone_class}"><span class="stat-label">{escape(label)}</span>'
+        f'<strong class="stat-value">{escape(str(value))}</strong>{hint_html}</div>'
+    )
+
+
+def _status_section(title: str, body: str, subtitle: str = "") -> str:
+    sub = f"<p>{escape(subtitle)}</p>" if subtitle else ""
+    return f'<section class="status-block"><div class="status-head"><h2>{escape(title)}</h2>{sub}</div>{body}</section>'
+
+
+def _status_page_html(user_key: str = "local") -> str:
+    """Every subsystem, on one page, in the app's own visual language."""
     status = full_status_payload()
-    checks = status["checks"]
+    checks = status.get("checks") or {}
     counts = status.get("counts") or {}
+    backends = status.get("media_backends") or {}
+    storage = backends.get("downloads") or {}
 
-    def check_card(key: str, label: str) -> str:
-        item = checks.get(key, {})
-        state = "ok" if item.get("ok") else "bad"
-        detail_parts = []
-        for field in ("latency_ms", "base_url", "status_code", "configured", "api_key_configured", "items", "embed", "companion_manifest", "likely_cause", "playback_fallback", "fallback_serving", "error"):
-            if item.get(field) is not None:
-                detail_parts.append(f"{escape(str(field))}: {escape(str(item.get(field)))}")
-        detail = "<br>".join(detail_parts)
-        return f"""
-        <article class="check {state}">
-          <div><h2>{escape(label)}</h2><p>{detail}</p></div>
-          <strong>{'OK' if item.get('ok') else 'FAIL'}</strong>
-        </article>
-        """
+    labels = {
+        "database": "Postgres", "redis": "Redis", "freshrss": "FreshRSS",
+        "invidious_api": "Invidious API", "invidious_player": "Invidious player",
+        "recommended_feed": "Recommended feed",
+    }
+    cards = []
+    for key, label in labels.items():
+        item = checks.get(key) or {}
+        ok = bool(item.get("ok"))
+        detail = " &middot; ".join(
+            f"{escape(str(field).replace('_', ' '))} {escape(str(item.get(field)))}"
+            for field in ("latency_ms", "status_code", "items", "likely_cause", "error")
+            if item.get(field) is not None
+        )
+        cards.append(
+            f'<article class="check {"ok" if ok else "bad"}">'
+            f'<div><h3>{escape(label)}</h3><p>{detail or "&nbsp;"}</p></div>'
+            f'<span class="check-badge">{"OK" if ok else "FAIL"}</span></article>'
+        )
 
-    count_rows = "".join(
-        f"<tr><th>{escape(str(key).replace('_', ' '))}</th><td>{escape(str(value))}</td></tr>"
-        for key, value in counts.items()
+    # --- personalization -----------------------------------------------------------
+    try:
+        watch = db.watch_time_profile(user_key)
+        takeout_profile = db.takeout_profile(user_key)
+        takeout_record = db.latest_takeout_import(user_key)
+        token_count = len(db.list_api_tokens(user_key))
+        download_count = len(db.list_downloads(user_key, "", 500))
+    except Exception as exc:
+        logger.warning("status personalization read failed: %s", exc)
+        watch, takeout_profile, takeout_record, token_count, download_count = {}, {}, None, 0, 0
+
+    hours = (watch.get("total_seconds") or 0) / 3600
+    personalization = "".join([
+        _status_metric("Watch time tracked", f"{hours:.1f} h", f"{len(watch.get('channels') or {})} channels"),
+        _status_metric("Signal confidence", f"{(watch.get('confidence') or 0):.0%}", "full weight at 1 hour"),
+        _status_metric("Imported history", f"{takeout_profile.get('total_watches') or 0:,}",
+                       "Takeout" if takeout_record else "no import yet"),
+        _status_metric("Already-watched IDs", f"{takeout_profile.get('watched_videos') or 0:,}", "suppressed in ranking"),
+    ])
+
+    # --- media backends ------------------------------------------------------------
+    ytdlp_version = backends.get("ytdlp") or ""
+    ffmpeg_version = (backends.get("ffmpeg") or "").split(" version ")[-1].split(" ")[0] if backends.get("ffmpeg") else ""
+    free = storage.get("free_bytes")
+    media = "".join([
+        _status_metric("yt-dlp", ytdlp_version or "not installed", "fallback + merged downloads",
+                       "ok" if ytdlp_version else "warn"),
+        _status_metric("ffmpeg", ffmpeg_version or "not installed", "muxes split tracks",
+                       "ok" if ffmpeg_version else "warn"),
+        _status_metric("Downloads stored", f"{download_count:,}", _bytes_text(storage.get("bytes")) or "nothing yet"),
+        _status_metric("Disk free", _bytes_text(free) if free else "unknown", str(storage.get("path") or "")),
+        _status_metric("Active jobs", backends.get("active_downloads") or 0, "downloading or merging"),
+        _status_metric("API tokens", token_count, "active, non-revoked"),
+    ])
+
+    # --- library -------------------------------------------------------------------
+    enrichment = status.get("enrichment") or {}
+    library = "".join(
+        _status_metric(str(key).replace("_", " ").title(), f"{value:,}" if isinstance(value, int) else value)
+        for key, value in list(counts.items())[:8]
     )
+    enrichment_tiles = "".join(
+        _status_metric(str(key).replace("_", " ").title(), f"{value:,}" if isinstance(value, int) else value)
+        for key, value in list(enrichment.items())[:6]
+    )
+
+    # --- playback sources ----------------------------------------------------------
+    source_rows = []
+    try:
+        for source in _all_playback_sources(user_key):
+            health = source_health_snapshot(source["id"])
+            cooling = source_in_cooldown(source["id"])
+            state = "cooling down" if cooling else health.get("status", "unknown")
+            source_rows.append(
+                f'<tr><td>{escape(source["label"])}</td><td>{escape(source["kind"])}</td>'
+                f'<td>{"enabled" if source.get("enabled", True) else "disabled"}</td>'
+                f'<td class="{"bad-text" if cooling else ""}">{escape(str(state))}</td>'
+                f'<td>{escape(str(health.get("failures") or 0))}</td></tr>'
+            )
+    except Exception as exc:
+        logger.warning("status playback read failed: %s", exc)
+    sources_table = (
+        '<div class="status-scroll"><table><thead><tr><th>Source</th><th>Kind</th><th>State</th>'
+        f'<th>Health</th><th>Failures</th></tr></thead><tbody>{"".join(source_rows) or "<tr><td colspan=5>No sources configured.</td></tr>"}</tbody></table></div>'
+    )
+
     sync_rows = "".join(
-        f"<tr><td>{run['id']}</td><td>{escape(run['status'])}</td><td>{escape(str(run.get('started_at') or ''))}</td><td>{escape(str(run.get('finished_at') or ''))}</td><td>{run['subscriptions_count']}</td><td>{run['entries_count']}</td><td>{escape(run.get('message') or '')}</td></tr>"
+        f'<tr><td>{escape(str(run.get("status") or ""))}</td>'
+        f'<td>{escape(_relative_time(run.get("started_at")) or "-")}</td>'
+        f'<td>{escape(str(run.get("subscriptions_count") or 0))}</td>'
+        f'<td>{escape(str(run.get("entries_count") or 0))}</td>'
+        f'<td>{escape(_text_excerpt(str(run.get("message") or ""), 90))}</td></tr>'
         for run in status.get("latest_sync_runs") or []
-    ) or "<tr><td colspan='7'>No sync runs.</td></tr>"
+    ) or "<tr><td colspan=5>No sync runs yet.</td></tr>"
+
     retrieval_rows = "".join(
-        f"<tr><td>{escape(item.get('source') or '')}</td><td>{escape(item.get('status') or '')}</td><td>{escape(str(item.get('attempted_at') or ''))}</td><td>{escape(item.get('youtube_video_id') or '')}</td><td>{escape(item.get('message') or '')}</td></tr>"
+        f'<tr><td>{escape(str(item.get("source") or ""))}</td>'
+        f'<td class="{"bad-text" if item.get("status") != "success" else ""}">{escape(str(item.get("status") or ""))}</td>'
+        f'<td>{escape(_relative_time(item.get("attempted_at")) or "-")}</td>'
+        f'<td>{escape(str(item.get("youtube_video_id") or ""))}</td>'
+        f'<td>{escape(_text_excerpt(str(item.get("message") or ""), 80))}</td></tr>'
         for item in status.get("recent_retrieval_attempts") or []
-    ) or "<tr><td colspan='5'>No retrieval attempts.</td></tr>"
-    generated_at = escape(str(status.get("generated_at") or ""))
-    overall = "ok" if status.get("ok") else "bad"
-    cards = "".join(
-        [
-            check_card("database", "Postgres"),
-            check_card("redis", "Redis"),
-            check_card("gorse", "Gorse"),
-            check_card("freshrss", "FreshRSS"),
-            check_card("invidious_api", "Invidious API"),
-            check_card("invidious_player", "Invidious Player"),
-            check_card("recommended_feed", "Recommended Feed"),
-        ]
-    )
-    return f"""
-    <!doctype html>
-    <html lang="en">
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Status - OpenFeed</title>
-        <style>
-          :root {{ color-scheme: dark; font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-          body {{ margin: 0; background: #101820; color: #eef2f7; }}
-          header {{ padding: 18px 28px; border-bottom: 1px solid #314052; background: #0c1218; display: flex; justify-content: space-between; gap: 16px; align-items: center; }}
-          main {{ max-width: 1180px; margin: 0 auto; padding: 24px; }}
-          a {{ color: #8bd3ff; text-decoration: none; }}
-          h1 {{ margin: 0; font-size: 24px; letter-spacing: 0; }}
-          .overall {{ border: 1px solid #314052; border-radius: 8px; padding: 8px 11px; background: #17222e; }}
-          .overall.ok {{ border-color: #2f8f5b; color: #a7f3c6; }}
-          .overall.bad {{ border-color: #be123c; color: #fecdd3; }}
-          .checks {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }}
-          .check {{ border: 1px solid #314052; border-radius: 8px; background: #17222e; padding: 13px; display: flex; justify-content: space-between; gap: 10px; min-height: 104px; }}
-          .check.ok {{ border-color: #2f8f5b; }}
-          .check.bad {{ border-color: #be123c; }}
-          .check h2 {{ margin: 0 0 8px; font-size: 15px; letter-spacing: 0; }}
-          .check p {{ margin: 0; color: #b7c6d8; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }}
-          .check strong {{ font-size: 13px; }}
-          section {{ margin-top: 24px; }}
-          table {{ width: 100%; border-collapse: collapse; font-size: 13px; border: 1px solid #314052; background: #17222e; }}
-          th, td {{ border-bottom: 1px solid #314052; padding: 8px; text-align: left; vertical-align: top; }}
-          th {{ color: #b7c6d8; font-weight: 600; }}
-          .two {{ display: grid; grid-template-columns: minmax(260px, 390px) 1fr; gap: 18px; align-items: start; }}
-          @media (max-width: 820px) {{ header {{ align-items: flex-start; flex-direction: column; }} main {{ padding: 18px; }} .two {{ grid-template-columns: 1fr; }} }}
-        </style>
-      </head>
-      <body>
-        <header>
-          <div><a href="/">OpenFeed</a><h1>System Status</h1><p>Generated {generated_at}</p></div>
-          <div class="overall {overall}">{'All critical checks passing' if status.get('ok') else 'One or more critical checks failed'}</div>
-        </header>
-        <main>
-          <section class="checks">{cards}</section>
-          <section class="two">
-            <div>
-              <h2>Counts</h2>
-              <table><tbody>{count_rows}</tbody></table>
-            </div>
-            <div>
-              <h2>Latest Sync Runs</h2>
-              <table><thead><tr><th>ID</th><th>Status</th><th>Started</th><th>Finished</th><th>Subs</th><th>Entries</th><th>Message</th></tr></thead><tbody>{sync_rows}</tbody></table>
-            </div>
-          </section>
-          <section>
-            <h2>Recent Retrieval Attempts</h2>
-            <table><thead><tr><th>Source</th><th>Status</th><th>Attempted</th><th>Video</th><th>Message</th></tr></thead><tbody>{retrieval_rows}</tbody></table>
-          </section>
-        </main>
-      </body>
-    </html>
+    ) or "<tr><td colspan=5>No retrieval attempts recorded.</td></tr>"
+
+    overall_ok = bool(status.get("ok"))
+    generated = escape(_relative_time(status.get("generated_at")) or "just now")
+
+    return f'''
+      <section class="page-hero status-hero">
+        <div>
+          <p class="page-kicker">System</p>
+          <h1>Status</h1>
+          <p>Every subsystem OpenFeed depends on, checked {generated}.</p>
+        </div>
+        <span class="status-overall {"ok" if overall_ok else "bad"}">
+          {_icon("verified" if overall_ok else "block")}
+          <span>{"All systems healthy" if overall_ok else "Something needs attention"}</span>
+        </span>
+      </section>
+
+      {_status_section("Service health", f'<div class="checks-grid">{"".join(cards)}</div>',
+                       "The seven services a working install needs.")}
+      {_status_section("Media backends", f'<div class="stat-grid">{media}</div>',
+                       "Playback fallback, downloads and programmatic access.")}
+      {_status_section("Personalization", f'<div class="stat-grid">{personalization}</div>',
+                       "What the recommendation engine has to work with.")}
+      {_status_section("Library", f'<div class="stat-grid">{library}</div>')}
+      {_status_section("Enrichment", f'<div class="stat-grid">{enrichment_tiles}</div>',
+                       "Metadata coverage. Topic ranking cannot see an unenriched video.")}
+      {_status_section("Playback sources", sources_table,
+                       "In preference order. A cooled-down source is retried automatically.")}
+      {_status_section("Recent syncs",
+                       f'<div class="status-scroll"><table><thead><tr><th>Status</th><th>Started</th><th>Subs</th><th>Entries</th><th>Message</th></tr></thead><tbody>{sync_rows}</tbody></table></div>')}
+      {_status_section("Recent retrieval attempts",
+                       f'<div class="status-scroll"><table><thead><tr><th>Source</th><th>Status</th><th>When</th><th>Video</th><th>Message</th></tr></thead><tbody>{retrieval_rows}</tbody></table></div>')}
+      <p class="dialog-note">Machine-readable equivalent: <a href="/api/status/full">/api/status/full</a></p>
+    '''
+
+
+@app.get("/admin/status", response_class=HTMLResponse)
+def admin_status(request: Request):
+    """Kept as a redirect: status now lives in Settings, where the rest of the
+    deployment-level information already is."""
+    return RedirectResponse(url="/?settings=status", status_code=307)
+
+
+def _unused_admin_status(request: Request):
+    """The status page, rendered inside the app rather than as a separate document.
+
+    It used to be a standalone page with its own palette, which meant the one screen an
+    operator opens when something is wrong looked nothing like the app and shared none of
+    its navigation. It now uses the same shell, and reports every subsystem rather than
+    only the seven original health checks.
     """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    user_key = _user_key(request)
+    return _app_shell("Status", "status", _status_page_html(user_key), request=request)
+
 
 
 # Icon geometry from Lucide v1.26.0 (ISC) — https://lucide.dev
 # Vendored as path data so the app stays a single self-contained server render
 # with no bundler, CDN request, or runtime dependency.
+
+# One thumb, drawn once. Dislike is the same geometry rotated half a turn rather than
+# a second hand-drawn path, so the two buttons can never drift out of sync. The outline
+# is a single closed subpath, which means `fill: currentColor` alone turns it solid -
+# that is how the selected state is rendered, with no second "filled" icon to maintain.
+_THUMB_PATH = (
+    '<path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8'
+    'a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/> <path d="M7 10v12"/>'
+)
+
 ICON_PATHS = {
     "home": '<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/> <path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
     "discover": '<circle cx="12" cy="12" r="10"/> <path d="m16.24 7.76-1.804 5.411a2 2 0 0 1-1.265 1.265L7.76 16.24l1.804-5.411a2 2 0 0 1 1.265-1.265z"/>',
@@ -860,10 +1134,12 @@ ICON_PATHS = {
     "more": '<circle cx="12" cy="12" r="1"/> <circle cx="12" cy="5" r="1"/> <circle cx="12" cy="19" r="1"/>',
     "tune": '<path d="M10 5H3"/> <path d="M12 19H3"/> <path d="M14 3v4"/> <path d="M16 17v4"/> <path d="M21 12h-9"/> <path d="M21 19h-5"/> <path d="M21 5h-7"/> <path d="M8 10v4"/> <path d="M8 12H3"/>',
     "bell": '<path d="M10.268 21a2 2 0 0 0 3.464 0"/> <path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/>',
+    "bell-ring": '<path d="M10.268 21a2 2 0 0 0 3.464 0"/> <path d="M22 8c0-2.3-.8-4.3-2-6"/> <path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/> <path d="M4 2C2.8 3.7 2 5.7 2 8"/>',
+    "bell-off": '<path d="M10.268 21a2 2 0 0 0 3.464 0"/> <path d="M17 17H4a1 1 0 0 1-.74-1.673C4.59 13.956 6 12.499 6 8a6 6 0 0 1 .258-1.742"/> <path d="m2 2 20 20"/> <path d="M8.668 3.01A6 6 0 0 1 18 8c0 2.687.77 4.653 1.707 6.05"/>',
     "user": '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/> <circle cx="12" cy="7" r="4"/>',
     "clock": '<circle cx="12" cy="12" r="10"/> <path d="M12 6v6l4 2"/>',
-    "like": '<path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/> <path d="M7 10v12"/>',
-    "dislike": '<path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z"/> <path d="M17 14V2"/>',
+    "like": _THUMB_PATH,
+    "dislike": f'<g transform="rotate(180 12 12)">{_THUMB_PATH}</g>',
     "hide": '<path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/> <path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/> <path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/> <path d="m2 2 20 20"/>',
     "check": '<path d="M20 6 9 17l-5-5"/>',
     "external": '<path d="M15 3h6v6"/> <path d="M10 14 21 3"/> <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
@@ -897,6 +1173,26 @@ ICON_PATHS = {
     "sort": '<path d="m21 16-4 4-4-4"/> <path d="M17 20V4"/> <path d="m3 8 4-4 4 4"/> <path d="M7 4v16"/>',
     "trash": '<path d="M10 11v6"/> <path d="M14 11v6"/> <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/> <path d="M3 6h18"/> <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
 }
+
+
+def _brand_mark() -> str:
+    """The OpenFeed logo.
+
+    The previous mark set the word "Open" in 9px type inside a 22px tile, which at that
+    size is a grey smear rather than a word. This is a shape instead: a play triangle with
+    two broadcast arcs behind it — play for video, arcs for a feed — which survives being
+    22px because it has no small detail to lose.
+    """
+    return (
+        '<span class="brand-mark" aria-hidden="true">'
+        '<svg viewBox="0 0 24 24" focusable="false">'
+        '<path d="M6.6 9.1a5.2 5.2 0 0 1 0 5.8" fill="none" stroke="currentColor" '
+        'stroke-width="1.9" stroke-linecap="round" opacity=".55"/>'
+        '<path d="M9.7 10.6a2 2 0 0 1 0 2.8" fill="none" stroke="currentColor" '
+        'stroke-width="1.9" stroke-linecap="round" opacity=".8"/>'
+        '<path d="M13.1 7.7 19 12l-5.9 4.3a.7.7 0 0 1-1.1-.6V8.3a.7.7 0 0 1 1.1-.6Z" fill="currentColor"/>'
+        '</svg></span>'
+    )
 
 
 def _icon(name: str) -> str:
@@ -1014,7 +1310,10 @@ def _video_meta_parts(video: dict[str, Any]) -> list[str]:
     return parts
 
 
-def _sidebar_channels(limit: int = 7) -> list[dict[str, Any]]:
+SIDEBAR_VISIBLE_CHANNELS = 7
+
+
+def _sidebar_channels(limit: int = 250) -> list[dict[str, Any]]:
     try:
         rows = db.list_subscriptions(limit * 3)
     except Exception:
@@ -1037,43 +1336,69 @@ def _sidebar_subscription_group() -> str:
     if not channels:
         return ""
     rows = []
-    for channel in channels:
+    for index, channel in enumerate(channels):
         name = str(channel.get("title") or "Channel")
         channel_id = escape(str(channel.get("youtube_channel_id") or ""))
         dot = '<span class="nav-dot" aria-hidden="true"></span>' if _is_recent(channel.get("latest_video_at")) else ""
         avatar = _avatar_html(name, channel.get("channel_avatar_url") or channel.get("avatar_url"))
+        # Everything past the first few is rendered but hidden, so "Show more" is instant
+        # and needs no request. The list used to stop at seven with no way to reach the
+        # rest, which made a 73-channel subscription list look like it had seven in it.
+        extra = " nav-channel-extra" if index >= SIDEBAR_VISIBLE_CHANNELS else ""
+        hidden = " hidden" if index >= SIDEBAR_VISIBLE_CHANNELS else ""
         rows.append(
-            f'<a class="nav-item nav-channel" href="/channel/{channel_id}">'
+            f'<a class="nav-item nav-channel{extra}" href="/channel/{channel_id}"{hidden}>'
             f'{avatar}<span>{escape(name)}</span>{dot}</a>'
+        )
+    toggle = ""
+    if len(channels) > SIDEBAR_VISIBLE_CHANNELS:
+        remaining = len(channels) - SIDEBAR_VISIBLE_CHANNELS
+        toggle = (
+            f'<button class="nav-item nav-more" type="button" data-subscription-more '
+            f'data-more-label="Show {remaining} more" data-less-label="Show less" aria-expanded="false">'
+            f'{_icon("chevron-down")}<span>Show {remaining} more</span></button>'
         )
     return (
         '<nav class="nav-group" data-subscription-nav>'
-        f'<p class="nav-group-title">Subscriptions</p>{"".join(rows)}</nav>'
+        f'<p class="nav-group-title">Subscriptions</p>{"".join(rows)}{toggle}</nav>'
     )
 
 
 def _home_nav(active: str = "home") -> str:
-    groups = [
-        [
+    """The sidebar. Every entry goes to a page that *is* the thing it names.
+
+    The old one kept sending you somewhere adjacent: History, Playlists and Liked all
+    opened the Library page with a tab pre-selected, Collections opened the Subscriptions
+    page, and Recommended opened Home — because `/recommendations` literally returned the
+    home page. So clicking a thing landed you on a page that merely contained it, which
+    is disorienting in a way that no amount of labelling fixes.
+
+    Two entries are gone rather than repointed. "Library" was a container for four items
+    that are all listed here individually, and "Recommended" was Home under another name.
+    Both URLs still work and redirect, so old links and bookmarks survive.
+    """
+    groups: list[tuple[str, list[tuple[str, str, str, str]]]] = [
+        ("", [
             ("home", "Home", "/", "home"),
-            ("explore", "Explore", "/recommendations", "discover"),
             ("shorts", "Shorts", "/shorts", "shorts"),
-            ("channels", "Subscriptions", "/channels", "subs"),
-            ("library", "Library", "/library", "library"),
-        ],
-        [
-            ("history", "History", "/library#history", "history"),
-            ("liked", "Liked videos", "/library#liked", "like"),
-            ("playlists", "Playlists", "/library#playlists", "playlist"),
-        ],
-        [
-            ("collections", "Collections", "/channels#collections", "collections"),
-            ("status", "Status", "/admin/status", "status"),
-        ],
+            ("subscriptions", "Subscriptions", "/subscriptions", "subs"),
+        ]),
+        ("You", [
+            ("history", "History", "/history", "history"),
+            ("playlists", "Playlists", "/playlists", "playlist"),
+            ("liked", "Liked videos", "/liked", "like"),
+            ("downloads", "Downloads", "/downloads", "download"),
+        ]),
+        ("Channels", [
+            ("channels", "All channels", "/channels", "channels"),
+            ("collections", "Collections", "/channels?tab=collections", "collections"),
+        ]),
     ]
     blocks: list[str] = []
-    for group in groups:
+    for heading, group in groups:
         items = []
+        if heading:
+            items.append(f'<p class="nav-heading">{escape(heading)}</p>')
         for key, label, href, icon in group:
             current = ' aria-current="page"' if key == active else ""
             item_class = " active" if key == active else ""
@@ -1088,8 +1413,8 @@ def _mobile_nav() -> str:
     links = [
         ("Home", "/", "home"),
         ("Subs", "/channels", "subs"),
-        ("Library", "/library", "library"),
-        ("Status", "/admin/status", "status"),
+        ("Library", "/history", "library"),
+        ("Library", "/history", "library"),
     ]
     return "".join(f'<a class="mobile-nav-item" href="{href}">{_icon(icon)}<span>{escape(label)}</span></a>' for label, href, icon in links)
 
@@ -1175,7 +1500,9 @@ def _menu_row(icon: str, label: str, *, href: str = "", attrs: str = "", trailin
     copy = f'<span class="menu-label">{escape(label)}</span>'
     if sub:
         copy += f'<span class="menu-sub">{escape(sub)}</span>'
-    trailing_html = f'<span class="menu-trailing">{escape(trailing)}</span>' if trailing else "<span></span>"
+    # Always emit the trailing slot, even when empty: rows whose trailing text is set
+    # later (the notification tick) need somewhere to write it.
+    trailing_html = f'<span class="menu-trailing">{escape(trailing)}</span>'
     body = f'<span class="menu-icon">{_icon(icon)}</span><span class="menu-copy">{copy}</span>{trailing_html}'
     if href:
         rel = ' rel="noreferrer"' if href.startswith(("http://", "https://")) else ""
@@ -1208,23 +1535,354 @@ def _video_action_menu(video_id_raw: str, title_text: str, watch_href: str, orig
     '''
 
 
-def _watch_options_menu(video_id_raw: str, invidious_url: str, youtube_url: str) -> str:
+def _subscription_feed_for_video(video: dict[str, Any]) -> str:
+    """The feed URL proving this video's channel is subscribed, or "" if it is not.
+
+    Subscription belongs to the channel, not to the route a particular video took to get
+    here. A video pulled in by recommendations or search has no freshrss_entries row, so
+    reading only the entry-level join reported "Subscribe" for channels that were already
+    subscribed — and pressing that button asked FreshRSS to add a feed it already had,
+    which fails. The channel-level column is therefore the authority, with the entry-level
+    one kept as a fallback for rows fetched by queries that do not select it.
+    """
+    return str(
+        video.get("channel_subscription_feed_url") or video.get("subscription_feed_url") or ""
+    ).strip()
+
+
+def _download_dialog() -> str:
+    """Resolution picker for the download button. Rows are filled in from the API."""
+    return f'''
+      <dialog class="feed-dialog download-dialog" id="download-dialog" data-download-dialog aria-labelledby="download-dialog-title">
+        <div class="dialog-head">
+          <div>
+            <h2 id="download-dialog-title">Download</h2>
+            <p data-download-subtitle>Choose a quality.</p>
+          </div>
+          <button class="icon-button" type="button" data-close-dialog aria-label="Close">{_icon("x")}</button>
+        </div>
+        <div class="dialog-body">
+          <div class="download-destination" data-download-destination role="radiogroup" aria-label="Where to save">
+            <button class="destination-option active" type="button" role="radio" aria-checked="true" data-destination="local">
+              <strong>Download to this device</strong>
+              <small>Saves through your browser. The server copy is deleted afterwards.</small>
+            </button>
+            <button class="destination-option" type="button" role="radio" aria-checked="false" data-destination="server">
+              <strong>Keep on server</strong>
+              <small>Added to your Library, playable here without touching YouTube.</small>
+            </button>
+          </div>
+          <div class="download-options" data-download-options role="group" aria-label="Available qualities">
+            <p class="dialog-note">Checking what is available&hellip;</p>
+          </div>
+          <div class="download-progress" data-download-progress hidden>
+            <div class="download-progress-head">
+              <strong data-download-progress-label>Preparing&hellip;</strong>
+              <button class="pill-action" type="button" data-download-cancel>Cancel</button>
+            </div>
+            <div class="download-bar"><span data-download-bar></span></div>
+            <p class="dialog-note" data-download-stats></p>
+          </div>
+          <p class="dialog-note" data-download-note hidden></p>
+        </div>
+      </dialog>
+    '''
+
+
+# A timestamp in a description or comment: 1:23, 12:34, or 1:02:03.
+_TIMESTAMP_RE = re.compile(r"(?<![\d:])((?:\d{1,2}:)?\d{1,2}:\d{2})(?![\d:])")
+_URL_RE = re.compile(r"https?://[^\s<>\"]+")
+_HANDLE_RE = re.compile(r"(?<![\w@/])@([A-Za-z0-9_.-]{3,30})\b")
+_HASHTAG_RE = re.compile(r"(?<![\w&/])#([A-Za-z0-9_]{2,40})\b")
+
+
+def _timestamp_seconds(label: str) -> int:
+    parts = [int(piece) for piece in label.split(":")]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return parts[0] * 60 + parts[1]
+
+
+def _rich_text(raw: str) -> str:
+    """Turn a creator's plain-text blurb back into the thing they wrote.
+
+    YouTube descriptions carry real structure — chapter timestamps, links, line breaks
+    people spent effort laying out — and collapsing that into one escaped paragraph threw
+    all of it away. Escaping happens first and everything below only ever wraps existing
+    escaped text, so no user content can become markup.
+    """
+    text = escape(raw)
+
+    def _link(match: re.Match[str]) -> str:
+        shown = match.group(0)
+        # The href has to carry the real URL, but the visible text stays escaped.
+        href = shown.replace("&amp;", "&")
+        trimmed = shown.rstrip(".,);:!?")
+        tail = shown[len(trimmed):]
+        href = trimmed.replace("&amp;", "&")
+        return (
+            f'<a href="{href}" target="_blank" rel="noopener noreferrer nofollow ugc">{trimmed}</a>{tail}'
+        )
+
+    text = _URL_RE.sub(_link, text)
+    text = _TIMESTAMP_RE.sub(
+        lambda m: f'<button type="button" class="ts-link" data-seek="{_timestamp_seconds(m.group(1))}">{m.group(1)}</button>',
+        text,
+    )
+    text = _HANDLE_RE.sub(
+        lambda m: f'<a href="https://www.youtube.com/@{m.group(1)}" target="_blank" rel="noopener noreferrer nofollow ugc">@{m.group(1)}</a>',
+        text,
+    )
+    text = _HASHTAG_RE.sub(lambda m: f'<a href="/search?q=%23{m.group(1)}">#{m.group(1)}</a>', text)
+    # Line breaks are structure too — a blank line separates blocks, a single one wraps.
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
+
+# YouTube reports a collaboration as one combined author string ("3Blue1Brown and Ben
+# Syversen"), with a single channel id for whoever hosts it. Splitting it lets both names
+# be shown, and lets the ones we happen to know about become links.
+_CREATOR_SPLIT = re.compile(r"\s+(?:and|&|feat\.?|ft\.?|with|x)\s+|,\s+", re.IGNORECASE)
+# Guarded so a channel legitimately named "Rock and Roll Garage" is not torn in half.
+_MAX_CREATORS = 4
+_MIN_CREATOR_NAME = 2
+
+
+def split_creators(author: str) -> list[str]:
+    """The individual creators behind a combined author string.
+
+    Returns a single-element list for the ordinary case, so callers can treat everything
+    uniformly. A split that produces something implausible - too many parts, or a part too
+    short to be a channel name - is discarded in favour of the original string, because
+    showing one correct name beats showing three wrong ones.
+    """
+    text = str(author or "").strip()
+    if not text:
+        return []
+    parts = [part.strip() for part in _CREATOR_SPLIT.split(text) if part.strip()]
+    if len(parts) < 2 or len(parts) > _MAX_CREATORS:
+        return [text]
+    if any(len(part) < _MIN_CREATOR_NAME for part in parts):
+        return [text]
+    return parts
+
+
+def _creator_links(video: dict[str, Any], channel_href: str) -> str:
+    """Render the creator line, linking each name we can resolve.
+
+    The host channel keeps its link; a guest we have no id for is shown as plain text
+    rather than a link that would go somewhere wrong.
+    """
+    author = str(video.get("channel_title") or video.get("author") or "")
+    names = split_creators(author)
+    if len(names) <= 1:
+        return f'<a class="watch-channel-name" href="{channel_href}">{escape(author or "Unknown channel")}</a>'
+    known = db.channel_ids_for_titles(names[1:]) if len(names) > 1 else {}
+    rendered = [f'<a class="watch-channel-name" href="{channel_href}">{escape(names[0])}</a>']
+    for name in names[1:]:
+        target = known.get(name.strip().lower())
+        if target:
+            rendered.append(f'<a class="watch-channel-name" href="/channel/{escape(target, quote=True)}">{escape(name)}</a>')
+        else:
+            rendered.append(f'<span class="watch-channel-name is-plain">{escape(name)}</span>')
+    return '<span class="watch-creators">' + '<span class="creator-sep">&amp;</span>'.join(rendered) + '</span>'
+
+
+def _video_details_pane(video: dict[str, Any], download: dict[str, Any] | None = None) -> str:
+    """The facts about a video that do not fit in a one-line meta row.
+
+    Release date, exact figures, duration, captions, where the video came from and whether
+    a copy is on disk. Collapsed by default so it is available without crowding the page,
+    and skipped entirely when there is nothing worth showing.
+    """
+    rows: list[tuple[str, str]] = []
+
+    published = video.get("published_at")
+    exact = _date_text(published)
+    relative = _relative_time(published)
+    if exact:
+        rows.append(("Released", f"{escape(exact)}" + (f" &middot; {escape(relative)}" if relative else "")))
+
+    for label, key in (("Views", "view_count"), ("Likes", "like_count")):
+        value = video.get(key)
+        if isinstance(value, (int, float)) and value:
+            # The exact figure, since the header already shows the rounded one.
+            rows.append((label, f"{int(value):,}"))
+
+    dislikes = video.get("dislike_count")
+    if isinstance(dislikes, (int, float)) and dislikes:
+        estimated = str(video.get("dislike_source") or "") == "ryd"
+        rows.append(("Dislikes", f"{int(dislikes):,}" + (" <span class=\"detail-tag\">estimated</span>" if estimated else "")))
+
+    duration = _duration_text(video.get("duration_seconds"))
+    if duration:
+        rows.append(("Duration", escape(duration)))
+
+    captions = str(video.get("captions_status") or "").strip()
+    if captions and captions != "unknown":
+        rows.append(("Captions", escape(captions)))
+
+    source_kind = str(video.get("source_kind") or "").strip()
+    if source_kind:
+        origin = "From a subscription feed" if source_kind == "subscription" else f"Discovered via {escape(str(video.get('discovery_source') or 'recommendations'))}"
+        rows.append(("How it got here", origin))
+
+    metadata_source = str(video.get("metadata_source") or "").strip()
+    if metadata_source and metadata_source != "not fetched":
+        fetched = _relative_time(video.get("metadata_fetched_at"))
+        rows.append(("Metadata", escape(metadata_source) + (f" &middot; {escape(fetched)}" if fetched else "")))
+
+    if download:
+        quality = escape(str(download.get("quality") or ""))
+        size = _bytes_text(download.get("size_bytes"))
+        rows.append(("Downloaded", " &middot; ".join(part for part in (quality, size) if part) or "yes"))
+
+    tags = [str(tag) for tag in (video.get("tags") or []) if str(tag).strip()][:12]
+    tag_html = ""
+    if tags:
+        chips = "".join(f'<a class="detail-chip" href="/search?q={urllib.parse.quote(tag)}">{escape(tag)}</a>' for tag in tags)
+        tag_html = f'<div class="detail-tags">{chips}</div>'
+
+    if not rows and not tag_html:
+        return ""
+
+    row_html = "".join(f'<div class="detail-row"><dt>{escape(label)}</dt><dd>{value}</dd></div>' for label, value in rows)
+    return f'''
+      <details class="video-details">
+        <summary>{_icon("status")}<span>Details</span></summary>
+        <dl class="detail-list">{row_html}</dl>
+        {tag_html}
+      </details>
+    '''
+
+
+def _bytes_text(value: Any) -> str:
+    try:
+        size = float(value or 0)
+    except (TypeError, ValueError):
+        return ""
+    if size <= 0:
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if size >= 10 or unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return ""
+
+
+def _download_card(row: dict[str, Any], settings: Any) -> str:
+    """A downloaded video, rendered as an ordinary card so it behaves like one.
+
+    Reusing _home_video_card means the menu, the save-to-playlist action, the reaction
+    buttons and the watch link all work exactly as they do everywhere else — a download
+    is a video that happens to also exist on disk, not a separate kind of thing.
+    """
+    card = _home_video_card(row, 0, settings, force_watch_route=True)
+    quality = escape(str(row.get("quality") or ""))
+    size = _bytes_text(row.get("size_bytes"))
+    meta = " &middot; ".join(part for part in (quality, size) if part)
+    video_id = escape(str(row.get("youtube_video_id") or ""), quote=True)
+    badge = (
+        f'<span class="download-chip">{_icon("download")}<span>{meta}</span>'
+        f'<button class="download-remove" type="button" data-remove-download="{video_id}" '
+        f'aria-label="Remove download" title="Remove download">{_icon("trash")}</button></span>'
+    )
+    # Injected just inside the card so it sits over the thumbnail, without rebuilding the
+    # whole card markup here and letting the two drift apart.
+    return card.replace('<div class="video-info">', f'{badge}<div class="video-info">', 1)
+
+
+def _watch_options_menu(video_id_raw: str, invidious_url: str, youtube_url: str, title_text: str = "") -> str:
+    """The overflow menu for the action row.
+
+    Download and Theater live here rather than on the row itself: YouTube keeps that row
+    to the handful of actions people reach for constantly, and anything longer wraps onto
+    a second line at ordinary window widths. Theater keeps its `t` shortcut either way.
+    """
     video_id = escape(video_id_raw)
+    title_attr = escape(_text_excerpt(title_text or video_id_raw, 90), quote=True)
     rows = [
-        _menu_row("external", "Open in Invidious", href=invidious_url),
-        _menu_row("external", "Open original", href=youtube_url),
-        _menu_row("share", "Copy OpenFeed link", attrs=f' data-copy-url="/watch/{video_id}"'),
-        _menu_row("share", "Copy original link", attrs=f' data-copy-url="{youtube_url}"'),
+        _menu_row("status", "Details", attrs=" data-open-details"),
+        _menu_row("download", "Download", attrs=f' data-download-video="{video_id}" data-video-title="{title_attr}"'),
+        _menu_row("theater", "Theater mode", trailing="t", attrs=" data-theater-toggle"),
         '<div class="menu-separator" role="separator"></div>',
         _menu_row("check", "Mark watched", attrs=f' data-feedback="mark_watched" data-video-id="{video_id}"'),
+        _menu_row("history", "Start from the beginning", href=f"/watch/{video_id}?restart=1"),
         _menu_row("block", "Not interested", attrs=f' data-feedback="hide" data-video-id="{video_id}"', danger=True),
+        '<div class="menu-separator" role="separator"></div>',
+        _menu_row("share", "Copy OpenFeed link", attrs=f' data-copy-url="/watch/{video_id}"'),
+        _menu_row("share", "Copy original link", attrs=f' data-copy-url="{youtube_url}"'),
+        _menu_row("external", "Open in Invidious", href=invidious_url),
+        _menu_row("external", "Open original", href=youtube_url),
     ]
     return f'''
       <details class="watch-menu yt-menu">
-        <summary class="text-action menu-summary" aria-label="Open watch options">{_icon("settings")}<span>Options</span></summary>
+        <summary class="pill-action pill-icon" aria-label="More actions" title="More actions">{_icon("more")}<span class="sr-only">More actions</span></summary>
         <div class="menu-panel" role="menu" aria-label="Watch options">{"".join(rows)}</div>
       </details>
     '''
+
+
+# Bell levels, in the order they appear in the menu. The icon doubles as the trigger's
+# face so the current setting is readable without opening anything.
+_NOTIFICATION_CHOICES = (
+    ("all", "bell-ring", "All", "Every upload from this channel"),
+    ("personalized", "bell", "Personalized", "Uploads matching topics you follow"),
+    ("none", "bell-off", "None", "Nothing from this channel"),
+)
+
+
+def _notification_bell(channel_id_raw: str, level: str) -> str:
+    """The bell beside Subscribed, for choosing how much this channel may notify you."""
+    if not channel_id_raw:
+        return ""
+    channel_id = escape(channel_id_raw, quote=True)
+    level = level if level in {choice[0] for choice in _NOTIFICATION_CHOICES} else "all"
+    current = next(choice for choice in _NOTIFICATION_CHOICES if choice[0] == level)
+    rows = [
+        _menu_row(
+            icon,
+            label,
+            sub=description,
+            trailing="✓" if value == level else "",
+            attrs=f' data-notify-level="{value}" data-channel-id="{channel_id}"',
+        )
+        for value, icon, label, description in _NOTIFICATION_CHOICES
+    ]
+    muted_class = " is-muted" if level == "none" else ""
+    return f'''
+      <details class="notify-menu yt-menu" data-notify-menu data-channel-id="{channel_id}">
+        <summary class="notify-trigger{muted_class}" data-notify-trigger aria-label="Notifications: {current[2]}" title="Notifications: {current[2]}">{_icon(current[1])}{_icon("chevron-down")}</summary>
+        <div class="menu-panel" role="menu" aria-label="Notification settings">{"".join(rows)}</div>
+      </details>
+    '''
+
+
+def _subscribe_control(channel_id_raw: str, feed_url_raw: str, channel_text: str, subscribed: bool, notify_level: str = "all") -> str:
+    """Subscribe pill, plus the notification bell once you are actually subscribed."""
+    if not channel_id_raw or not feed_url_raw:
+        return ""
+    channel_id = escape(channel_id_raw, quote=True)
+    feed_url = escape(feed_url_raw, quote=True)
+    title_attr = escape(channel_text, quote=True)
+    channel = escape(channel_text)
+    if subscribed:
+        button = (
+            f'<button class="watch-subscribe subscribed" type="button" data-unsubscribe-feed data-channel-id="{channel_id}" '
+            f'data-feed-url="{feed_url}" data-title="{title_attr}" aria-label="Unsubscribe from {channel}">'
+            f'{_icon("check")}<span>Subscribed</span></button>'
+        )
+        group_class = "subscribe-group is-subscribed"
+    else:
+        button = (
+            f'<button class="watch-subscribe" type="button" data-subscribe-feed data-channel-id="{channel_id}" '
+            f'data-feed-url="{feed_url}" data-title="{title_attr}" aria-label="Subscribe to {channel}">'
+            f'<span>Subscribe</span></button>'
+        )
+        group_class = "subscribe-group"
+    # The bell is always rendered and hidden by the group class, so subscribing in place
+    # reveals it without a page load or a second copy of this markup in JavaScript.
+    bell = _notification_bell(channel_id_raw, notify_level)
+    return f'<div class="{group_class}" data-subscribe-group>{button}{bell}</div>'
 
 
 def _header_actions(user: dict[str, Any] | None = None, user_key: str = "local") -> str:
@@ -1265,9 +1923,9 @@ def _header_actions(user: dict[str, Any] | None = None, user_key: str = "local")
             {_menu_row("settings", "Settings", attrs=" data-open-settings-dialog")}
             {auth_action}
             <div class="menu-separator" role="separator"></div>
-            {_menu_row("library", "Library", href="/library")}
+            {_menu_row("history", "History", href="/history")}
             {_menu_row("subs", "Subscriptions", href="/channels")}
-            {_menu_row("status", "Admin status", href="/admin/status")}
+            {_menu_row("status", "Status", href="/?settings=status")}
             <div class="menu-separator" role="separator"></div>
             {_menu_row("check", "User key", trailing=auth_sub[:22], attrs=" disabled").replace('class="menu-row"', 'class="menu-row disabled"')}
           </div>
@@ -1277,70 +1935,195 @@ def _header_actions(user: dict[str, Any] | None = None, user_key: str = "local")
 
 
 def _feed_dialog(user_key: str = "local") -> str:
+    """Feed controls, built on what the feed actually contains.
+
+    The previous version showed a "Subscriptions 35% / New to you 65%" bar derived from
+    the slider position — a restatement of the input dressed up as a measurement, which is
+    worse than showing nothing because it invites you to trust it. Every number here is
+    counted from the ranked feed instead, so the panel answers "what am I actually being
+    shown" before it offers to change it.
+    """
+    from . import evaluation
+
     preferences = db.get_feed_preferences(user_key)
     preferred = ", ".join(preferences.get("preferred_topics") or [])
     muted = ", ".join(preferences.get("muted_topics") or [])
+    muted_channels = {str(c).lower() for c in (preferences.get("muted_channels") or [])}
     prioritize_checked = " checked" if preferences.get("prioritize_subscriptions", True) else ""
     shorts_checked = " checked" if preferences.get("exclude_shorts", False) else ""
     discovery_level = max(0, min(100, int(float(preferences.get("discovery_level", 0.35)) * 100)))
+
+    # Deliberately NOT computed here. Measuring the feed means running a full ranking
+    # pass, and this dialog is rendered into every page whether or not anyone opens it —
+    # so it was costing ~125ms on every single page load to draw a panel nobody had asked
+    # for. The panels below load on open instead.
+    coverage: dict[str, Any] = {}
+
+    total = int(coverage.get("videos") or 0)
+    sources = coverage.get("sources") or {}
+    subs_count = int(sources.get("subscription") or 0)
+    discovery_count = int(sources.get("discovery") or 0)
+    subs_pct = round(subs_count / total * 100) if total else 0
+    discovery_pct = 100 - subs_pct if total else 0
+    creators = int(coverage.get("distinct_channels") or 0)
+    top_share = float(coverage.get("top_channel_share") or 0)
+
+    composition = (
+        f'<div class="fc-measure">'
+        f'<div class="fc-bar" role="img" aria-label="{subs_pct}% from subscriptions, {discovery_pct}% discovered">'
+        f'<span class="fc-bar-fill" style="width:{subs_pct}%"></span></div>'
+        f'<div class="fc-legend"><span><i class="fc-dot subs"></i>From channels you follow <b>{subs_pct}%</b></span>'
+        f'<span><i class="fc-dot disc"></i>Discovered <b>{discovery_pct}%</b></span></div>'
+        f'<p class="fc-caption">Counted from the {total} videos ranked for you right now &mdash; '
+        f'{creators} different creators, and no single one holds more than {round(top_share * 100)}% of the feed.</p>'
+        f'</div>'
+    ) if total else '<p class="fc-caption" data-fc-loading>Measuring your feed\u2026</p>'
+
+    # Which signals actually fired, with real coverage. The old panel listed static chips,
+    # including one for Gorse, which has since been removed entirely.
+    signal_labels = {
+        "semantic_affinity": "Topic similarity",
+        "subscription_topic_affinity": "Subscription topics",
+        "watch_time_channel": "Channels you watch",
+        "watch_time_topic": "Subjects you watch",
+        "takeout_channel": "Imported history",
+        "takeout_already_watched": "Already watched",
+        "preferred_topic": "Followed topics",
+        "muted_topic": "Muted topics",
+        "discovery_balance": "Discovery balance",
+        "quick_abandonment": "Videos you bounced off",
+        "partial_watch_penalty": "Part-watched",
+    }
+    chips = []
+    for name, share in (coverage.get("signal_coverage") or {}).items():
+        label = signal_labels.get(name)
+        if not label:
+            continue
+        chips.append(f'<span class="fc-signal"><b>{label}</b><i>{round(float(share) * 100)}%</i></span>')
+    signals = "".join(chips) or '<span class="fc-signal muted"><b>Loading\u2026</b></span>'
+
+    # Channel mutes, offered against the creators actually filling the feed.
+    top_channels: list[dict[str, Any]] = []
+    channel_rows = "".join(
+        f'<button class="fc-channel{" is-muted" if str(row["key"]).lower() in muted_channels else ""}" type="button" '
+        f'data-mute-channel="{escape(str(row["key"]), quote=True)}" '
+        f'aria-pressed="{"true" if str(row["key"]).lower() in muted_channels else "false"}">'
+        f'<span>{escape(str(row["title"]))}</span><small>{row["count"]}</small>'
+        f'<i class="fc-channel-mark">{_icon("block")}</i></button>'
+        for row in top_channels
+    ) or '<p class="fc-caption" data-fc-loading>Loading creators\u2026</p>'
+
     return f"""
-      <dialog class="feed-dialog tune-dialog" id="feed-dialog" aria-labelledby="feed-dialog-title">
-        <form id="feed-preferences-form" method="dialog" data-tune-root style="--tune: {discovery_level}; --tune-hue: {190 + discovery_level * 1.65:.0f};">
-          <div class="tune-hero">
-            <span class="tune-aurora" aria-hidden="true"></span>
-            <div class="dialog-head">
-              <div>
-                <p class="tune-eyebrow">Feed controls</p>
-                <h2 id="feed-dialog-title">Personalize your feed</h2>
-                <p class="tune-sub">Set how far OpenFeed wanders from the channels you follow. Everything here applies the moment you save.</p>
-              </div>
-              <button class="icon-button" type="button" data-close-dialog aria-label="Close">{_icon("x")}</button>
+      <dialog class="feed-dialog fc-dialog" id="feed-dialog" aria-labelledby="feed-dialog-title">
+        <form id="feed-preferences-form" method="dialog" data-tune-root>
+          <div class="fc-head">
+            <div>
+              <p class="fc-kicker">Feed controls</p>
+              <h2 id="feed-dialog-title">What you see, and why</h2>
             </div>
-            <section class="tune-card" aria-label="Discovery balance">
-              <header class="tune-card-head">
-                <div>
-                  <p class="tune-card-label">Discovery</p>
-                  <p class="tune-state" data-tune-state aria-live="polite">Balanced</p>
-                </div>
-                <span class="tune-readout" data-tune-readout>{discovery_level}%</span>
-              </header>
-              <div class="tune-slider">
-                <span class="tune-track" aria-hidden="true"><span class="tune-fill" data-tune-fill></span></span>
-                <input class="tune-range" name="discovery_level" type="range" min="0" max="100" value="{discovery_level}" data-tune-range aria-label="Discovery level">
-              </div>
-              <div class="tune-scale" aria-hidden="true"><span>Familiar</span><span>Balanced</span><span>Wide open</span></div>
-              <div class="tune-mix" aria-hidden="true">
-                <span class="tune-mix-bar"><span class="tune-mix-known" data-tune-known></span><span class="tune-mix-new" data-tune-new></span></span>
-                <div class="tune-mix-legend">
-                  <span><i class="tune-dot known"></i>Subscriptions &amp; close matches <b data-tune-known-pct>65%</b></span>
-                  <span><i class="tune-dot new"></i>New to you <b data-tune-new-pct>35%</b></span>
-                </div>
-              </div>
-            </section>
+            <button class="icon-button" type="button" data-close-dialog aria-label="Close">{_icon("x")}</button>
           </div>
-          <div class="dialog-body dialog-grid">
-            <section class="dialog-section dialog-card" aria-label="Feed sources">
+
+          <div class="fc-body">
+            <section class="fc-section">
+              <h3>Your feed right now</h3>
+              <div data-fc-composition>{composition}</div>
+            </section>
+
+            <section class="fc-section">
+              <h3>How far to wander <span class="fc-value" data-tune-value>{discovery_level}%</span></h3>
+              <p class="fc-caption">Low keeps close to what you already watch. High lets less certain
+                matches through. This changes ranking only &mdash; the split above is measured after.</p>
+              <input class="fc-slider" type="range" min="0" max="100" step="5" name="discovery_level"
+                     value="{discovery_level}" data-tune-input aria-label="Discovery level">
+              <div class="fc-scale"><span>Familiar</span><span>Balanced</span><span>Adventurous</span></div>
+            </section>
+
+            <section class="fc-section">
               <h3>Sources</h3>
-              <label class="toggle-row"><span><strong>Prioritize subscriptions</strong><small>Anchor the feed to subscribed channels and the topics they cover.</small></span><input name="prioritize_subscriptions" type="checkbox" data-tune-input{prioritize_checked}></label>
-              <label class="toggle-row"><span><strong>Exclude Shorts</strong><small>Hide videos under 90 seconds from every recommendation section.</small></span><input name="exclude_shorts" type="checkbox" data-tune-input{shorts_checked}></label>
+              <label class="toggle-row"><span><strong>Prioritize subscriptions</strong>
+                <small>Give channels you follow a head start in ranking.</small></span>
+                <input name="prioritize_subscriptions" type="checkbox"{prioritize_checked}></label>
+              <label class="toggle-row"><span><strong>Exclude Shorts</strong>
+                <small>Hide videos under 90 seconds from every recommendation section.</small></span>
+                <input name="exclude_shorts" type="checkbox"{shorts_checked}></label>
             </section>
-            <section class="dialog-section dialog-card" aria-label="Topic preferences">
+
+            <section class="fc-section">
               <h3>Topics</h3>
-              <label class="text-field">Follow<input name="preferred_topics" type="text" value="{escape(preferred, quote=True)}" placeholder="technology, cooking, music" data-topic-input="follow"></label>
-              <div class="topic-chip-list" data-topic-chips="follow"></div>
-              <label class="text-field">Mute<input name="muted_topics" type="text" value="{escape(muted, quote=True)}" placeholder="drama, prank, reaction" data-topic-input="mute"></label>
-              <div class="topic-chip-list muted" data-topic-chips="mute"></div>
-              <p class="dialog-note">Comma separated. Followed topics get a visible boost; muted topics take a heavy ranking penalty.</p>
+              <label class="fc-field"><span>More of</span>
+                <input name="preferred_topics" type="text" value="{escape(preferred, quote=True)}"
+                       placeholder="woodworking, astronomy"></label>
+              <label class="fc-field"><span>Less of</span>
+                <input name="muted_topics" type="text" value="{escape(muted, quote=True)}"
+                       placeholder="drama, reaction"></label>
+              <p class="fc-caption">Comma separated. Followed topics get a boost; muted topics take a
+                heavy penalty but are not removed outright.</p>
             </section>
-            <section class="dialog-section dialog-card" aria-label="Signals collected">
+
+            <section class="fc-section">
+              <h3>Creators in your feed</h3>
+              <p class="fc-caption">Tap to mute. A muted creator is removed from recommendations
+                entirely, not just pushed down &mdash; you stay subscribed.</p>
+              <div class="fc-channels" data-fc-channels>{channel_rows}</div>
+            </section>
+
+            <section class="fc-section">
               <h3>Signals in play</h3>
-              <div class="signal-list"><span>Subscriptions</span><span>Watch progress</span><span>Likes &amp; dislikes</span><span>Not interested</span><span>Gorse personalization</span></div>
+              <p class="fc-caption">What the ranker actually used, and how much of the feed each one
+                touched.</p>
+              <div class="fc-signals" data-fc-signals>{signals}</div>
             </section>
           </div>
-          <div class="dialog-actions"><p id="feed-preferences-status" class="status-line"></p><button type="button" data-reset-feed-preferences>Reset</button><button class="primary-action tune-save" type="submit">Save changes</button></div>
+
+          <div class="fc-foot">
+            <p id="feed-preferences-status" class="status-line"></p>
+            <button class="pill-action" type="button" data-reset-feed-preferences>Reset</button>
+            <button class="primary-action" type="submit">Save changes</button>
+          </div>
         </form>
       </dialog>
     """
+
+
+def _sponsorblock_settings_html(user_key: str = "local") -> str:
+    """The SponsorBlock pane: master switch, per-category action, and the trade stated."""
+    from . import sponsorblock
+
+    if not get_settings().sponsorblock_enabled:
+        return '<p class="dialog-note">SponsorBlock is disabled for this deployment.</p>'
+    try:
+        preferences = db.get_feed_preferences(user_key)
+        on = bool(preferences.get("sponsorblock_enabled"))
+        actions = sponsorblock.normalize_actions(preferences.get("sponsorblock_actions"))
+    except Exception:
+        on, actions = False, dict(sponsorblock.DEFAULT_ACTIONS)
+
+    rows = []
+    for key, label, blurb in sponsorblock.CATEGORIES:
+        current = actions.get(key, "off")
+        options = "".join(
+            f'<option value="{value}"{" selected" if current == value else ""}>{text}</option>'
+            for value, text in (("skip", "Auto-skip"), ("manual", "Show skip button"), ("off", "Do nothing"))
+        )
+        rows.append(
+            f'<label class="sb-row"><span><strong>{escape(label)}</strong><small>{escape(blurb)}</small></span>'
+            f'<select data-sponsorblock-category="{key}" aria-label="{escape(label)} action">{options}</select></label>'
+        )
+
+    return f'''
+      <label class="toggle-row"><span><strong>SponsorBlock</strong>
+        <small>Skip sponsor reads and other interruptions using the community segment database.</small></span>
+        <input type="checkbox" data-setting-sponsorblock{" checked" if on else ""}></label>
+      <p class="dialog-note privacy-note">Privacy trade-off: this asks a third party about the videos
+        you open. It is kept as small as it can be. Lookups use SponsorBlock's hashed endpoint &mdash;
+        OpenFeed sends only the first four characters of the video ID's SHA-256, and gets back segments
+        for every video sharing that prefix, so SponsorBlock cannot tell which one you are watching.
+        Requests go out from this server, never your browser, so your IP and session stay here, and
+        results are cached so a video is asked about roughly once. Counts shown on videos are RYD's estimates, not figures published by YouTube. This is read-only: OpenFeed never
+        submits segments, votes, or reports, none of which are possible without identifying you.</p>
+      <div class="sb-categories" data-sponsorblock-categories{"" if on else " hidden"}>{"".join(rows)}</div>
+    '''
 
 
 def _settings_dialog(user: dict[str, Any] | None = None, user_key: str = "local") -> str:
@@ -1351,9 +2134,33 @@ def _settings_dialog(user: dict[str, Any] | None = None, user_key: str = "local"
         comments_checked = " checked" if _preferences.get("show_comments") else ""
         # Stored as exclude_shorts; surfaced as the friendlier positive "Show Shorts".
         shorts_checked = "" if _preferences.get("exclude_shorts") else " checked"
+        ryd_checked = " checked" if _preferences.get("ryd_enabled") else ""
+        posts_checked = " checked" if _preferences.get("show_posts_in_feeds") else ""
     except Exception:
         comments_checked = ""
         shorts_checked = " checked"
+        ryd_checked = ""
+        posts_checked = ""
+
+    # The trade-off is stated in full next to the switch rather than buried in docs: this
+    # is the one setting that sends anything about what is in your library off the box.
+    ryd_row = (
+        '<label class="toggle-row"><span><strong>Estimated dislike counts</strong>'
+        '<small>Fetch public dislike estimates from Return YouTube Dislike, which YouTube '
+        'itself stopped publishing in 2021.</small></span>'
+        f'<input type="checkbox" data-setting-ryd{ryd_checked}></label>'
+        '<p class="dialog-note privacy-note">Privacy trade-off: turning this on tells a third '
+        'party which video IDs your server is interested in. To keep that as small as possible, '
+        'OpenFeed only ever reads from RYD, never submits to it &mdash; your likes and dislikes '
+        'stay in your own database. Most lookups run in the background on the sync schedule. '
+        'Opening a video with no estimate yet does trigger one, but it is shuffled into a batch '
+        'of unrelated videos that also need filling in, so RYD sees a group and cannot tell '
+        'which one you are watching; if there is nothing to hide it among, the request waits for '
+        'the next background pass instead. Everything goes out from the server, so RYD never '
+        'sees your IP, account, or session, and each video is asked about once and then cached.</p>'
+    ) if get_settings().ryd_enabled else (
+        '<p class="dialog-note">Estimated dislike counts are disabled for this deployment.</p>'
+    )
     signed_in = bool(user.get("authenticated"))
     display_name_raw = str(user.get("display_name") or "Local OpenFeed")
     display_name = escape(display_name_raw)
@@ -1372,8 +2179,10 @@ def _settings_dialog(user: dict[str, Any] | None = None, user_key: str = "local"
     panes = [
         ("playback", "Playback", "play"),
         ("content", "Content", "home"),
+        ("import", "Import", "spark"),
         ("account", "Account", "user"),
         ("services", "Services", "status"),
+        ("status", "Status", "spark"),
     ]
     nav = "".join(
         f'<button class="settings-nav-item{" active" if index == 0 else ""}" type="button" role="tab" '
@@ -1420,6 +2229,9 @@ def _settings_dialog(user: dict[str, Any] | None = None, user_key: str = "local"
                 <span class="status-line" data-playback-status></span>
               </div>
               <div class="diagnosis" data-playback-diagnosis hidden></div>
+
+              <div class="settings-divider" role="separator"></div>
+              {_sponsorblock_settings_html(user_key)}
             </section>
 
             <section class="settings-pane" data-settings-pane-body="content" role="tabpanel">
@@ -1430,6 +2242,19 @@ def _settings_dialog(user: dict[str, Any] | None = None, user_key: str = "local"
               <label class="toggle-row"><span><strong>Show Shorts</strong><small>Include vertical Shorts, with their own shelf on Home. Off hides them everywhere.</small></span><input type="checkbox" data-setting-shorts{shorts_checked}></label>
               <label class="toggle-row"><span><strong>Show comments</strong><small>Load comments on watch pages through Invidious, only when you open a video.</small></span><input type="checkbox" data-setting-comments{comments_checked}></label>
               <p class="dialog-note" data-comments-status></p>
+              <label class="toggle-row"><span><strong>Show posts in feeds</strong>
+                <small>Mix community posts from subscribed channels into Home and Subscriptions.
+                       The Posts tab on a channel works either way.</small></span>
+                <input type="checkbox" data-setting-posts{posts_checked}></label>
+              {ryd_row}
+            </section>
+
+            <section class="settings-pane" data-settings-pane-body="import" role="tabpanel">
+              {_takeout_pane_html(user_key)}
+            </section>
+
+            <section class="settings-pane settings-pane-wide" data-settings-pane-body="status" role="tabpanel">
+              <div data-status-body><p class="dialog-note">Loading status&hellip;</p></div>
             </section>
 
             <section class="settings-pane" data-settings-pane-body="account" role="tabpanel">
@@ -1454,8 +2279,8 @@ def _settings_dialog(user: dict[str, Any] | None = None, user_key: str = "local"
                 <h3>Services</h3>
                 <p>The backends OpenFeed depends on.</p>
               </header>
-              <dl class="settings-list"><dt>FreshRSS</dt><dd>{freshrss}</dd><dt>Invidious</dt><dd>{escape(settings.invidious_public_url or "Not configured")}</dd><dt>Gorse</dt><dd>{escape(settings.gorse_base_url or "Not configured")}</dd></dl>
-              <div class="settings-pane-actions"><a class="text-action" href="/admin/status">{_icon("status")}<span>Full status page</span></a></div>
+              <dl class="settings-list"><dt>FreshRSS</dt><dd>{freshrss}</dd><dt>Invidious</dt><dd>{escape(settings.invidious_public_url or "Not configured")}</dd></dl>
+              
             </section>
           </div>
         </div>
@@ -1474,7 +2299,7 @@ def _progress_rail(video: dict[str, Any]) -> str:
     return f'<span class="progress-rail" aria-hidden="true"><span style="width:{width:.0f}%"></span></span>'
 
 
-def _home_video_card(video: dict[str, Any], position: int, settings: Any, variant: str = "grid") -> str:
+def _home_video_card(video: dict[str, Any], position: int, settings: Any, variant: str = "grid", force_watch_route: bool = False) -> str:
     title_text = str(video.get("title") or "Untitled")
     title = escape(title_text)
     channel_text = str(video.get("channel_title") or video.get("author") or "Unknown channel")
@@ -1482,7 +2307,14 @@ def _home_video_card(video: dict[str, Any], position: int, settings: Any, varian
     video_id_raw = str(video.get("youtube_video_id") or "")
     video_id = escape(video_id_raw)
     # Shorts open in the immersive Shorts feed; everything else opens the watch page.
-    watch_href = (f"/shorts?start={video_id}" if db.is_short_video(video) else f"/watch/{video_id}") if video_id else "#"
+    # A downloaded short overrides that: the Shorts feed streams from Invidious, so
+    # sending it there would ignore the copy on disk the user asked us to keep.
+    if not video_id:
+        watch_href = "#"
+    elif db.is_short_video(video) and not force_watch_route:
+        watch_href = f"/shorts?start={video_id}"
+    else:
+        watch_href = f"/watch/{video_id}"
     channel_id = escape(str(video.get("youtube_channel_id") or ""))
     channel_href = f"/channel/{channel_id}" if channel_id else "/channels"
     original_url = escape(video.get("url") or f"https://www.youtube.com/watch?v={video_id_raw}")
@@ -1869,14 +2701,12 @@ def _home_feed_sections(page: int, feed_filter: str, settings: Any, user_key: st
         # Shorts into the 16:9 grid and leave the Shorts shelf with nothing.
         shorts = _dedupe_section_videos(db.list_short_videos(14, user_key), seen, 14) if show_shorts else []
 
-        # The top of the feed is always the recommendation run, with subscription
-        # uploads woven through it rather than parked in their own shelf below.
-        recommended = _blend_subscription_videos(
-            _without_shorts(db.list_recommended_videos(HOME_PAGE_SIZE + 12, 0, "all", user_key)),
-            subscription_pool,
-            HOME_PAGE_SIZE,
-            cadence,
-        )
+        # Recommendations are recommendations. Subscription uploads used to be woven into
+        # this shelf every few slots, which meant the same handful of followed creators
+        # filled the top of the page and genuinely recommended videos were pushed off it.
+        # They now have their own shelf below and their own page, so this run is ranked
+        # purely on merit — topics, watch time, and everything else the scorer knows.
+        recommended = _without_shorts(db.list_recommended_videos(HOME_PAGE_SIZE + 24, 0, "recommended", user_key))
         top_videos = _dedupe_section_videos(recommended, seen, HOME_PAGE_SIZE)
         if top_videos:
             sections.append({"id": "recommended", "eyebrow": "For you", "title": "Recommended for you", "videos": top_videos, "layout": "grid", "kind": "recommended"})
@@ -1894,12 +2724,7 @@ def _home_feed_sections(page: int, feed_filter: str, settings: Any, user_key: st
         if shorts:
             sections.append({"id": "shorts", "eyebrow": "Shorts", "title": "Shorts", "videos": shorts, "layout": "shorts", "kind": "shorts"})
         more = _dedupe_section_videos(
-            _blend_subscription_videos(
-                _without_shorts(db.list_recommended_videos(HOME_PAGE_SIZE, HOME_PAGE_SIZE, "all", user_key)),
-                subscription_pool,
-                HOME_PAGE_SIZE,
-                cadence,
-            ),
+            _without_shorts(db.list_recommended_videos(HOME_PAGE_SIZE, HOME_PAGE_SIZE, "all", user_key)),
             seen,
             HOME_PAGE_SIZE,
         )
@@ -1913,7 +2738,7 @@ def _home_feed_sections(page: int, feed_filter: str, settings: Any, user_key: st
     # Page 0 already served two runs, so deeper pages start past both of them.
     offset = (HOME_PAGE_SIZE * 2) + ((page - 1) * HOME_PAGE_SIZE)
     if page % 4 == 1:
-        lane, title, eyebrow = "all", "More from channels you like", "Personalized"
+        lane, title, eyebrow = "recommended", "More for you", "Personalized"
         section_id = f"channels-you-like-{page}"
     elif page % 4 == 2:
         lane, title, eyebrow = "recent", "Recently uploaded in your interests", "Fresh"
@@ -1922,26 +2747,20 @@ def _home_feed_sections(page: int, feed_filter: str, settings: Any, user_key: st
         lane, title, eyebrow = "long-form", "Long-form picks", "Deep watch"
         section_id = f"long-form-{page}"
     else:
-        lane, title, eyebrow = "all", "Personalized discovery", "Explore"
+        lane, title, eyebrow = "recommended", "Personalized discovery", "Explore"
         section_id = f"discovery-{page}"
 
     videos = db.list_recommended_videos(HOME_PAGE_SIZE, offset, lane, user_key)
     if len(videos) < 8 and lane != "all":
         # A narrow lane runs dry long before the library does. Top it up rather than
         # returning an empty page, which would stop infinite scroll for good.
-        videos = videos + db.list_recommended_videos(HOME_PAGE_SIZE, offset, "all", user_key)
+        videos = videos + db.list_recommended_videos(HOME_PAGE_SIZE, offset, "recommended", user_key)
         title, eyebrow = "More recommendations", "Keep going"
         section_id = f"more-{page}"
 
-    # Deeper pages keep the same blend so subscriptions never fall out of the feed.
-    # Start past what page 0 already showed, or every page would inject the same
-    # uploads and the client-side dedupe would just drop them again.
-    subscription_slice = subscription_pool[min(len(subscription_pool), 42 + (page - 1) * 8):]
-    videos = _dedupe_section_videos(
-        _blend_subscription_videos(_without_shorts(videos), subscription_slice, HOME_PAGE_SIZE, cadence),
-        seen,
-        HOME_PAGE_SIZE,
-    )
+    # Deeper pages are recommendations too — subscriptions reach the feed through their
+    # own shelf and the catch-up shelf below, not by being injected into every grid.
+    videos = _dedupe_section_videos(_without_shorts(videos), seen, HOME_PAGE_SIZE)
     if videos:
         sections.append({"id": section_id, "eyebrow": eyebrow, "title": title, "videos": videos, "layout": "grid", "kind": "recommended"})
 
@@ -2017,8 +2836,15 @@ def _home_styles() -> str:
       /* ---------- top bar ---------- */
       .app-header { position: fixed; top: 0; left: 0; right: 0; z-index: 60; height: var(--header); background: rgba(10,10,11,.86); backdrop-filter: saturate(160%) blur(14px); border-bottom: 1px solid var(--border-soft); display: grid; grid-template-columns: minmax(150px, 1fr) minmax(0, 560px) minmax(150px, 1fr); align-items: center; gap: 16px; padding: 0 16px; }
       .header-left { display: flex; align-items: center; gap: 6px; min-width: 0; }
-      .brand { display: inline-flex; align-items: center; gap: 8px; padding: 0 6px; font-size: 15px; font-weight: 650; letter-spacing: -.02em; color: var(--text); }
-      .brand-mark { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; background: var(--accent); color: #fff; font-size: 9px; font-weight: 700; letter-spacing: .02em; }
+      .brand { display: inline-flex; align-items: center; gap: 9px; padding: 0 6px; font-size: 16px; letter-spacing: -.025em; color: var(--text); }
+      .brand-mark { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 8px;
+        background: var(--accent); color: #fff; }
+      .brand-mark svg { width: 24px; height: 24px; display: block; }
+      /* "Open" light, "Feed" solid: the weight break carries the wordmark, so the tile
+         does not have to hold a word at 9px to say what this is. */
+      .brand-word { font-weight: 400; color: var(--muted); }
+      .brand-word b { font-weight: 680; color: var(--text); }
+      .brand:hover .brand-word { color: var(--text); }
       .header-center { display: flex; align-items: center; gap: 8px; justify-content: center; min-width: 0; }
       .search-form { flex: 1; min-width: 0; height: 36px; display: flex; align-items: center; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); overflow: hidden; transition: border-color .12s ease, background .12s ease; }
       .search-form:hover { background: var(--surface-2); }
@@ -2028,7 +2854,11 @@ def _home_styles() -> str:
       .search-form button { width: 52px; height: 100%; border: 0; border-left: 1px solid var(--border-soft); background: var(--surface-2); display: grid; place-items: center; cursor: pointer; color: var(--muted); }
       .search-form button:hover { color: var(--text); background: var(--surface-3); }
       .header-mic { display: none; }
-      .header-actions { display: flex; justify-content: flex-end; align-items: center; gap: 2px; }
+      .header-actions { display: flex; justify-content: flex-end; align-items: center; gap: 6px; }
+      /* The bell is a 34px hit area around a 20px glyph; the avatar is a bare 28px circle
+         with no padding of its own. Matching gaps therefore look uneven, and the avatar
+         ends up almost touching the bell — hence the extra room on this one. */
+      .header-actions .profile-menu { margin-left: 6px; }
       .icon-button { width: 34px; height: 34px; border: 0; border-radius: 999px; background: transparent; display: grid; place-items: center; cursor: pointer; color: var(--muted); transition: background .12s ease, color .12s ease; }
       .icon-button:hover { background: var(--surface-2); color: var(--text); }
       .compact-only { display: none; }
@@ -2042,6 +2872,10 @@ def _home_styles() -> str:
       .nav-group:first-child { padding-top: 0; }
       .nav-group:last-child { border-bottom: 0; }
       .nav-group-title { margin: 6px 0 6px; padding: 0 12px; font-size: 13px; font-weight: 600; letter-spacing: -.01em; color: var(--text); }
+      .nav-more { border: 0; background: none; width: 100%; cursor: pointer; color: var(--text); }
+      .nav-more .icon { transition: transform .18s ease; }
+      .nav-more[aria-expanded="true"] .icon { transform: rotate(180deg); }
+      .nav-heading { margin: 2px 0 6px; padding: 0 12px; color: var(--text); font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
       .nav-item { position: relative; min-height: 38px; border-radius: 10px; display: flex; align-items: center; gap: 16px; padding: 0 12px; color: var(--text); font-size: 13.5px; transition: background .12s ease, color .12s ease; }
       .nav-item:hover { background: var(--surface-2); }
       .nav-item.active { background: var(--surface-3); font-weight: 500; }
@@ -2129,7 +2963,11 @@ def _home_styles() -> str:
       .shelf-nav .icon { width: 15px; height: 15px; }
 
       /* ---------- video cards ---------- */
-      .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(288px, 1fr)); gap: 34px 20px; align-items: start; }
+      /* Three across at most. auto-fill packs in as many 288px columns as fit, which on
+         a wide window is four and makes each card small enough that titles truncate.
+         min() caps the count while still collapsing to 2 and 1 on narrower screens. */
+      .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(max(288px, (100% - 40px) / 3), 1fr));
+        gap: 34px 20px; align-items: start; }
       .video-card { min-width: 0; color: var(--text); }
       .thumb { position: relative; display: grid; place-items: center; aspect-ratio: 16 / 9; overflow: hidden; border-radius: var(--r-thumb); background: #000; border: 1px solid var(--border-soft); color: #fff; }
       .thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
@@ -2226,10 +3064,14 @@ def _home_styles() -> str:
       .signal-list { display: flex; flex-wrap: wrap; gap: 6px; }
       .signal-list span { min-height: 26px; display: inline-flex; align-items: center; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--muted); padding: 0 9px; font-size: 11.5px; }
       /* ---------- settings dialog ---------- */
-      .settings-dialog { width: min(860px, calc(100vw - 32px)); overflow: hidden; }
+      /* Wider and taller: the panes now carry real content — the source ladder, the
+   privacy note, and the Takeout importer with its step-by-step instructions —
+   and 860px left all of it scrolling in a narrow column. */
+      .settings-dialog { width: min(1180px, calc(100vw - 48px)); height: min(760px, calc(100vh - 64px)); overflow: hidden; }
+      .settings-dialog .dialog-body { max-height: none; height: 100%; }
       .settings-dialog[open] { animation: tune-in .22s cubic-bezier(.2,.9,.3,1); }
       .settings-dialog::backdrop { background: rgba(0,0,0,.66); backdrop-filter: blur(6px); }
-      .settings-shell { display: grid; grid-template-columns: 208px minmax(0, 1fr); min-height: 470px; max-height: min(84vh, 720px); }
+      .settings-shell { display: grid; grid-template-columns: 232px minmax(0, 1fr); height: 100%; min-height: 0; }
       .settings-nav { display: flex; flex-direction: column; gap: 2px; padding: 18px 12px 12px; border-right: 1px solid var(--border-soft);
         background: linear-gradient(180deg, rgba(255,255,255,.03), transparent 40%), var(--surface-2); }
       .settings-nav-head { padding: 0 10px 14px; }
@@ -2331,81 +3173,29 @@ def _home_styles() -> str:
          the user to make a deliberate choice, so the controls should feel deliberate. */
       .toggle-row input[type=checkbox], .source-row input[type=checkbox] { appearance: none; -webkit-appearance: none; position: relative; width: 40px; height: 23px; flex: 0 0 auto; margin: 0; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-3); cursor: pointer; transition: background .18s ease, border-color .18s ease, box-shadow .18s ease; }
       .toggle-row input[type=checkbox]::after, .source-row input[type=checkbox]::after { content: ''; position: absolute; top: 2px; left: 2px; width: 17px; height: 17px; border-radius: 999px; background: #d8d8de; box-shadow: 0 1px 3px rgba(0,0,0,.5); transition: transform .18s cubic-bezier(.2,.8,.3,1.2), background .18s ease; }
-      .toggle-row input[type=checkbox]:checked, .source-row input[type=checkbox]:checked { background: linear-gradient(120deg, hsl(var(--tune-hue, 352) 72% 46%), hsl(calc(var(--tune-hue, 352) + 26) 78% 54%)); border-color: transparent; box-shadow: 0 0 14px hsl(var(--tune-hue, 352) 80% 50% / .35); }
+      .toggle-row input[type=checkbox]:checked, .source-row input[type=checkbox]:checked { background: var(--accent); border-color: transparent; }
       .toggle-row input[type=checkbox]:checked::after, .source-row input[type=checkbox]:checked::after { transform: translateX(17px); background: #fff; }
       .toggle-row input[type=checkbox]:focus-visible, .source-row input[type=checkbox]:focus-visible { box-shadow: var(--focus); }
-      .toggle-row:has(input[type=checkbox]:checked) { border-color: hsl(var(--tune-hue, 352) 60% 50% / .35); }
+      .toggle-row:has(input[type=checkbox]:checked) { border-color: rgba(229,72,77,.32); }
       .toggle-row { transition: border-color .2s ease, background .2s ease; }
 
       /* ---------- personalize feed dialog ---------- */
-      .tune-dialog { width: min(760px, calc(100vw - 32px)); overflow: hidden; }
-      .tune-dialog[open] { animation: tune-in .22s cubic-bezier(.2,.9,.3,1); }
       @keyframes tune-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: none; } }
-      .tune-dialog::backdrop { background: rgba(0,0,0,.66); backdrop-filter: blur(6px); }
-      .tune-hero { position: relative; overflow: hidden; padding-bottom: 18px; border-bottom: 1px solid var(--border-soft); background:
-        radial-gradient(120% 140% at 8% -10%, hsl(var(--tune-hue) 70% 22% / .55), transparent 62%),
-        radial-gradient(90% 120% at 100% 0%, hsl(calc(var(--tune-hue) + 40) 70% 24% / .35), transparent 60%),
         var(--surface); transition: background .35s ease; }
-      .tune-aurora { position: absolute; inset: -40% -10% auto -10%; height: 220px; pointer-events: none; background: radial-gradient(50% 100% at 50% 50%, hsl(var(--tune-hue) 90% 55% / .22), transparent 70%); filter: blur(18px); opacity: .9; transform: translateX(calc((var(--tune) - 50) * .6%)); transition: transform .35s cubic-bezier(.2,.8,.3,1), background .35s ease; }
-      .tune-hero .dialog-head { border-bottom: 0; padding-bottom: 4px; }
-      .tune-eyebrow { margin: 0 0 6px; font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: hsl(var(--tune-hue) 80% 72%); transition: color .35s ease; }
-      .tune-sub { margin: 8px 0 0; max-width: 46ch; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
-      .tune-card { position: relative; margin: 4px 20px 0; padding: 16px 18px 18px; border: 1px solid hsl(var(--tune-hue) 60% 60% / .18); border-radius: 14px; background: rgba(10,10,11,.55); backdrop-filter: blur(8px); display: grid; gap: 12px; transition: border-color .35s ease, box-shadow .35s ease; }
-      .tune-card-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; }
-      .tune-card-label { margin: 0; font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted-2); }
-      .tune-state { margin: 3px 0 0; font-size: 16px; font-weight: 600; letter-spacing: -.014em; color: var(--text); }
-      .tune-readout { font-variant-numeric: tabular-nums; font-size: 22px; font-weight: 650; letter-spacing: -.02em; color: hsl(var(--tune-hue) 85% 66%); transition: color .3s ease, transform .18s ease; }
-      .tune-slider { position: relative; height: 26px; display: flex; align-items: center; }
-      .tune-track { position: absolute; left: 0; right: 0; height: 8px; border-radius: 999px; background: linear-gradient(90deg, rgba(255,255,255,.09), rgba(255,255,255,.05)); overflow: hidden; }
       /* The thumb travels inset by half its own width at each end, so the fill has to
          use the same geometry or the colour stops short of (or runs past) the handle. */
-      .tune-fill { display: block; height: 100%; width: calc(10px + (100% - 20px) * var(--tune) / 100); border-radius: 999px; background: linear-gradient(90deg, hsl(calc(var(--tune-hue) - 32) 78% 48%), hsl(var(--tune-hue) 88% 58%)); box-shadow: 0 0 16px hsl(var(--tune-hue) 90% 55% / .45); transition: width .12s linear, background .3s ease, box-shadow .3s ease; }
-      .tune-range { position: relative; z-index: 2; width: 100%; margin: 0; background: transparent; appearance: none; -webkit-appearance: none; cursor: grab; }
-      .tune-range:active { cursor: grabbing; }
-      .tune-range::-webkit-slider-runnable-track { height: 8px; background: transparent; }
-      .tune-range::-moz-range-track { height: 8px; background: transparent; }
-      .tune-range::-webkit-slider-thumb { appearance: none; -webkit-appearance: none; width: 20px; height: 20px; margin-top: -6px; border-radius: 999px; background: #fff; border: 3px solid hsl(var(--tune-hue) 88% 56%); box-shadow: 0 2px 10px rgba(0,0,0,.55), 0 0 0 0 hsl(var(--tune-hue) 90% 55% / .5); transition: transform .16s cubic-bezier(.2,.8,.3,1.4), border-color .3s ease, box-shadow .2s ease; }
-      .tune-range::-moz-range-thumb { width: 20px; height: 20px; border-radius: 999px; background: #fff; border: 3px solid hsl(var(--tune-hue) 88% 56%); box-shadow: 0 2px 10px rgba(0,0,0,.55); transition: transform .16s ease, border-color .3s ease; }
-      .tune-range:focus-visible { outline: none; box-shadow: none; }
-      .tune-range:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 4px hsl(var(--tune-hue) 90% 55% / .35); }
-      [data-tune-root].is-sliding .tune-range::-webkit-slider-thumb { transform: scale(1.22); box-shadow: 0 2px 12px rgba(0,0,0,.6), 0 0 0 8px hsl(var(--tune-hue) 90% 55% / .18); }
       [data-tune-root].is-sliding .tune-range::-moz-range-thumb { transform: scale(1.22); }
-      [data-tune-root].is-sliding .tune-card { border-color: hsl(var(--tune-hue) 70% 60% / .4); box-shadow: 0 0 0 1px hsl(var(--tune-hue) 70% 55% / .16), 0 18px 40px hsl(var(--tune-hue) 80% 20% / .5); }
       [data-tune-root].is-sliding .tune-readout { transform: scale(1.06); }
       /* Grid, not space-between: with flex the middle label centres between the two
          end labels rather than on the track's midpoint, which reads as crooked. */
-      .tune-scale { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; color: var(--muted-2); font-size: 11px; letter-spacing: .01em; }
-      .tune-scale span:first-child { justify-self: start; }
-      .tune-scale span:nth-child(2) { justify-self: center; opacity: .7; }
-      .tune-scale span:last-child { justify-self: end; }
-      .tune-mix { display: grid; gap: 8px; padding-top: 12px; border-top: 1px solid var(--border-soft); }
-      .tune-mix-bar { display: flex; height: 10px; border-radius: 999px; overflow: hidden; background: var(--surface-3); }
-      .tune-mix-bar > span { display: block; transition: width .28s cubic-bezier(.2,.8,.3,1), background .3s ease; }
-      .tune-mix-known { background: linear-gradient(90deg, hsl(calc(var(--tune-hue) - 45) 62% 42%), hsl(calc(var(--tune-hue) - 20) 70% 50%)); }
-      .tune-mix-new { background: linear-gradient(90deg, hsl(var(--tune-hue) 85% 55%), hsl(calc(var(--tune-hue) + 30) 88% 62%)); }
-      .tune-mix-legend { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11.5px; }
-      .tune-mix-legend span { display: inline-flex; align-items: center; gap: 7px; }
-      .tune-mix-legend b { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
-      .tune-dot { width: 8px; height: 8px; border-radius: 999px; }
-      .tune-dot.known { background: hsl(calc(var(--tune-hue) - 30) 68% 48%); }
-      .tune-dot.new { background: hsl(calc(var(--tune-hue) + 15) 88% 58%); }
       .topic-chip-list { display: flex; flex-wrap: wrap; gap: 6px; min-height: 0; }
       .topic-chip-list:empty { display: none; }
-      .topic-chip-list button { min-height: 26px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid hsl(var(--tune-hue) 60% 55% / .3); border-radius: 999px; background: hsl(var(--tune-hue) 70% 50% / .12); color: var(--text); padding: 0 8px 0 10px; font-size: 11.5px; cursor: pointer; animation: chip-in .18s ease; transition: background .15s ease, border-color .15s ease; }
-      .topic-chip-list button:hover { background: hsl(var(--tune-hue) 70% 50% / .22); }
       .topic-chip-list button em { font-style: normal; opacity: .55; font-size: 13px; line-height: 1; }
       .topic-chip-list.muted button { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.05); color: var(--muted); text-decoration: line-through; text-decoration-color: rgba(255,255,255,.28); }
       @keyframes chip-in { from { opacity: 0; transform: translateY(3px) scale(.96); } to { opacity: 1; transform: none; } }
-      .tune-save { background: linear-gradient(120deg, hsl(var(--tune-hue) 80% 52%), hsl(calc(var(--tune-hue) + 34) 85% 60%)); color: #fff; box-shadow: 0 6px 18px hsl(var(--tune-hue) 80% 40% / .38); transition: filter .15s ease, box-shadow .2s ease, background .3s ease; }
-      .tune-save:hover { background: linear-gradient(120deg, hsl(var(--tune-hue) 80% 56%), hsl(calc(var(--tune-hue) + 34) 88% 64%)); filter: brightness(1.05); }
       @media (prefers-reduced-motion: reduce) {
-        .tune-dialog[open] { animation: none; }
-        .tune-fill, .tune-mix-bar > span, .tune-aurora, .tune-readout, .tune-range::-webkit-slider-thumb { transition: none; }
       }
       @media (max-width: 720px) {
-        .tune-card { margin: 4px 14px 0; padding: 14px; }
-        .tune-readout { font-size: 19px; }
-        .tune-mix-legend { flex-direction: column; }
       }
 
       .dialog-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; padding: 0 20px 20px; }
@@ -2413,8 +3203,6 @@ def _home_styles() -> str:
       .dialog-actions button:hover { background: var(--surface-3); }
       .dialog-actions .primary-action { background: #f1f1f3; color: #0a0a0b; font-weight: 600; }
       .dialog-actions .primary-action:hover { background: #fff; }
-      .dialog-actions .tune-save { background: linear-gradient(120deg, hsl(var(--tune-hue) 80% 52%), hsl(calc(var(--tune-hue) + 34) 85% 60%)); color: #fff; box-shadow: 0 6px 18px hsl(var(--tune-hue) 80% 40% / .38); }
-      .dialog-actions .tune-save:hover { background: linear-gradient(120deg, hsl(var(--tune-hue) 80% 56%), hsl(calc(var(--tune-hue) + 34) 88% 64%)); filter: brightness(1.05); }
       .picker-list { display: grid; gap: 2px; max-height: 320px; overflow: auto; }
       .picker-row { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 46px; padding: 0 12px; border: 0; border-radius: 10px; background: transparent; color: var(--text); text-align: left; cursor: pointer; font-size: 13px; }
       .picker-row:hover { background: var(--surface-3); }
@@ -2565,6 +3353,16 @@ def _home_styles() -> str:
       .playlist-remove:hover { background: var(--surface-3); color: #f2686c; }
 
       /* ---------- channel page ---------- */
+      /* YouTube caps channel content and centres it. Ours inherited the 2200px page width,
+         which stretched the banner and left the identity block marooned against the
+         gutter — the single biggest reason the page did not read like a channel. */
+      /* An inner wrapper, not margin-inline on the main element: .home-main uses
+         margin-left for the sidebar offset, and "auto" silently discarded it, sliding the
+         whole page under the nav. */
+      .channel-main .ch-wrap { max-width: 1320px; margin-inline: auto; }
+      .channel-banner { aspect-ratio: 6.2 / 1; border-radius: 12px; overflow: hidden; background: var(--surface-2); margin-top: 4px; }
+      .channel-banner img { width: 100%; height: 100%; object-fit: cover; display: block; }
+      .channel-banner:not(.has-image) { display: none; }
       /* YouTube banner geometry. Invidious serves the desktop crop (2560x423, ~6.05:1).
          YouTube renders 2560x423 on desktop, 1855x423 on tablet and 1546x423 on mobile —
          all the same centred strip, progressively cropped at the sides. Matching those
@@ -2624,6 +3422,11 @@ def _home_styles() -> str:
       .shorts-action:hover { background: var(--surface-2); }
       .shorts-action .icon { width: 22px; height: 22px; }
       .shorts-action.is-selected { color: var(--accent); }
+      /* Same filled-thumb treatment as the watch page, so a like reads the same everywhere. */
+      .shorts-action .icon { transition: fill .18s ease; }
+      .shorts-action.is-selected .icon { fill: currentColor; }
+      .shorts-action.is-bumped .icon { animation: thumb-pop .38s cubic-bezier(.2,1.55,.35,1); }
+      .shorts-action.is-bumped[data-feedback="dislike"] .icon { animation-name: thumb-pop-down; }
       .shorts-nav-buttons { position: absolute; right: 14px; bottom: 20px; display: grid; gap: 8px; z-index: 5; }
       .shorts-nav { width: 34px; height: 34px; border: 1px solid var(--border); border-radius: 999px; background: rgba(18,18,20,.9); color: var(--text); display: grid; place-items: center; cursor: pointer; backdrop-filter: blur(6px); }
       .shorts-nav:hover { background: var(--surface-3); }
@@ -2677,62 +3480,570 @@ def _home_styles() -> str:
       .comment .avatar { width: 36px; height: 36px; }
       .comment-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-bottom: 5px; }
       .comment-author { font-size: 12.5px; font-weight: 600; color: var(--text); }
-      .comment-author.owner { background: var(--surface-3); border-radius: 999px; padding: 2px 9px; }
+      /* A creator's own comment is set apart the way YouTube does it: their handle gets a
+         filled chip, and the whole comment a faint tint so it reads as authored, not just
+         another reply. */
+      .comment-author.owner { background: var(--text); color: var(--bg); border-radius: 999px; padding: 2px 9px; font-weight: 650; }
+      .comment.is-creator { background: rgba(255,255,255,.028); border-radius: 12px; padding: 12px 14px; margin-left: -14px; }
+      .comment-mention { color: #6ea8ff; font-weight: 550; }
+      .comment-heart { position: relative; display: inline-grid; place-items: center; width: 22px; height: 22px; }
+      .comment-heart img { width: 18px; height: 18px; border-radius: 999px; object-fit: cover; }
+      .comment-heart i { position: absolute; right: -3px; bottom: -3px; font-size: 10px; font-style: normal;
+        color: #f2686c; text-shadow: 0 0 3px rgba(0,0,0,.9); }
       .comment-time { color: var(--muted-2); font-size: 12px; }
       .comment-flag { color: var(--muted-2); font-size: 11px; display: inline-flex; align-items: center; gap: 4px; }
       .comment-flag .icon { width: 13px; height: 13px; }
       .comment-body { margin: 0; color: var(--text); font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+      /* A clickable timestamp, in a description or a comment. Styled as a link but built
+         as a button, because it seeks the player rather than navigating anywhere. */
+      .ts-link { border: 0; background: none; padding: 0; font: inherit; color: #6ea8ff; cursor: pointer; }
+      .ts-link:hover, .ts-link:focus-visible { text-decoration: underline; }
+      .watch-description a { color: #6ea8ff; overflow-wrap: anywhere; }
+      .watch-description a:hover { text-decoration: underline; }
+      /* Kept tight so the pair reads as one control. The like button carries a count and
+         the dislike does not — YouTube publishes no per-comment dislike figure, and there
+         is nothing to put there — so the gap between them is the only thing holding the
+         two thumbs apart. */
+      .comment-reactions { display: inline-flex; align-items: center; gap: 0; margin-left: -5px; }
+      .comment-vote-count { font-size: 11.5px; }
+      .comment-vote { display: inline-flex; align-items: center; gap: 4px; min-height: 26px; padding: 0 5px;
+        border: 0; border-radius: 999px; background: transparent; color: var(--muted-2); font-size: 12px;
+        font-variant-numeric: tabular-nums; cursor: pointer; transition: background .12s ease, color .12s ease; }
+      .comment-vote:hover { background: var(--surface-3); color: var(--text); }
+      .comment-vote .icon { width: 15px; height: 15px; transition: fill .16s ease, transform .16s ease; }
+      .comment-vote.is-selected { color: var(--text); }
+      .comment-vote.is-selected .icon { fill: currentColor; }
+      .comment-vote .icon { transition: fill .18s ease; }
+      .comment-vote.is-bumped .icon { animation: thumb-pop .38s cubic-bezier(.2,1.55,.35,1); }
+      .comment-vote.is-bumped[data-comment-vote="dislike"] .icon { animation-name: thumb-pop-down; }
+      @media (prefers-reduced-motion: reduce) { .comment-vote .icon { transition: none; } }
       .comment-meta { display: flex; align-items: center; gap: 14px; margin-top: 8px; color: var(--muted-2); font-size: 12px; }
       .comment-meta span { display: inline-flex; align-items: center; gap: 5px; }
       .comment-meta .icon { width: 14px; height: 14px; }
 
       /* ---------- watch ---------- */
-      .watch-main { max-width: 1760px; padding-top: calc(var(--header) + 20px); padding-right: 32px; }
-      .watch-layout { display: grid; grid-template-columns: minmax(0, 1fr) clamp(320px, 27vw, 392px); gap: 28px; align-items: start; min-width: 0; }
+      /* The player is a grid child rather than the first thing inside the article, which
+         is what lets theater mode span it across both columns without moving any markup. */
+      /* --theater-reserve is the vertical room theater mode keeps below the player for the
+         title, channel row and action buttons. Raise it to see more of the page under the
+         video, lower it to let the video grow. */
+      .watch-main { max-width: 1760px; padding-top: calc(var(--header) + 20px); padding-right: 32px;
+        --watch-gutter: 32px; --theater-reserve: 196px; }
+      .watch-layout { display: grid; grid-template-columns: minmax(0, 1fr) clamp(320px, 27vw, 392px);
+        grid-template-areas: "stage panel" "content panel"; gap: 0 28px; align-items: start; min-width: 0; }
       .watch-layout > * { min-width: 0; }
-      .watch-content { min-width: 0; }
+      .watch-stage { grid-area: stage; }
+      .watch-content { grid-area: content; }
+      .watch-panel { grid-area: panel; }
       .watch-player-shell { position: relative; z-index: 1; background: #000; border: 1px solid var(--border-soft); border-radius: var(--r-panel); overflow: hidden; }
       .player-frame { width: 100%; max-width: 100%; aspect-ratio: 16 / 9; border: 0; background: #000; display: block; }
       .watch-title { margin: 16px 0 12px; font-size: 19px; font-weight: 650; line-height: 1.35; letter-spacing: -.018em; }
-      .watch-meta-line { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+      /* Channel, subscribe and the actions share one row, the way YouTube arranges them.
+         The actions are pushed right by an auto margin and drop to their own line only
+         once the row genuinely runs out of width. */
+      /* The margin here is load-bearing: the gap under this row used to come from
+         .watch-actions, which lost it when the actions moved onto this line. Without it
+         the description sits flush against the subscriber count and clips it. */
+      .watch-meta-line { display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap;
+        margin: 4px 0 12px; min-height: 40px; color: var(--muted); font-size: 13px; }
       .watch-channel { display: flex; align-items: center; gap: 11px; min-width: 0; }
-      .watch-channel .avatar { width: 36px; height: 36px; }
+      .watch-channel .avatar { width: 40px; height: 40px; }
       .watch-channel > div { min-width: 0; }
-      .watch-channel-name { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-size: 13.5px; font-weight: 550; }
+      .watch-creators { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+      .creator-sep { color: var(--muted-2); font-size: 12px; }
+      .watch-channel-name.is-plain { color: var(--muted); cursor: default; }
+      .watch-channel-name { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
       .watch-channel .metadata { font-size: 11.5px; margin-top: 2px; }
       .watch-inline-actions, .watch-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
       .watch-inline-actions { justify-content: flex-end; flex: 0 0 auto; }
-      .watch-actions { margin: 16px 0; }
-      .watch-actions button, .watch-actions a, .watch-actions summary, .watch-inline-actions button { min-height: 34px; border: 0; border-radius: 999px; background: var(--surface-2); color: var(--text); display: inline-flex; align-items: center; gap: 7px; padding: 0 14px; cursor: pointer; white-space: nowrap; font-size: 13px; font-weight: 500; transition: background .12s ease; }
-      .watch-actions button:hover, .watch-actions a:hover, .watch-actions summary:hover, .watch-inline-actions button:hover { background: var(--surface-3); }
-      .watch-actions .icon, .watch-inline-actions .icon { width: 16px; height: 16px; }
-      .watch-actions button:disabled, .watch-inline-actions button:disabled { cursor: default; opacity: .6; }
-      .watch-subscribe { min-height: 34px; border: 0; border-radius: 999px; display: inline-flex; align-items: center; gap: 7px; padding: 0 16px; cursor: pointer; font-size: 13px; font-weight: 600; background: #f1f1f3 !important; color: #0a0a0b !important; }
+      .watch-actions { margin: 0 0 0 auto; }
+
+      /* One pill, used by every action on the page, so hover, press and focus behave
+         identically whether the control is a button, a link or a <summary>. */
+      .pill-action { min-height: 36px; border: 1px solid transparent; border-radius: 999px; background: var(--surface-2); color: var(--text);
+        display: inline-flex; align-items: center; gap: 8px; padding: 0 15px; cursor: pointer; white-space: nowrap;
+        font-size: 13px; font-weight: 550; letter-spacing: -.005em; list-style: none;
+        transition: background .14s ease, border-color .14s ease, color .14s ease, transform .14s cubic-bezier(.2,.8,.3,1); }
+      .pill-action:hover { background: var(--surface-3); border-color: var(--border-soft); }
+      .pill-action:active { transform: scale(.96); }
+      .pill-action:disabled { cursor: default; opacity: .55; }
+      .pill-action .icon { width: 17px; height: 17px; }
+      .pill-icon { width: 36px; padding: 0; justify-content: center; gap: 0; }
+
+      /* ---------- subscribe + notification bell ---------- */
+      .subscribe-group { display: inline-flex; align-items: center; }
+      .subscribe-group.is-subscribed { background: var(--surface-2); border-radius: 999px; }
+      .subscribe-group:not(.is-subscribed) .notify-menu { display: none; }
+      .watch-subscribe { min-height: 36px; border: 0; border-radius: 999px; display: inline-flex; align-items: center; gap: 7px;
+        padding: 0 18px; cursor: pointer; font-size: 13px; font-weight: 650; letter-spacing: -.006em;
+        background: var(--text); color: var(--bg);
+        transition: filter .14s ease, transform .14s cubic-bezier(.2,.8,.3,1), background .14s ease, color .14s ease; }
       .watch-subscribe .icon { width: 16px; height: 16px; }
-      .watch-subscribe.subscribed { background: var(--surface-2) !important; color: var(--text) !important; font-weight: 500; }
-      .watch-subscribe.subscribed:hover { background: var(--surface-2) !important; color: var(--text) !important; }
-      .watch-reactions { display: inline-flex; align-items: center; background: var(--surface-2); border-radius: 999px; overflow: hidden; }
-      .watch-reactions .watch-icon-action { border-radius: 0 !important; background: transparent !important; }
-      .watch-reactions .watch-icon-action:first-child { border-right: 1px solid var(--border) !important; }
-      .watch-icon-action { width: 42px; justify-content: center; padding: 0 !important; }
-      .watch-icon-action.has-count { width: auto; padding: 0 14px !important; gap: 8px; }
-      .watch-icon-action.is-selected { color: var(--text) !important; background: var(--surface-3) !important; }
+      .watch-subscribe:hover { filter: brightness(.88); }
+      .watch-subscribe:active { transform: scale(.96); }
+      .watch-subscribe.subscribed { background: transparent; color: var(--text); font-weight: 550; border-radius: 999px 0 0 999px; padding-right: 14px; }
+      .watch-subscribe.subscribed:hover { background: var(--surface-3); filter: none; }
+      .notify-menu { display: inline-flex; }
+      .notify-trigger { position: relative; min-height: 36px; display: inline-flex; align-items: center; gap: 1px;
+        padding: 0 12px 0 10px; border-radius: 0 999px 999px 0; color: var(--text); cursor: pointer; list-style: none;
+        transition: background .14s ease, color .14s ease; }
+      .notify-trigger::-webkit-details-marker { display: none; }
+      .notify-trigger::before { content: ""; position: absolute; left: 0; top: 9px; bottom: 9px; width: 1px; background: var(--border); }
+      .notify-trigger:hover, .notify-menu[open] > .notify-trigger { background: var(--surface-3); }
+      .notify-trigger.is-muted { color: var(--muted-2); }
+      .notify-trigger .icon { width: 17px; height: 17px; }
+      .notify-trigger .icon + .icon { width: 13px; height: 13px; color: var(--muted); transition: transform .18s ease; }
+      .notify-menu[open] > .notify-trigger .icon + .icon { transform: rotate(180deg); }
+      .notify-menu .menu-panel { right: 0; left: auto; top: 42px; width: min(288px, calc(100vw - 24px)); }
+      .notify-menu.drop-up .menu-panel { top: auto; bottom: 42px; }
+
+      /* ---------- reactions ---------- */
+      .watch-reactions { display: inline-flex; align-items: center; background: var(--surface-2); border-radius: 999px; }
+      .watch-reactions .pill-action { background: transparent; border-color: transparent; }
+      .watch-reactions .pill-action:hover { background: var(--surface-3); }
+      .watch-reactions .pill-action:first-child { border-radius: 999px 0 0 999px; padding-right: 13px; }
+      .watch-reactions .pill-action:last-child { position: relative; border-radius: 0 999px 999px 0; padding-left: 13px; }
+      .watch-reactions .pill-action:last-child::before { content: ""; position: absolute; left: 0; top: 9px; bottom: 9px; width: 1px; background: var(--border); }
+      /* The outline is one closed subpath, so filling it is the whole "filled thumb"
+         state — there is no second icon that could drift away from the outline one. */
+      .reaction-action .icon { transition: fill .18s ease; }
+      .reaction-action.is-selected { color: var(--text); }
+      .reaction-action.is-selected .icon { fill: currentColor; }
+      .reaction-action.is-bumped .icon { animation: thumb-pop .38s cubic-bezier(.2,1.55,.35,1); }
+      .reaction-action.is-bumped[data-feedback="dislike"] .icon { animation-name: thumb-pop-down; }
+      @keyframes thumb-pop {
+        0% { transform: scale(1) rotate(0); }
+        30% { transform: scale(1.3) rotate(-10deg); }
+        62% { transform: scale(.93) rotate(4deg); }
+        100% { transform: scale(1) rotate(0); }
+      }
+      @keyframes thumb-pop-down {
+        0% { transform: scale(1) rotate(0); }
+        30% { transform: scale(1.3) rotate(10deg); }
+        62% { transform: scale(.93) rotate(-4deg); }
+        100% { transform: scale(1) rotate(0); }
+      }
       .reaction-count { font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--muted); }
-      .watch-icon-action.is-selected .reaction-count { color: var(--text); }
+      .reaction-action.is-selected .reaction-count { color: var(--text); }
       .reaction-count.muted { color: var(--muted-2); }
+      /* An estimate is set slightly back from a real count so the two do not read alike. */
+      .reaction-count.is-estimate { color: var(--muted); }
+      .privacy-note { border-left: 2px solid var(--border); padding-left: 10px; margin-top: 4px; line-height: 1.55; }
+
+      /* ---------- download picker ---------- */
+      .download-dialog { width: min(460px, calc(100vw - 32px)); }
+      .download-options { display: grid; gap: 6px; }
+      .download-option { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 48px;
+        border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-2); color: var(--text);
+        padding: 0 14px; cursor: pointer; text-align: left; font-size: 13px;
+        transition: background .14s ease, border-color .14s ease, transform .14s cubic-bezier(.2,.8,.3,1); }
+      .download-option:hover { background: var(--surface-3); border-color: var(--border); }
+      .download-option:active { transform: scale(.985); }
+      .download-option .icon { width: 17px; height: 17px; color: var(--muted); }
+      .download-option strong { display: block; font-size: 13.5px; font-weight: 600; }
+      .download-option small { display: block; color: var(--muted-2); font-size: 11.5px; margin-top: 2px; }
+      .download-size { color: var(--muted-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+      /* ---------- video details ---------- */
+      .details-dialog { width: min(560px, calc(100vw - 32px)); }
+      .details-dialog .video-details > summary { display: none; }
+      .details-dialog .video-details { margin: 0; border-top: 0; padding-top: 0; }
+      .video-details { margin-top: 14px; border-top: 1px solid var(--border-soft); padding-top: 12px; }
+      .video-details > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 7px;
+        color: var(--muted); font-size: 12.5px; font-weight: 600; }
+      .video-details > summary::-webkit-details-marker { display: none; }
+      .video-details > summary:hover { color: var(--text); }
+      .video-details > summary .icon { width: 15px; height: 15px; }
+      .video-details[open] > summary { margin-bottom: 12px; color: var(--text); }
+      .detail-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px 20px; margin: 0; }
+      .detail-row { display: grid; gap: 2px; }
+      .detail-row dt { color: var(--muted-2); font-size: 11.5px; }
+      .detail-row dd { margin: 0; font-size: 13px; font-variant-numeric: tabular-nums; }
+      .detail-tag { display: inline-block; margin-left: 5px; padding: 1px 6px; border-radius: 999px;
+        background: var(--surface-3); color: var(--muted); font-size: 10.5px; font-weight: 600; }
+      .detail-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+      .detail-chip { padding: 4px 10px; border-radius: 999px; background: var(--surface-2); color: var(--muted);
+        font-size: 11.5px; transition: background .12s ease, color .12s ease; }
+      .detail-chip:hover { background: var(--surface-3); color: var(--text); }
+
+      /* ---------- channel page ---------- */
+      .ch-identity { display: grid; grid-template-columns: 160px minmax(0, 1fr); gap: 28px; align-items: center;
+        margin: 24px 0 0; }
+      .ch-avatar { width: 160px; height: 160px; font-size: 44px; }
+      .ch-identity-copy { min-width: 0; display: grid; gap: 8px; }
+      .ch-identity h1 { margin: 0; font-size: 36px; font-weight: 700; letter-spacing: -.03em; display: flex; align-items: center; gap: 8px; line-height: 1.15; }
+      .ch-identity h1 .verified { width: 17px; height: 17px; color: var(--muted); }
+      .ch-meta { margin: 0; color: var(--muted); font-size: 14px; }
+      .ch-handle { color: var(--text); font-weight: 550; }
+      .ch-dot { color: var(--muted-2); }
+      /* One clamped line with "...more" trailing it. Deliberately not expandable in place:
+         this sits in a grid cell next to the avatar, so growing it shifts the avatar. */
+      .ch-about { display: flex; align-items: baseline; gap: 4px; color: var(--muted); font-size: 14px;
+        line-height: 1.45; max-width: 620px; }
+      .ch-about p { margin: 0; }
+      .ch-about-short { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .ch-about-more { flex: none; border: 0; background: none; padding: 0; color: var(--text); font-size: 14px;
+        font-weight: 600; cursor: pointer; }
+      .ch-about-more:hover { text-decoration: underline; }
+      .ch-about a { color: #6ea8ff; }
+      .ch-links { display: flex; align-items: center; gap: 7px; margin: 0; font-size: 14px; }
+      .ch-links .icon { width: 15px; height: 15px; color: var(--muted); flex: none; }
+      .ch-links a { color: #6ea8ff; }
+
+      /* Scoped to [open]: a bare `display: flex` on a dialog beats the browser's own
+         "closed dialogs are hidden" rule, and the panel renders inline on page load. */
+      .ch-about-dialog[open] { width: min(560px, calc(100vw - 32px)); max-height: min(86vh, 780px);
+        display: flex; flex-direction: column; }
+      .ch-about-dialog .fc-head { align-items: center; }
+      .ch-about-dialog .fc-head h2 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -.02em; }
+      .ch-about-dialog .fc-body { overflow-y: auto; padding: 4px 22px 22px; display: grid; gap: 0; }
+      .ch-about-section { padding: 18px 0 0; }
+      .ch-about-section h3 { margin: 0 0 10px; font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+      .ch-about-text { color: var(--text); font-size: 14px; line-height: 1.5; white-space: pre-line;
+        overflow-wrap: anywhere; }
+      .ch-about-text a { color: #6ea8ff; }
+      .ch-link-list, .ch-info-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
+      .ch-link-list li, .ch-info-list li { display: flex; align-items: center; gap: 14px; min-width: 0; }
+      .ch-link-list .icon, .ch-info-list .icon { width: 20px; height: 20px; color: var(--muted); flex: none; }
+      .ch-link-list div { min-width: 0; display: grid; gap: 1px; }
+      .ch-link-name { font-size: 14px; font-weight: 550; }
+      .ch-link-list a, .ch-info-list a { color: #6ea8ff; font-size: 14px; overflow-wrap: anywhere; }
+      .ch-info-list span { font-size: 14px; }
+      .ch-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+      .ch-menu { display: inline-flex; }
+      .ch-menu .menu-panel { left: 0; right: auto; top: 40px; }
+
+      .ch-tabs { display: flex; align-items: stretch; justify-content: space-between; gap: 28px; margin: 22px 0 0;
+        padding: 0 2px; border-bottom: 1px solid var(--border-soft); }
+      .ch-tab-row { display: flex; align-items: center; gap: 28px; min-width: 0; overflow-x: auto;
+        scrollbar-width: none; }
+      .ch-tab-row::-webkit-scrollbar { display: none; }
+      .ch-tab { position: relative; padding: 13px 0; color: var(--muted); font-size: 15px; font-weight: 550; letter-spacing: -.005em; }
+      .ch-tab:hover { color: var(--text); }
+      .ch-tab.active { color: var(--text); }
+      .ch-tab.active::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: var(--text); }
+      /* YouTube's channel search is a bare magnifier that grows into an underlined field.
+         The old pill drew a small outlined box floating in the middle of the tab row. */
+      .ch-search { flex: none; display: flex; align-items: center; gap: 10px; align-self: center; }
+      .ch-search-toggle { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px;
+        padding: 0; border: 0; border-radius: 50%; background: none; color: var(--muted); cursor: pointer;
+        transition: background .12s ease, color .12s ease; }
+      .ch-search-toggle:hover { background: var(--surface-2); color: var(--text); }
+      .ch-search-toggle .icon { width: 20px; height: 20px; }
+      .ch-search.is-open .ch-search-toggle { color: var(--text); }
+      .ch-search input { width: 0; padding: 5px 0; border: 0; border-bottom: 1px solid transparent;
+        background: none; color: var(--text); font-size: 14px; outline: none; opacity: 0;
+        transition: width .18s ease, opacity .12s ease; }
+      .ch-search.is-open input { width: min(240px, 34vw); opacity: 1; border-bottom-color: var(--border); }
+      .ch-search.is-open input:focus { border-bottom-color: var(--text); }
+      .ch-search input::-webkit-search-cancel-button { filter: invert(.6); }
+
+      .channel-main .video-grid { margin-top: 18px; }
+      .ch-filters { display: flex; gap: 8px; margin: 20px 0 6px; }
+      .ch-chip { display: inline-flex; align-items: center; min-height: 34px; padding: 0 14px; border-radius: 999px;
+        background: var(--surface-2); color: var(--text); font-size: 13.5px; font-weight: 500; }
+      .ch-chip:hover { background: var(--surface-3); }
+      .ch-chip.active { background: var(--text); color: var(--bg); }
+
+      @media (max-width: 760px) {
+        .ch-identity { grid-template-columns: 1fr; justify-items: center; text-align: center; gap: 14px; }
+        .ch-identity-copy { justify-items: center; }
+        .ch-avatar { width: 96px; height: 96px; }
+        .ch-identity h1 { font-size: 24px; }
+        .ch-tabs { gap: 12px; }
+        .ch-tab-row { gap: 18px; }
+        .ch-search.is-open input { width: 42vw; }
+        .ch-about { max-width: none; }
+      }
+
+      /* ---------- feed controls ----------
+         Deliberately plain. The panel this replaced animated a gradient from cyan to
+         magenta as the slider moved, which had nothing to do with the rest of the
+         interface and made a settings panel look like a screensaver. */
+      .fc-dialog[open] { width: min(720px, calc(100vw - 40px)); max-height: min(88vh, 880px); display: flex; flex-direction: column; }
+      .fc-dialog form { display: flex; flex-direction: column; min-height: 0; }
+      .fc-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
+        padding: 20px 22px 16px; border-bottom: 1px solid var(--border-soft); }
+      .fc-kicker { margin: 0 0 4px; color: var(--muted-2); font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; }
+      .fc-head h2 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: -.02em; }
+      .fc-body { overflow-y: auto; padding: 4px 22px 8px; display: grid; gap: 4px; }
+      .fc-section { padding: 16px 0; border-bottom: 1px solid var(--border-soft); }
+      .fc-section:last-child { border-bottom: 0; }
+      .fc-section h3 { margin: 0 0 8px; font-size: 13.5px; font-weight: 600; display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+      .fc-value { color: var(--accent); font-size: 13px; font-variant-numeric: tabular-nums; }
+      .fc-caption { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+
+      /* Measured composition. One bar, two real numbers, counted not derived. */
+      .fc-measure { display: grid; gap: 9px; }
+      .fc-bar { height: 8px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
+      .fc-bar-fill { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
+      .fc-legend { display: flex; justify-content: space-between; gap: 14px; color: var(--muted); font-size: 12px; }
+      .fc-legend b { color: var(--text); font-variant-numeric: tabular-nums; margin-left: 4px; }
+      .fc-dot { width: 8px; height: 8px; border-radius: 999px; display: inline-block; margin-right: 7px; }
+      .fc-dot.subs { background: var(--accent); }
+      .fc-dot.disc { background: var(--surface-3); border: 1px solid var(--border); }
+
+      .fc-slider { width: 100%; height: 4px; margin: 12px 0 6px; appearance: none; border-radius: 999px;
+        background: linear-gradient(to right, var(--accent) var(--fill, 35%), var(--surface-3) var(--fill, 35%)); cursor: pointer; }
+      .fc-slider::-webkit-slider-thumb { appearance: none; width: 16px; height: 16px; border-radius: 999px;
+        background: var(--text); border: 3px solid var(--accent); cursor: grab; }
+      .fc-slider::-moz-range-thumb { width: 16px; height: 16px; border-radius: 999px; background: var(--text);
+        border: 3px solid var(--accent); cursor: grab; }
+      .fc-scale { display: flex; justify-content: space-between; color: var(--muted-2); font-size: 11px; }
+
+      .fc-field { display: grid; gap: 5px; margin-bottom: 10px; }
+      .fc-field span { color: var(--muted); font-size: 12px; }
+      .fc-field input { height: 36px; padding: 0 12px; border: 1px solid var(--border); border-radius: 9px;
+        background: var(--surface-2); color: var(--text); font-size: 13px; }
+      .fc-field input:focus-visible { border-color: var(--accent); }
+
+      .fc-channels { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+      .fc-channel { display: inline-flex; align-items: center; gap: 7px; min-height: 32px; padding: 0 11px;
+        border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); color: var(--text);
+        font-size: 12.5px; cursor: pointer; }
+      .fc-channel:hover { background: var(--surface-3); }
+      .fc-channel small { color: var(--muted-2); font-variant-numeric: tabular-nums; }
+      .fc-channel-mark { display: none; }
+      .fc-channel-mark .icon { width: 13px; height: 13px; }
+      .fc-channel.is-muted { border-color: var(--accent); background: var(--accent-soft); color: var(--muted); text-decoration: line-through; }
+      .fc-channel.is-muted .fc-channel-mark { display: grid; place-items: center; color: var(--accent); }
+
+      .fc-signals { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+      .fc-signal { display: inline-flex; align-items: baseline; gap: 7px; padding: 5px 11px; border-radius: 999px;
+        background: var(--surface-2); border: 1px solid var(--border-soft); font-size: 12px; }
+      .fc-signal b { font-weight: 550; }
+      .fc-signal i { color: var(--muted-2); font-style: normal; font-variant-numeric: tabular-nums; }
+      .fc-signal.muted b { color: var(--muted-2); font-weight: 500; }
+
+      .fc-foot { display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+        padding: 14px 22px; border-top: 1px solid var(--border-soft); }
+      .fc-foot .status-line { margin-right: auto; }
+
+      /* ---------- community posts ---------- */
+      .post-list { display: grid; gap: 14px; max-width: 760px; }
+      .post-list.is-shelf { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); max-width: none; }
+      .post-card { border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); padding: 16px 18px; }
+      .post-card.is-compact { padding: 14px; }
+      .post-head { display: grid; grid-template-columns: 36px minmax(0,1fr) auto; gap: 11px; align-items: center; margin-bottom: 10px; }
+      .post-head .avatar { width: 36px; height: 36px; }
+      .post-head strong { display: block; font-size: 13.5px; font-weight: 600; }
+      .post-head small { color: var(--muted-2); font-size: 11.5px; }
+      .post-flag { margin-left: 6px; padding: 1px 6px; border-radius: 999px; background: var(--surface-3); font-size: 10px; }
+      .post-permalink { color: var(--muted); display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px; }
+      .post-permalink:hover { background: var(--surface-3); color: var(--text); }
+      .post-body { font-size: 13.5px; line-height: 1.6; overflow-wrap: anywhere; }
+      .post-card.is-compact .post-body { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+      .post-meta { margin: 10px 0 0; color: var(--muted-2); font-size: 12px; }
+      .post-images { display: grid; gap: 6px; margin-top: 12px; }
+      .post-images.is-multi { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+      .post-images img { width: 100%; border-radius: 10px; display: block; }
+      .post-video { display: grid; grid-template-columns: 168px minmax(0,1fr); gap: 12px; margin-top: 12px;
+        padding: 8px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-2); }
+      .post-video-thumb { position: relative; aspect-ratio: 16/9; border-radius: 8px; overflow: hidden; background: #000; }
+      .post-video-thumb img { width: 100%; height: 100%; object-fit: cover; }
+      .post-video-copy { display: grid; align-content: center; gap: 4px; min-width: 0; }
+      .post-video-copy strong { font-size: 13px; line-height: 1.35; }
+      .post-video-copy small { color: var(--muted); font-size: 11.5px; }
+      .post-playlist { display: flex; align-items: center; gap: 10px; margin-top: 12px; padding: 11px 13px;
+        border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-2); }
+      .post-unsupported { display: flex; gap: 8px; align-items: flex-start; margin: 12px 0 0; padding: 10px 12px;
+        border: 1px dashed var(--border); border-radius: 10px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+      .post-unsupported .icon { width: 15px; height: 15px; flex: 0 0 auto; margin-top: 1px; }
+      .post-more { margin-top: 18px; }
+
+      /* Poll. The bar is a local tally, never YouTube's split — which it does not publish. */
+      .post-poll { display: grid; gap: 6px; margin-top: 12px; }
+      .poll-choice { position: relative; display: flex; align-items: center; gap: 10px; min-height: 40px;
+        padding: 0 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2);
+        color: var(--text); font-size: 13px; text-align: left; cursor: pointer; overflow: hidden; }
+      .poll-choice:hover { background: var(--surface-3); }
+      .poll-bar { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--accent-soft); transition: width .28s ease; }
+      .poll-choice.is-picked { border-color: var(--accent); }
+      .poll-choice.is-picked .poll-bar { width: 100%; }
+      .poll-text { position: relative; flex: 1 1 auto; min-width: 0; }
+      .poll-mark { position: relative; opacity: 0; color: var(--accent); display: grid; place-items: center; }
+      .poll-choice.is-picked .poll-mark { opacity: 1; }
+      .poll-mark .icon { width: 15px; height: 15px; }
+      .poll-note { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0 0; padding: 10px 12px;
+        border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-2);
+        color: var(--muted); font-size: 11.5px; line-height: 1.55; }
+      .poll-note .icon { width: 14px; height: 14px; flex: 0 0 auto; margin-top: 2px; }
+      .poll-note strong { color: var(--text); }
+
+      /* ---------- sponsorblock ---------- */
+      .settings-divider { height: 1px; margin: 6px 0 2px; background: var(--border-soft); }
+      .sb-categories { display: grid; gap: 2px; margin-top: 4px; }
+      .sb-categories[hidden] { display: none; }
+      .sb-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 9px 0; }
+      .sb-row + .sb-row { border-top: 1px solid var(--border-soft); }
+      .sb-row span { display: grid; gap: 2px; min-width: 0; }
+      .sb-row strong { font-size: 13px; font-weight: 550; }
+      .sb-row small { color: var(--muted); font-size: 11.5px; line-height: 1.45; }
+      .sb-row select { flex: 0 0 auto; height: 30px; padding: 0 8px; border: 1px solid var(--border);
+        border-radius: 8px; background: var(--surface-2); color: var(--text); font-size: 12.5px; cursor: pointer; }
+      /* The timeline markers and the manual skip button are NOT styled here. They are
+         created inside the player embed, which is a separate document that never loads
+         this stylesheet — their rules live in EMBED_CSS in the player shell, and putting
+         copies here only makes it look like they are covered. The skip notice reuses the
+         ordinary feedback toast. */
+
+      /* ---------- status ---------- */
+      .status-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+      .status-overall { display: inline-flex; align-items: center; gap: 9px; padding: 9px 15px; border-radius: 999px;
+        border: 1px solid var(--border); background: var(--surface-2); font-size: 13px; font-weight: 600; }
+      .status-overall.ok { border-color: rgba(63,185,120,.4); background: rgba(63,185,120,.1); color: #7ee2a8; }
+      .status-overall.bad { border-color: rgba(229,72,77,.45); background: var(--accent-soft); color: #f2686c; }
+      .status-overall .icon { width: 17px; height: 17px; }
+      .status-block { margin-top: 30px; }
+      .status-head { margin-bottom: 14px; }
+      .status-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+      .status-head p { margin: 4px 0 0; color: var(--muted); font-size: 12.5px; }
+      .checks-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+      .check { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 74px;
+        padding: 13px 15px; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); }
+      .check.ok { border-left: 3px solid #3fb978; }
+      .check.bad { border-left: 3px solid var(--accent); background: var(--accent-soft); }
+      .check h3 { margin: 0 0 3px; font-size: 13.5px; font-weight: 600; }
+      .check p { margin: 0; color: var(--muted-2); font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere; }
+      .check-badge { font-size: 11px; font-weight: 700; letter-spacing: .04em; color: var(--muted); }
+      .check.ok .check-badge { color: #7ee2a8; }
+      .check.bad .check-badge { color: #f2686c; }
+      .stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+      .stat-tile { display: grid; gap: 3px; padding: 13px 15px; border: 1px solid var(--border-soft);
+        border-radius: var(--r-panel); background: var(--surface); }
+      .stat-tile.ok { border-left: 3px solid #3fb978; }
+      .stat-tile.warn { border-left: 3px solid #d9a441; }
+      .stat-label { color: var(--muted); font-size: 11.5px; font-weight: 500; }
+      .stat-value { font-size: 19px; font-weight: 650; letter-spacing: -.02em; overflow-wrap: anywhere; }
+      .stat-tile small { color: var(--muted-2); font-size: 11px; overflow-wrap: anywhere; }
+      /* Tables scroll inside their own box so a long message can never widen the page. */
+      .status-scroll { overflow-x: auto; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); }
+      .status-scroll table { width: 100%; border-collapse: collapse; font-size: 12.5px; min-width: 560px; }
+      .status-scroll th, .status-scroll td { padding: 9px 14px; text-align: left; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+      .status-scroll th { color: var(--muted); font-weight: 600; font-size: 11.5px; letter-spacing: .02em; }
+      .status-scroll tr:last-child td { border-bottom: 0; }
+      .status-scroll .bad-text { color: #f2686c; }
+
+      /* ---------- takeout import ---------- */
+      .import-note { display: flex; gap: 9px; align-items: flex-start; margin-top: 12px !important;
+        padding: 11px 13px; border: 1px solid var(--border-soft); border-radius: 10px;
+        background: var(--surface-2); line-height: 1.55; }
+      .import-note .icon { width: 15px; height: 15px; flex: 0 0 auto; margin-top: 2px; color: var(--muted); }
+      .import-note strong { color: var(--text); }
+      .link-action { border: 0; background: none; padding: 0; color: #6ea8ff; font: inherit; cursor: pointer; text-decoration: underline; }
+      .link-action:hover { color: #9cc4ff; }
+      .import-status-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .import-layout { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(320px, .85fr); gap: 32px; align-items: start; }
+      .import-steps { margin: 0; padding: 0 0 0 20px; display: grid; gap: 18px; counter-reset: none; }
+      .import-steps li { padding-left: 6px; }
+      .import-steps h3 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+      .import-steps p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
+      .import-steps a { color: #6ea8ff; }
+      .import-steps code { background: var(--surface-2); border-radius: 5px; padding: 1px 5px; font-size: 12px; }
+      .import-panel { position: sticky; top: calc(var(--header) + 20px); display: grid; gap: 14px;
+        border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); padding: 18px; }
+      .import-drop { display: grid; place-items: center; gap: 6px; min-height: 190px; padding: 20px; cursor: pointer;
+        border: 1.5px dashed var(--border); border-radius: 12px; background: var(--surface-2); text-align: center; }
+      .import-drop:hover, .import-drop.is-over { border-color: var(--accent); background: var(--accent-soft); }
+      .import-drop .icon { width: 26px; height: 26px; color: var(--muted); }
+      .import-drop strong { font-size: 13.5px; }
+      .import-drop small { color: var(--muted-2); font-size: 12px; }
+      .import-progress[hidden], .import-result[hidden] { display: none; }
+      .import-result { border-radius: 10px; padding: 14px; background: var(--surface-2); font-size: 13px; line-height: 1.6; }
+      .import-result.is-error { background: rgba(229,72,77,.1); }
+      .import-result ul { margin: 8px 0 0; padding-left: 18px; color: var(--muted); }
+      .import-status { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+        border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); padding: 14px 18px; margin-bottom: 24px; }
+      .import-status p { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; }
+      .pill-action.danger { color: #f2686c; }
+      @media (max-width: 1000px) {
+        .import-layout { grid-template-columns: 1fr; }
+        .import-panel { position: static; }
+      }
+
+      .download-destination { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
+      .download-destination[hidden] { display: none; }
+      .destination-option { display: grid; gap: 3px; text-align: left; padding: 10px 12px; border: 1px solid var(--border);
+        border-radius: 10px; background: var(--surface-2); color: var(--text); cursor: pointer; }
+      .destination-option:hover { background: var(--surface-3); }
+      .destination-option.active { border-color: var(--accent); background: var(--accent-soft); }
+      .destination-option strong { font-size: 13px; font-weight: 600; }
+      .destination-option small { color: var(--muted); font-size: 11.5px; line-height: 1.4; }
+      @media (max-width: 560px) { .download-destination { grid-template-columns: 1fr; } }
+
+      /* A downloaded card is an ordinary card with a chip over the thumbnail. */
+      .video-card { position: relative; }
+      .download-chip { position: absolute; top: 8px; left: 8px; z-index: 3; display: inline-flex; align-items: center; gap: 6px;
+        padding: 3px 4px 3px 8px; border-radius: 999px; background: rgba(10,10,11,.82); color: #ededef;
+        font-size: 11px; font-weight: 600; backdrop-filter: blur(6px); }
+      .download-chip .icon { width: 13px; height: 13px; }
+      .download-remove { display: grid; place-items: center; width: 22px; height: 22px; border: 0; border-radius: 999px;
+        background: transparent; color: var(--muted); cursor: pointer; }
+      .download-remove:hover { background: rgba(255,255,255,.12); color: #f2686c; }
+      .download-remove .icon { width: 13px; height: 13px; }
+
+      .download-progress { display: grid; gap: 10px; }
+      .download-progress[hidden] { display: none; }
+      .download-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+      .download-progress-head strong { font-size: 13.5px; font-weight: 600; }
+      .download-bar { height: 6px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
+      .download-bar span { display: block; height: 100%; width: 0; border-radius: 999px; background: var(--accent);
+        transition: width .3s ease; }
+      .download-bar.is-indeterminate span { width: 40%; animation: download-sweep 1.1s ease-in-out infinite; }
+      @keyframes download-sweep { 0% { transform: translateX(-100%); } 100% { transform: translateX(250%); } }
+      @media (prefers-reduced-motion: reduce) {
+        .download-bar span { transition: none; }
+        .download-bar.is-indeterminate span { animation: none; width: 100%; opacity: .5; }
+      }
 
       /* ---------- theater mode ---------- */
-      body.theater .watch-main { max-width: none; padding-left: 0; padding-right: 0; }
-      body.theater .watch-layout { display: block; }
-      body.theater .watch-player-shell { max-width: none; margin: 0 0 24px; border-radius: 0; border-left: 0; border-right: 0;
-        max-height: min(80vh, calc(100vw * 9 / 16)); }
-      body.theater .watch-player-shell.is-short { max-width: min(430px, 100%); margin-inline: auto; }
-      body.theater .watch-content, body.theater .watch-panel { max-width: 1280px; margin-inline: auto; padding: 0 32px; }
-      body.theater .watch-panel { margin-top: 32px; }
+      /* Same shape YouTube uses: the player goes edge to edge, and everything below it
+         keeps the two-column split so up-next sits beside the description, not under it. */
+      body.theater .watch-layout { grid-template-areas: "stage stage" "content panel"; }
+      /* The player widens across both columns but stops at the same gutter the title and
+         up-next rail use, so every left edge on the page lines up. Going fully edge to
+         edge would overshoot that line by the width of the gutter. */
+      /* Turning the stage into a size container is what makes the rule below work: it
+         exposes the stage's own width as 100cqw, so the player's height can be written as
+         a real number instead of being derived from `aspect-ratio`. That matters because
+         `aspect-ratio` plus `max-height` makes the browser recompute the *width* from the
+         clamped height, which shrinks the box and breaks the edge alignment. */
+      /* The page normally holds a 20px gap below the header; in theater the player has to
+         meet it, so that breathing room is dropped for the duration. */
+      body.theater .watch-main { padding-top: var(--header); }
+      body.theater .watch-stage { container-type: inline-size; background: #000;
+        margin: 0 calc(var(--watch-gutter) * -1) 14px; }
+      /* The stage already spaces the player from what follows, so the title's own top
+         margin would stack on top of it — and because the up-next rail has no such margin,
+         that extra 16px also knocked the two columns out of line. Dropping it fixes the
+         gap and the alignment together: both columns now start on the same row. */
+      body.theater .watch-title { margin-top: 0; }
+      /* The box runs edge to edge and only its height gives way, so the title, channel row
+         and buttons stay on screen. Once the cap bites, the box is wider than 16:9 and the
+         video letterboxes inside it against the black backdrop — the same trade YouTube
+         makes. Nothing is cropped or stretched: only the side bars grow, and on a window
+         tall enough for the natural height there are no bars at all.
+         margin-inline is pinned to 0 because the narrow breakpoint pulls the shell out by
+         its own negative margin, which the stage is already doing here. */
+      body.theater .watch-player-shell { width: 100%; max-width: 100%; margin-inline: 0;
+        border-radius: 0; border-left: 0; border-right: 0;
+        height: min(calc(100cqw * 9 / 16), max(280px, calc(100vh - var(--header) - var(--theater-reserve, 196px)))); }
+      /* The iframe fills the capped box; the letterboxing itself is done by the video
+         element inside the player, which always preserves its own aspect ratio. */
+      body.theater .player-frame { height: 100%; aspect-ratio: auto; }
+      /* A 9:16 short letterboxed into a wide box would be almost entirely black, so spend
+         the same height budget on capping its width and keep it in its own ratio. */
+      body.theater .watch-player-shell.is-short { height: auto; aspect-ratio: 9 / 16; margin-inline: auto;
+        max-width: min(430px, calc(max(280px, 100vh - var(--header) - var(--theater-reserve, 196px)) * 9 / 16)); }
       body.nav-ready .watch-player-shell { transition: max-width .2s cubic-bezier(.2,.8,.3,1), border-radius .2s ease; }
       .theater-toggle .icon { transition: transform .18s ease; }
+      .theater-toggle.is-selected { background: var(--surface-3); border-color: var(--border-soft); }
       .theater-toggle.is-selected .icon { transform: scaleX(1.15); }
-      @media (max-width: 1100px) { body.theater .watch-content, body.theater .watch-panel { padding: 0 16px; } }
+      @media (max-width: 900px) { .watch-main { --watch-gutter: 16px; } }
+      @media (prefers-reduced-motion: reduce) {
+        .pill-action, .watch-subscribe, .download-option { transition: none; }
+        .pill-action:active, .watch-subscribe:active, .download-option:active { transform: none; }
+        .reaction-action.is-bumped .icon { animation: none; }
+      }
 
       /* ---------- comment replies ---------- */
       .reply-toggle { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; margin-top: 6px; padding: 0 10px 0 8px;
@@ -2750,7 +4061,12 @@ def _home_styles() -> str:
       .watch-description p + p { margin-top: 8px; }
       .watch-description-meta { color: var(--muted-2); font-size: 12px; font-weight: 500; margin-bottom: 10px !important; }
       .watch-description-body { overflow: hidden; }
-      .watch-description.is-collapsed .watch-description-body { max-height: 4.4em; }
+      /* line-clamp rather than a max-height: clamping by ems cut the last line through
+   its descenders, so g and p lost their tails. */
+      .watch-description.is-collapsed .watch-description-body { display: -webkit-box;
+        -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+        /* A hair of extra line-height so descenders on the clamped line are not shaved. */
+        line-height: 1.62; }
       .description-toggle { margin-top: 10px; min-height: 24px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font-size: 12.5px; font-weight: 600; cursor: pointer; padding: 0; }
       .description-toggle:hover { color: var(--text); }
       .description-empty { color: var(--muted-2); }
@@ -2801,8 +4117,10 @@ def _home_styles() -> str:
         .playlist-panel { position: static; }
       }
       @media (max-width: 1000px) {
-        .watch-layout { grid-template-columns: 1fr; }
-        .watch-panel { position: static; max-height: none; overflow: visible; }
+        /* One column, so the named areas have to collapse with it — in and out of theater. */
+        .watch-layout, body.theater .watch-layout { grid-template-columns: 1fr; grid-template-areas: "stage" "content" "panel"; }
+        body.theater .watch-stage { margin-bottom: 16px; }
+        .watch-panel { position: static; max-height: none; overflow: visible; margin-top: 24px; }
         .shelf-track { grid-auto-columns: calc((100% - 16px) / 2); }
       }
       @media (max-width: 900px) {
@@ -2847,6 +4165,8 @@ def _home_styles() -> str:
         .watch-title { font-size: 16px; }
         .watch-meta-line { align-items: flex-start; flex-direction: column; }
         .watch-inline-actions { justify-content: flex-start; width: 100%; }
+        /* Stacked, the auto margin would shove the actions to the right-hand edge. */
+        .watch-actions { margin: 0; width: 100%; }
         .watch-actions { overflow-x: auto; flex-wrap: nowrap; padding-bottom: 4px; }
         .watch-panel .media-row { grid-template-columns: minmax(132px, 42%) minmax(0, 1fr) 22px; }
         .mobile-bottom-nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 80; height: calc(56px + env(safe-area-inset-bottom)); padding-bottom: env(safe-area-inset-bottom); background: rgba(10,10,11,.94); backdrop-filter: blur(12px); border-top: 1px solid var(--border-soft); display: grid; grid-template-columns: repeat(4, 1fr); }
@@ -2873,13 +4193,28 @@ def _home_styles() -> str:
 
 
 def _home_script() -> str:
-    return '''
+    # The two thumbs come from the server's own icon table rather than being spelled out
+    # again here. A hand-copied duplicate had already drifted from it, which is exactly
+    # how the like and dislike buttons end up not matching.
+    return f'''
+      const LIKE_ICON = '{_icon("like")}';
+      const DISLIKE_ICON = '{_icon("dislike")}';
+    ''' + '''
       const PLAYLIST_ICON = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h12"/><path d="M4 12h12"/><path d="M4 18h7"/><path d="M18 15v6"/><path d="M15 18h6"/></svg>';
-      const LIKE_ICON = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88"/></svg>';
       const PLUS_ICON = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>';
       const CHECK_ICON = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>';
       const COLLECTIONS_ICON = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="7" height="7" rx="2"/><rect x="14" y="4" width="7" height="7" rx="2"/><rect x="3" y="13" width="7" height="7" rx="2"/><rect x="14" y="13" width="7" height="7" rx="2"/></svg>';
       const CHEVRON_ICON = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
+      const ICON_DOWNLOAD = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>';
+      /* Short names match the server-rendered trigger label; the longer ones are what the
+         toast says, where there is room for a full sentence. */
+      const NOTIFY_LABELS = { all: 'All', personalized: 'Personalized', none: 'None' };
+      const NOTIFY_TOASTS = { all: 'All notifications', personalized: 'Personalized notifications', none: 'Notifications off' };
+      const NOTIFY_ICONS = {
+        all: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M22 8c0-2.3-.8-4.3-2-6"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/><path d="M4 2C2.8 3.7 2 5.7 2 8"/></svg>',
+        personalized: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/></svg>',
+        none: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M17 17H4a1 1 0 0 1-.74-1.673C4.59 13.956 6 12.499 6 8a6 6 0 0 1 .258-1.742"/><path d="m2 2 20 20"/><path d="M8.668 3.01A6 6 0 0 1 18 8c0 2.687.77 4.653 1.707 6.05"/></svg>'
+      };
       const toast = document.querySelector('[data-feedback-toast]');
       const dialog = document.getElementById('feed-dialog');
       const settingsDialog = document.getElementById('settings-dialog');
@@ -2918,8 +4253,18 @@ def _home_script() -> str:
           const eventType = button.dataset.feedback;
           if (eventType !== 'like' && eventType !== 'dislike') return;
           const selected = reaction === eventType;
+          const wasSelected = button.classList.contains('is-selected');
           button.classList.toggle('is-selected', selected);
           button.setAttribute('aria-pressed', selected ? 'true' : 'false');
+          /* Bump only on the transition into selected, and via a class the server never
+             renders, so a page that loads already-liked does not animate on arrival. */
+          if (selected && !wasSelected) {
+            button.classList.remove('is-bumped');
+            void button.offsetWidth;
+            button.classList.add('is-bumped');
+          } else if (!selected) {
+            button.classList.remove('is-bumped');
+          }
         });
       }
 
@@ -3343,6 +4688,12 @@ def _home_script() -> str:
             subscribeButton.classList.toggle('subscribed', !unsubscribe);
             const label = subscribeButton.querySelector('span');
             if (label) label.textContent = unsubscribe ? 'Subscribe' : 'Subscribed';
+            /* Reveals or hides the notification bell that is already sitting in the
+               group, so subscribing in place matches what a reload would render. */
+            const group = subscribeButton.closest('[data-subscribe-group]');
+            if (group) group.classList.toggle('is-subscribed', !unsubscribe);
+            const swap = subscribeButton.querySelector('.icon');
+            if (swap && group) swap.outerHTML = unsubscribe ? PLUS_ICON : CHECK_ICON;
             if (unsubscribe) {
               subscribeButton.removeAttribute('data-unsubscribe-feed');
               subscribeButton.setAttribute('data-subscribe-feed', '');
@@ -3387,6 +4738,68 @@ def _home_script() -> str:
           if (!box) return;
           const collapsed = box.classList.toggle('is-collapsed');
           descriptionButton.textContent = collapsed ? (descriptionButton.dataset.moreLabel || 'More') : (descriptionButton.dataset.lessLabel || 'Show less');
+          return;
+        }
+
+        const commentVote = event.target.closest('[data-comment-vote]');
+        if (commentVote) {
+          event.preventDefault();
+          const box = commentVote.closest('[data-comments-for]');
+          const videoId = box ? box.dataset.commentsFor : '';
+          const commentId = commentVote.dataset.commentId || '';
+          if (!videoId || !commentId) return;
+          const pressed = commentVote.getAttribute('aria-pressed') === 'true';
+          const reaction = pressed ? '' : commentVote.dataset.commentVote;
+          /* Paint first: a vote on a comment should feel instant, and the worst case is
+             the button snapping back when the write fails. */
+          const pair = commentVote.parentElement.querySelectorAll('[data-comment-vote]');
+          pair.forEach((button) => {
+            const on = !!reaction && button.dataset.commentVote === reaction;
+            button.classList.toggle('is-selected', on);
+            button.setAttribute('aria-pressed', on ? 'true' : 'false');
+          });
+          if (reaction) {
+            /* Restarted deliberately: without clearing the class first, voting the same
+               way twice in a row would not replay the animation. */
+            commentVote.classList.remove('is-bumped');
+            void commentVote.offsetWidth;
+            commentVote.classList.add('is-bumped');
+            window.setTimeout(() => commentVote.classList.remove('is-bumped'), 420);
+          }
+          try {
+            const response = await fetch('/api/comments/reaction', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ youtube_video_id: videoId, comment_id: commentId, reaction })
+            });
+            if (!response.ok) throw new Error('save failed');
+          } catch (error) {
+            pair.forEach((button) => {
+              const on = pressed && button === commentVote;
+              button.classList.toggle('is-selected', on);
+              button.setAttribute('aria-pressed', on ? 'true' : 'false');
+            });
+            showToast('Could not save that');
+          }
+          return;
+        }
+
+        /* A timestamp anywhere — description, comment, transcript — seeks the player. */
+        const seekButton = event.target.closest('[data-seek]');
+        if (seekButton) {
+          event.preventDefault();
+          const raw = seekButton.dataset.seek || '';
+          const seconds = /^\\d+$/.test(raw)
+            ? Number(raw)
+            : raw.split(':').reduce((total, part) => total * 60 + Number(part || 0), 0);
+          const player = document.querySelector('.player-frame');
+          if (player && player.contentWindow && isFinite(seconds)) {
+            player.contentWindow.postMessage({ type: 'openfeed:seek', seconds }, window.location.origin);
+            /* A timestamp deep in the description or a comment is usually off-screen, so
+               seeking without moving looks like nothing happened. */
+            const stage = document.querySelector('.watch-stage') || player;
+            stage.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
           return;
         }
 
@@ -3904,7 +5317,6 @@ def _home_script() -> str:
         const value = Math.max(0, Math.min(100, Number(range.value || 0)));
         const hue = Math.round(190 + value * 1.65);
         tuneRoot.style.setProperty('--tune', String(value));
-        tuneRoot.style.setProperty('--tune-hue', String(hue));
 
         const readout = tuneRoot.querySelector('[data-tune-readout]');
         if (readout) readout.textContent = `${Math.round(value)}%`;
@@ -4037,19 +5449,44 @@ def _home_script() -> str:
 
         const slides = () => [...stage.querySelectorAll('[data-shorts-slide]')];
 
-        // Only the visible Short gets an iframe; the rest fall back to their poster so we
-        // are never running a dozen players at once.
-        function mountPlayer(slide) {
+        /* A small window of players stays mounted rather than only the visible one.
+           Mounting on arrival meant every scroll paid for a fresh player page plus the
+           first video segments, which is the pause between flicking and seeing anything.
+           The window is deliberately small — two ahead, one behind — because each frame
+           is a real request to Invidious and preloading the whole deck would both burn
+           bandwidth and risk tripping rate limits. */
+        const PRELOAD_AHEAD = 2;
+        const PRELOAD_BEHIND = 1;
+
+        function mountPlayer(slide, active) {
           const frame = slide.querySelector('[data-shorts-frame]');
-          if (!frame || frame.querySelector('iframe')) return;
-          const videoId = slide.dataset.videoId;
-          const iframe = document.createElement('iframe');
-          iframe.src = `/watch/${encodeURIComponent(videoId)}/player`;
-          iframe.title = slide.dataset.title || 'Short';
-          iframe.allow = 'autoplay; fullscreen; picture-in-picture';
-          iframe.setAttribute('allowfullscreen', '');
-          frame.appendChild(iframe);
-          slide.classList.add('is-playing');
+          if (!frame) return;
+          let iframe = frame.querySelector('iframe');
+          if (!iframe) {
+            const videoId = slide.dataset.videoId;
+            iframe = document.createElement('iframe');
+            /* Preloaded frames autoplay=0: they fetch the player and buffer, but stay
+               paused until this slide is the one on screen. */
+            iframe.src = `/watch/${encodeURIComponent(videoId)}/player?autoplay=${active ? 1 : 0}`;
+            iframe.title = slide.dataset.title || 'Short';
+            iframe.allow = 'autoplay; fullscreen; picture-in-picture';
+            iframe.setAttribute('allowfullscreen', '');
+            frame.appendChild(iframe);
+          }
+          if (active) {
+            slide.classList.add('is-playing');
+            tell(iframe, 'openfeed:play');
+          }
+        }
+
+        function tell(iframe, type) {
+          try { iframe?.contentWindow?.postMessage({ type }, window.location.origin); } catch (error) { /* not ready yet */ }
+        }
+
+        function pausePlayer(slide) {
+          const iframe = slide.querySelector('[data-shorts-frame] iframe');
+          if (iframe) tell(iframe, 'openfeed:pause');
+          slide.classList.remove('is-playing');
         }
 
         function unmountPlayer(slide) {
@@ -4058,11 +5495,30 @@ def _home_script() -> str:
           slide.classList.remove('is-playing');
         }
 
+        /* Keep the window populated and evict anything outside it, so memory and the
+           number of live players stay bounded however far the user scrolls. */
+        function syncWindow(index) {
+          const list = slides();
+          list.forEach((slide, position) => {
+            const distance = position - index;
+            const inWindow = distance >= -PRELOAD_BEHIND && distance <= PRELOAD_AHEAD;
+            if (!inWindow) { unmountPlayer(slide); return; }
+            if (distance === 0) return;
+            /* Staggered so arriving at a Short does not fire three player loads at once.
+               The immediate neighbour is worth loading now; the one after can wait. */
+            const delay = distance === 1 ? 0 : 400 * Math.abs(distance);
+            window.setTimeout(() => {
+              if (slide.isConnected) mountPlayer(slide, false);
+            }, delay);
+          });
+        }
+
         function setActive(slide) {
           if (!slide || slide === activeSlide) return;
-          if (activeSlide) unmountPlayer(activeSlide);
+          if (activeSlide) pausePlayer(activeSlide);
           activeSlide = slide;
-          mountPlayer(slide);
+          mountPlayer(slide, true);
+          syncWindow(slides().indexOf(slide));
           if (panel && !panel.hidden) loadShortComments(slide.dataset.videoId);
           const url = `/shorts?start=${encodeURIComponent(slide.dataset.videoId)}`;
           history.replaceState(null, '', url);
@@ -4344,6 +5800,42 @@ def _home_script() -> str:
           if (!response.ok) throw new Error('save failed');
           if (status) status.textContent = input.checked ? 'Shorts are shown in your feed.' : 'Shorts are hidden.';
           showToast(input.checked ? 'Shorts enabled' : 'Shorts hidden');
+        } catch (error) {
+          input.checked = !input.checked;
+          if (status) status.textContent = 'Could not save this setting.';
+        } finally {
+          input.disabled = false;
+        }
+      });
+
+      /* ---- estimated dislike counts (Return YouTube Dislike) ---- */
+      document.querySelector('[data-setting-ryd]')?.addEventListener('change', async (event) => {
+        const input = event.currentTarget;
+        const status = document.querySelector('[data-comments-status]');
+        input.disabled = true;
+        try {
+          const current = await fetch('/api/feed/preferences').then((r) => r.json());
+          const preferences = current.preferences || {};
+          const response = await fetch('/api/feed/preferences', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              preferred_topics: preferences.preferred_topics || [],
+              muted_topics: preferences.muted_topics || [],
+              prioritize_subscriptions: preferences.prioritize_subscriptions !== false,
+              exclude_shorts: !!preferences.exclude_shorts,
+              discovery_level: preferences.discovery_level ?? 0.35,
+              show_comments: !!preferences.show_comments,
+              ryd_enabled: input.checked
+            })
+          });
+          if (!response.ok) throw new Error('save failed');
+          if (status) {
+            status.textContent = input.checked
+              ? 'Dislike estimates will fill in over the next background sync.'
+              : 'Dislike estimates are off. Counts already fetched stay cached.';
+          }
+          showToast(input.checked ? 'Dislike estimates enabled' : 'Dislike estimates disabled');
         } catch (error) {
           input.checked = !input.checked;
           if (status) status.textContent = 'Could not save this setting.';
@@ -4714,14 +6206,83 @@ def _home_script() -> str:
 
         const body = document.createElement('p');
         body.className = 'comment-body';
-        body.textContent = item.content || '';
+        /* Built as nodes rather than innerHTML so comment text can never become markup.
+           Timestamps become buttons that seek the player, the way they do on YouTube. */
+        /* One pass over both patterns: a reply usually opens with an @mention and may
+           also carry a timestamp, and splitting twice would lose whichever ran second. */
+        (item.content || '').split(/((?:\\d{1,2}:)?\\d{1,2}:\\d{2}|@[A-Za-z0-9._-]{2,30})/).forEach((chunk) => {
+          if (!chunk) return;
+          if (/^(?:\\d{1,2}:)?\\d{1,2}:\\d{2}$/.test(chunk)) {
+            const link = document.createElement('button');
+            link.type = 'button';
+            link.className = 'ts-link';
+            link.dataset.seek = chunk;
+            link.textContent = chunk;
+            body.appendChild(link);
+          } else if (chunk.startsWith('@')) {
+            const mention = document.createElement('span');
+            mention.className = 'comment-mention';
+            mention.textContent = chunk;
+            body.appendChild(mention);
+          } else {
+            body.appendChild(document.createTextNode(chunk));
+          }
+        });
+
+        if (item.is_owner) row.classList.add('is-creator');
 
         const meta = document.createElement('div');
         meta.className = 'comment-meta';
-        const likes = document.createElement('span');
-        likes.innerHTML = LIKE_ICON;
-        likes.append(' ' + formatCount(item.like_count || 0));
-        meta.appendChild(likes);
+        if (item.creator_heart) {
+          /* Beside the vote buttons, where YouTube puts it. */
+          const heart = document.createElement('span');
+          heart.className = 'comment-heart';
+          heart.title = `${item.creator_heart_name || 'The creator'} hearted this`;
+          const face = document.createElement('img');
+          face.src = item.creator_heart;
+          face.alt = '';
+          face.loading = 'lazy';
+          face.addEventListener('error', () => face.remove());
+          const pip = document.createElement('i');
+          pip.textContent = '\u2764';
+          heart.append(face, pip);
+          meta.appendChild(heart);
+        }
+
+        /* Voting here is local only: Invidious reads comments, it cannot cast a vote on
+           YouTube. The click is recorded as a small signal about the video instead. */
+        const reactions = document.createElement('span');
+        reactions.className = 'comment-reactions';
+        const like = document.createElement('button');
+        like.type = 'button';
+        like.className = 'comment-vote';
+        like.dataset.commentVote = 'like';
+        like.dataset.commentId = item.comment_id || '';
+        like.setAttribute('aria-pressed', item.reaction === 'like' ? 'true' : 'false');
+        if (item.reaction === 'like') like.classList.add('is-selected');
+        like.setAttribute('aria-label', 'Like this comment');
+        like.innerHTML = LIKE_ICON;
+        /* A zero is not worth the width. Leaving it in padded every uncounted comment
+           and pushed the two thumbs apart for no information. */
+        if (item.like_count) {
+          const likeCount = document.createElement('span');
+          likeCount.className = 'comment-vote-count';
+          likeCount.textContent = formatCount(item.like_count);
+          like.appendChild(likeCount);
+        }
+
+        const dislike = document.createElement('button');
+        dislike.type = 'button';
+        dislike.className = 'comment-vote';
+        dislike.dataset.commentVote = 'dislike';
+        dislike.dataset.commentId = item.comment_id || '';
+        dislike.setAttribute('aria-pressed', item.reaction === 'dislike' ? 'true' : 'false');
+        if (item.reaction === 'dislike') dislike.classList.add('is-selected');
+        dislike.setAttribute('aria-label', 'Dislike this comment');
+        dislike.innerHTML = DISLIKE_ICON;
+
+        reactions.append(like, dislike);
+        meta.appendChild(reactions);
 
         main.append(head, body, meta);
 
@@ -4798,20 +6359,31 @@ def _home_script() -> str:
         return String(n);
       }
 
-      async function loadComments() {
+      /* Comments paginate as you scroll. Invidious returns a continuation token per page;
+         without following it the page showed only the first ~20 of several thousand. */
+      let commentCursor = '';
+      let commentsBusy = false;
+      let commentsDone = false;
+
+      async function loadComments(more = false) {
         const section = document.querySelector('[data-comments-for]');
-        if (!section) return;
+        if (!section || commentsBusy || (more && (commentsDone || !commentCursor))) return;
+        commentsBusy = true;
         const videoId = section.dataset.commentsFor;
         const body = section.querySelector('[data-comments-body]');
         const counter = section.querySelector('[data-comments-count]');
         try {
-          const response = await fetch(`/api/comments/${encodeURIComponent(videoId)}`);
+          const query = more ? `?continuation=${encodeURIComponent(commentCursor)}` : '';
+          const response = await fetch(`/api/comments/${encodeURIComponent(videoId)}${query}`);
           if (!response.ok) throw new Error(String(response.status));
           const data = await response.json();
           const items = data.items || [];
-          body.replaceChildren();
+          commentCursor = data.continuation || '';
+          if (!commentCursor) commentsDone = true;
+          if (!more) body.replaceChildren();
           if (counter && data.comment_count != null) counter.textContent = formatCount(data.comment_count);
           if (!items.length) {
+            if (more) { commentsDone = true; return; }
             const empty = document.createElement('p');
             empty.className = 'comments-state';
             empty.textContent = 'No comments on this video.';
@@ -4820,14 +6392,30 @@ def _home_script() -> str:
           }
           items.forEach((item) => body.appendChild(renderComment(item)));
         } catch (error) {
+          if (more) { commentsDone = true; return; }
           body.replaceChildren();
           const failed = document.createElement('p');
           failed.className = 'comments-state';
           failed.textContent = 'Comments could not be loaded right now.';
           body.appendChild(failed);
+        } finally {
+          commentsBusy = false;
         }
       }
       loadComments();
+
+      (() => {
+        const section = document.querySelector('[data-comments-for]');
+        if (!section || !('IntersectionObserver' in window)) return;
+        const sentinel = document.createElement('div');
+        sentinel.className = 'feed-sentinel';
+        section.appendChild(sentinel);
+        /* Fetches before the sentinel is on screen, so the next page is usually already
+           in place by the time you reach the bottom. */
+        new IntersectionObserver((entries) => {
+          if (entries.some((entry) => entry.isIntersecting)) loadComments(true);
+        }, { rootMargin: '600px 0px' }).observe(sentinel);
+      })();
 
       /* ---- comments setting ---- */
       document.querySelector('[data-setting-comments]')?.addEventListener('change', async (event) => {
@@ -4915,31 +6503,965 @@ def _home_script() -> str:
       })();
 
       /* ---- download ---- */
-      document.addEventListener('click', async (event) => {
-        const button = event.target.closest('[data-download-video]');
-        if (!button) return;
-        event.preventDefault();
-        const videoId = button.dataset.downloadVideo;
-        if (!videoId) return;
-        button.disabled = true;
-        showToast('Preparing download\\u2026');
-        try {
-          const info = await fetch(`/api/download/${encodeURIComponent(videoId)}/info`).then((r) => r.json());
-          if (!info.ok) throw new Error(info.detail || 'unavailable');
+      (() => {
+        const dialog = document.querySelector('[data-download-dialog]');
+
+        function formatSize(bytes) {
+          if (!bytes) return '';
+          const units = ['B', 'KB', 'MB', 'GB'];
+          let value = bytes;
+          let unit = 0;
+          while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+          return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+        }
+
+        function startDownload(videoId, itag, filename, quality) {
           /* A plain anchor click keeps the browser's own download UI and resume support. */
           const link = document.createElement('a');
-          link.href = `/api/download/${encodeURIComponent(videoId)}`;
-          link.download = info.filename || '';
+          const query = itag ? `?itag=${encodeURIComponent(itag)}` : '';
+          link.href = `/api/download/${encodeURIComponent(videoId)}${query}`;
+          link.download = filename || '';
           document.body.appendChild(link);
           link.click();
           link.remove();
-          showToast(info.quality ? `Downloading ${info.quality}` : 'Download started');
+          showToast(quality ? `Downloading ${quality}` : 'Download started');
+        }
+
+        function formatRate(bps) {
+          return bps ? `${formatSize(bps)}/s` : '';
+        }
+
+        function formatEta(seconds) {
+          if (!seconds || seconds < 0) return '';
+          const m = Math.floor(seconds / 60);
+          const s = Math.round(seconds % 60);
+          return m ? `${m}m ${s}s left` : `${s}s left`;
+        }
+
+        function showOptions(show) {
+          dialog.querySelector('[data-download-options]').hidden = !show;
+          dialog.querySelector('[data-download-destination]').hidden = !show;
+          dialog.querySelector('[data-download-progress]').hidden = show;
+        }
+
+        function chosenDestination() {
+          return dialog.querySelector('[data-destination].active')?.dataset.destination || 'local';
+        }
+
+        function renderOptions(videoId, data) {
+          const list = dialog.querySelector('[data-download-options]');
+          const note = dialog.querySelector('[data-download-note]');
+          const subtitle = dialog.querySelector('[data-download-subtitle]');
+          showOptions(true);
+          list.textContent = '';
+          if (!data.ok || !(data.formats || []).length) {
+            const empty = document.createElement('p');
+            empty.className = 'dialog-note';
+            empty.textContent = data.detail || 'No downloadable stream is available for this video.';
+            list.appendChild(empty);
+            note.hidden = true;
+            return;
+          }
+          subtitle.textContent = data.title || 'Choose a quality.';
+          data.formats.forEach((format) => {
+            const option = document.createElement('button');
+            option.type = 'button';
+            option.className = 'download-option';
+            option.dataset.downloadMode = format.mode || 'direct';
+            option.dataset.downloadItag = format.itag || '';
+            option.dataset.downloadHeight = String(format.height || 0);
+            option.dataset.downloadContainer = format.container || 'mp4';
+            option.dataset.downloadMerge = format.needs_merge ? '1' : '';
+            option.dataset.downloadFilename = format.filename || '';
+            option.dataset.downloadQuality = format.quality || '';
+            option.innerHTML = '<span class="menu-icon"></span><span></span><span class="download-size"></span>';
+            option.querySelector('.menu-icon').innerHTML = ICON_DOWNLOAD;
+            const copy = option.children[1];
+            const title = document.createElement('strong');
+            title.textContent = format.quality || 'Unknown quality';
+            const detail = document.createElement('small');
+            detail.textContent = format.needs_merge
+              ? `${(format.container || 'mp4').toUpperCase()} \\u00b7 video and audio muxed on the server`
+              : `${(format.container || 'mp4').toUpperCase()} \\u00b7 ready to stream straight through`;
+            copy.append(title, detail);
+            /* A merged size is derived from the tracks yt-dlp is expected to pick, so it
+               is close but not exact — the tilde says so rather than implying precision. */
+            const size = formatSize(format.size_bytes);
+            option.querySelector('.download-size').textContent = size && format.size_estimated ? `~${size}` : size;
+            list.appendChild(option);
+          });
+          if (!data.ytdlp) {
+            note.textContent = 'yt-dlp is not available here, so only the renditions YouTube publishes as a single file are listed.';
+            note.hidden = false;
+          } else if (!data.ffmpeg) {
+            note.textContent = 'ffmpeg is not installed, so resolutions that need video and audio merged are unavailable.';
+            note.hidden = false;
+          } else {
+            note.hidden = true;
+          }
+        }
+
+        /* --- merged downloads run as a job, because muxing takes real time --- */
+        let pollTimer = null;
+        let activeJob = '';
+
+        function stopPolling() {
+          if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+        }
+
+        function renderJob(job) {
+          const label = dialog.querySelector('[data-download-progress-label]');
+          const bar = dialog.querySelector('.download-bar');
+          const fill = dialog.querySelector('[data-download-bar]');
+          const stats = dialog.querySelector('[data-download-stats]');
+          const wording = { queued: 'Queued\\u2026', downloading: `Downloading ${job.quality || ''}`.trim(), merging: 'Merging video and audio\\u2026', done: 'Ready', error: 'Failed', cancelled: 'Cancelled' };
+          label.textContent = wording[job.status] || job.status;
+          /* Size is unknown until yt-dlp reports it, and unknowable during the merge —
+             a sweeping bar is honest there, a fake percentage is not. */
+          const indeterminate = job.status === 'merging' || (!job.total_bytes && job.status !== 'done');
+          bar.classList.toggle('is-indeterminate', indeterminate);
+          fill.style.width = indeterminate ? '' : `${job.percent || 0}%`;
+          stats.textContent = job.status === 'error'
+            ? job.error
+            : [job.total_bytes ? `${formatSize(job.downloaded_bytes)} of ${formatSize(job.total_bytes)}` : '', formatRate(job.speed_bps), formatEta(job.eta_seconds)].filter(Boolean).join(' \\u00b7 ');
+        }
+
+        async function pollJob(jobId) {
+          if (activeJob !== jobId) return;
+          let job;
+          try {
+            const data = await fetch(`/api/download/jobs/${encodeURIComponent(jobId)}`).then((r) => r.json());
+            job = data.job;
+          } catch (error) {
+            showToast('Lost track of the download');
+            return;
+          }
+          if (!job || activeJob !== jobId) return;
+          renderJob(job);
+          if (job.status === 'done') {
+            activeJob = '';
+            if (job.destination === 'server') {
+              showToast(`${job.quality || 'Download'} saved to your Library`, { label: 'Open', onClick: () => { window.location.href = '/downloads'; } });
+              dialog.close();
+              return;
+            }
+            const link = document.createElement('a');
+            link.href = `/api/download/jobs/${encodeURIComponent(jobId)}/file`;
+            link.download = job.filename || '';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            showToast(`${job.quality || 'Download'} ready`);
+            dialog.close();
+            return;
+          }
+          if (job.status === 'error' || job.status === 'cancelled') {
+            activeJob = '';
+            if (job.status === 'error') showToast('Download failed');
+            return;
+          }
+          pollTimer = setTimeout(() => pollJob(jobId), 900);
+        }
+
+        async function startJob(videoId, height, container, needsMerge, title, destination) {
+          showOptions(false);
+          dialog.querySelector('[data-download-progress-label]').textContent = 'Starting\\u2026';
+          dialog.querySelector('.download-bar').classList.add('is-indeterminate');
+          dialog.querySelector('[data-download-stats]').textContent = '';
+          try {
+            const response = await fetch(`/api/download/${encodeURIComponent(videoId)}/jobs`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ height: Number(height) || 0, container, needs_merge: !!needsMerge, title: title || '', destination: destination || 'local' })
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.detail || 'could not start');
+            activeJob = data.job.id;
+            renderJob(data.job);
+            pollJob(activeJob);
+          } catch (error) {
+            showOptions(true);
+            showToast(String(error.message || 'Could not start the download'));
+          }
+        }
+
+        document.addEventListener('click', (event) => {
+          const pick = event.target.closest('[data-destination]');
+          if (!pick || !dialog || !dialog.contains(pick)) return;
+          dialog.querySelectorAll('[data-destination]').forEach((option) => {
+            const on = option === pick;
+            option.classList.toggle('active', on);
+            option.setAttribute('aria-checked', on ? 'true' : 'false');
+          });
+        });
+
+        document.addEventListener('click', async (event) => {
+          const cancel = event.target.closest('[data-download-cancel]');
+          if (cancel && dialog) {
+            event.preventDefault();
+            const jobId = activeJob;
+            activeJob = '';
+            stopPolling();
+            showOptions(true);
+            if (jobId) fetch(`/api/download/jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' }).catch(() => {});
+            return;
+          }
+
+          const option = event.target.closest('[data-download-mode]');
+          if (option && dialog) {
+            event.preventDefault();
+            const videoId = dialog.dataset.videoId || '';
+            const destination = chosenDestination();
+            /* The passthrough streams straight to the browser and never lands on disk,
+               so keeping it on the server has to go through the job runner instead. */
+            if (option.dataset.downloadMode === 'direct' && destination !== 'server') {
+              /* Invidious already has this as one file — stream it straight through
+                 rather than spending a merge on work that is already done. */
+              startDownload(videoId, option.dataset.downloadItag, option.dataset.downloadFilename, option.dataset.downloadQuality);
+              dialog.close();
+              return;
+            }
+            startJob(videoId, option.dataset.downloadHeight, option.dataset.downloadContainer, option.dataset.downloadMerge, dialog.dataset.videoTitle || '', destination);
+            return;
+          }
+
+          const button = event.target.closest('[data-download-video]');
+          if (!button) return;
+          event.preventDefault();
+          const videoId = button.dataset.downloadVideo;
+          if (!videoId) return;
+
+          /* Outside the watch page there is no dialog in the DOM, so fall back to the
+             single best rendition rather than doing nothing. */
+          if (!dialog) {
+            button.disabled = true;
+            showToast('Preparing download\\u2026');
+            try {
+              const info = await fetch(`/api/download/${encodeURIComponent(videoId)}/info`).then((r) => r.json());
+              if (!info.ok) throw new Error(info.detail || 'unavailable');
+              startDownload(videoId, '', info.filename, info.quality);
+            } catch (error) {
+              showToast('No downloadable stream for this video');
+            } finally {
+              button.disabled = false;
+            }
+            return;
+          }
+
+          dialog.dataset.videoId = videoId;
+          dialog.dataset.videoTitle = button.dataset.videoTitle || '';
+          stopPolling();
+          activeJob = '';
+          showOptions(true);
+          dialog.querySelector('[data-download-options]').innerHTML = '<p class="dialog-note">Checking what is available\\u2026</p>';
+          dialog.querySelector('[data-download-note]').hidden = true;
+          dialog.showModal();
+          try {
+            const data = await fetch(`/api/download/${encodeURIComponent(videoId)}/formats`).then((r) => r.json());
+            if (dialog.dataset.videoId === videoId) renderOptions(videoId, data);
+          } catch (error) {
+            renderOptions(videoId, { ok: false, detail: 'Could not reach the playback backend.' });
+          }
+        });
+      })();
+
+      /* ---- dislike estimate arriving ---- */
+      (() => {
+        const slot = document.querySelector('[data-dislike-pending]');
+        if (!slot) return;
+        const videoId = slot.dataset.dislikePending;
+        /* The batch is paced to look nothing like a session, so it takes tens of seconds.
+           This polls our own database, never RYD, and gives up rather than running for as
+           long as the tab happens to stay open. */
+        let attempts = 0;
+        const timer = window.setInterval(async () => {
+          attempts += 1;
+          if (attempts > 20) { window.clearInterval(timer); return; }
+          try {
+            const data = await fetch(`/api/videos/${encodeURIComponent(videoId)}/dislikes`).then((r) => r.json());
+            if (!data.display && !data.checked) return;
+            window.clearInterval(timer);
+            if (!data.display) {
+              slot.title = 'No estimate is available for this video.';
+              return;
+            }
+            slot.classList.remove('muted');
+            slot.classList.toggle('is-estimate', !!data.estimated);
+            slot.textContent = data.display;
+            slot.title = data.estimated
+              ? 'Estimated by Return YouTube Dislike \\u2014 not an official count'
+              : 'Dislike count as published before YouTube removed them in 2021';
+          } catch (error) {
+            window.clearInterval(timer);
+          }
+        }, 3000);
+      })();
+
+      /* ---- channel feed: keep loading as you scroll ---- */
+      (() => {
+        const grid = document.querySelector('[data-channel-grid]');
+        const sentinel = document.querySelector('[data-channel-sentinel]');
+        if (!grid || !sentinel || !('IntersectionObserver' in window)) return;
+        const spinner = document.querySelector('[data-channel-loading]');
+        let offset = Number(grid.dataset.nextOffset || 0);
+        let loading = false;
+        let done = false;
+
+        async function loadMore() {
+          if (loading || done) return;
+          loading = true;
+          if (spinner) spinner.hidden = false;
+          try {
+            const url = `/api/channels/${encodeURIComponent(grid.dataset.channelId)}/videos/html`
+              + `?offset=${offset}&sort=${encodeURIComponent(grid.dataset.sort || 'latest')}`;
+            const data = await fetch(url).then((r) => r.json());
+            if (data.html) grid.insertAdjacentHTML('beforeend', data.html);
+            offset = data.next_offset ?? offset;
+            /* Stop for good when a page comes back empty, otherwise the observer would
+               keep firing against the bottom of the page forever. */
+            if (!data.has_more || !data.count) done = true;
+          } catch (error) {
+            done = true;
+          } finally {
+            loading = false;
+            if (spinner) spinner.hidden = true;
+          }
+        }
+
+        /* rootMargin starts the fetch before the sentinel is actually visible, so the
+           next batch is usually already in place by the time the user reaches it. */
+        new IntersectionObserver((entries) => {
+          if (entries.some((entry) => entry.isIntersecting)) loadMore();
+        }, { rootMargin: '800px 0px' }).observe(sentinel);
+      })();
+
+      /* ---- takeout import ---- */
+      (() => {
+        const drop = document.querySelector('[data-import-drop]');
+        if (!drop) return;
+        const input = document.querySelector('[data-import-file]');
+        const progress = document.querySelector('[data-import-progress]');
+        const state = document.querySelector('[data-import-state]');
+        const result = document.querySelector('[data-import-result]');
+
+        function show(node, on) { if (node) node.hidden = !on; }
+
+        function report(data, ok) {
+          show(progress, false);
+          show(result, true);
+          result.classList.toggle('is-error', !ok);
+          if (!ok) {
+            result.innerHTML = '';
+            const p = document.createElement('p');
+            p.textContent = data;
+            result.appendChild(p);
+            return;
+          }
+          const s = data.summary || {};
+          const top = (s.top_channels || []).slice(0, 5);
+          result.innerHTML = '';
+          const heading = document.createElement('strong');
+          heading.textContent = 'Import complete';
+          const counts = document.createElement('p');
+          counts.textContent = `${(s.watched_videos || 0).toLocaleString()} videos across ${(s.watched_channels || 0).toLocaleString()} channels, and ${(s.subscriptions || 0).toLocaleString()} subscriptions.`;
+          result.append(heading, counts);
+          if (top.length) {
+            const label = document.createElement('p');
+            label.textContent = 'Most watched:';
+            const list = document.createElement('ul');
+            top.forEach((c) => {
+              const li = document.createElement('li');
+              li.textContent = `${c.title} — ${(c.watch_count || 0).toLocaleString()} videos`;
+              list.appendChild(li);
+            });
+            result.append(label, list);
+          }
+          const note = document.createElement('p');
+          note.textContent = 'Your feed will reflect this on the next refresh.';
+          result.appendChild(note);
+        }
+
+        async function upload(file) {
+          if (!file) return;
+          if (!file.name.toLowerCase().endsWith('.zip')) {
+            report('That is not a .zip archive. Upload the file Takeout gave you, unmodified.', false);
+            return;
+          }
+          show(result, false);
+          show(progress, true);
+          /* Large archives take a while to send and a while to parse, so the copy says
+             what is actually happening rather than sitting on one message. */
+          if (state) state.textContent = `Uploading ${(file.size / (1024 * 1024)).toFixed(0)} MB\u2026`;
+          const body = new FormData();
+          body.append('archive', file);
+          try {
+            const response = await fetch('/api/takeout/import', { method: 'POST', body });
+            const data = await response.json();
+            if (!response.ok) { report(data.detail || 'That archive could not be imported.', false); return; }
+            report(data, true);
+          } catch (error) {
+            report('The upload failed. If the archive is very large, try exporting only history and subscriptions.', false);
+          }
+        }
+
+        drop.addEventListener('click', () => input?.click());
+        drop.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); input?.click(); }
+        });
+        input?.addEventListener('change', () => upload(input.files?.[0]));
+        ['dragenter', 'dragover'].forEach((name) => drop.addEventListener(name, (event) => {
+          event.preventDefault(); drop.classList.add('is-over');
+        }));
+        ['dragleave', 'drop'].forEach((name) => drop.addEventListener(name, () => drop.classList.remove('is-over')));
+        drop.addEventListener('drop', (event) => {
+          event.preventDefault();
+          upload(event.dataTransfer?.files?.[0]);
+        });
+
+        document.querySelector('[data-takeout-delete]')?.addEventListener('click', async (event) => {
+          if (!window.confirm('Delete everything the import added? Your own watch history in OpenFeed is not affected.')) return;
+          const button = event.currentTarget;
+          button.disabled = true;
+          try {
+            const response = await fetch('/api/takeout', { method: 'DELETE' });
+            if (!response.ok) throw new Error('delete failed');
+            document.querySelector('[data-import-status]')?.remove();
+            showToast('Imported data deleted');
+          } catch (error) {
+            button.disabled = false;
+            showToast('Could not delete the imported data');
+          }
+        });
+      })();
+
+      /* ---- downloads library ---- */
+      (() => {
+        const grid = document.querySelector('[data-downloads-grid]');
+        if (!grid) return;
+        const search = document.querySelector('[data-downloads-search]');
+        const summary = document.querySelector('[data-downloads-summary]');
+
+        /* Filtering happens on the cards already rendered: the whole list is on the page,
+           so a round trip per keystroke would be slower and no more accurate. */
+        search?.addEventListener('input', () => {
+          const needle = search.value.trim().toLowerCase();
+          let shown = 0;
+          grid.querySelectorAll('[data-video-card]').forEach((card) => {
+            const hit = !needle || card.textContent.toLowerCase().includes(needle);
+            card.hidden = !hit;
+            if (hit) shown += 1;
+          });
+          if (summary) summary.textContent = needle ? `${shown} matching` : summary.dataset.original || summary.textContent;
+        });
+        if (summary) summary.dataset.original = summary.textContent;
+
+        document.addEventListener('click', async (event) => {
+          const remove = event.target.closest('[data-remove-download]');
+          if (!remove) return;
+          event.preventDefault();
+          const videoId = remove.dataset.removeDownload;
+          if (!window.confirm('Delete the downloaded file? The video stays in your feed.')) return;
+          remove.disabled = true;
+          try {
+            const response = await fetch(`/api/downloads/${encodeURIComponent(videoId)}`, { method: 'DELETE' });
+            if (!response.ok) throw new Error('delete failed');
+            remove.closest('[data-video-card]')?.remove();
+            showToast('Download deleted');
+          } catch (error) {
+            remove.disabled = false;
+            showToast('Could not delete that download');
+          }
+        });
+      })();
+
+      /* ---- settings deep link ---- */
+      (() => {
+        const target = new URLSearchParams(window.location.search).get('settings');
+        if (!target) return;
+        const dialog = document.querySelector('#settings-dialog');
+        if (!dialog) return;
+        /* Fires after the pane wiring below has bound, so switching panes works. */
+        window.setTimeout(() => {
+          dialog.showModal();
+          document.querySelector(`[data-settings-pane="${target}"]`)?.click();
+          /* Drop the parameter so a reload does not reopen the dialog. */
+          window.history.replaceState(null, '', window.location.pathname);
+        }, 0);
+      })();
+
+      /* ---- sidebar: show more subscriptions ---- */
+      document.addEventListener('click', (event) => {
+        const button = event.target.closest('[data-subscription-more]');
+        if (!button) return;
+        const nav = button.closest('[data-subscription-nav]');
+        const expanded = button.getAttribute('aria-expanded') === 'true';
+        nav?.querySelectorAll('.nav-channel-extra').forEach((row) => { row.hidden = expanded; });
+        button.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+        const label = button.querySelector('span');
+        if (label) label.textContent = expanded ? button.dataset.moreLabel : button.dataset.lessLabel;
+      });
+
+      /* ---- sponsorblock settings ---- */
+      document.querySelector('[data-setting-sponsorblock]')?.addEventListener('change', async (event) => {
+        const input = event.currentTarget;
+        input.disabled = true;
+        try {
+          const response = await fetch('/api/feed/preferences', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sponsorblock_enabled: input.checked })
+          });
+          if (!response.ok) throw new Error('save failed');
+          document.querySelector('[data-sponsorblock-categories]').hidden = !input.checked;
+          showToast(input.checked ? 'SponsorBlock enabled' : 'SponsorBlock disabled');
         } catch (error) {
-          showToast('No downloadable stream for this video');
+          input.checked = !input.checked;
+          showToast('Could not save this setting');
+        } finally {
+          input.disabled = false;
+        }
+      });
+
+      document.addEventListener('change', async (event) => {
+        const select = event.target.closest('[data-sponsorblock-category]');
+        if (!select) return;
+        const actions = {};
+        document.querySelectorAll('[data-sponsorblock-category]').forEach((node) => {
+          actions[node.dataset.sponsorblockCategory] = node.value;
+        });
+        try {
+          await fetch('/api/feed/preferences', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sponsorblock_actions: actions })
+          });
+          showToast('SponsorBlock updated');
+        } catch (error) {
+          showToast('Could not save that change');
+        }
+      });
+
+      /* ---- community posts: simulated poll voting ---- */
+      document.addEventListener('click', async (event) => {
+        const clear = event.target.closest('[data-poll-clear]');
+        const choice = event.target.closest('[data-poll-vote]');
+        if (!clear && !choice) return;
+        event.preventDefault();
+        const postId = clear ? clear.dataset.pollClear : choice.dataset.pollVote;
+        const index = clear ? -1 : Number(choice.dataset.choice);
+        const poll = document.querySelector(`[data-poll="${safeCss(postId)}"]`);
+        /* Painted before the request returns: this is a local record, so there is nothing
+           to be authoritative about and waiting would only make it feel slow. */
+        poll?.querySelectorAll('[data-poll-vote]').forEach((node) => {
+          const picked = !clear && Number(node.dataset.choice) === index;
+          node.classList.toggle('is-picked', picked);
+          node.setAttribute('aria-pressed', picked ? 'true' : 'false');
+        });
+        try {
+          await fetch(`/api/posts/${encodeURIComponent(postId)}/vote`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ choice_index: clear ? null : index })
+          });
+          showToast(clear ? 'Answer cleared' : 'Saved here only \u2014 not sent to YouTube');
+        } catch (error) {
+          showToast('Could not save your answer');
+        }
+      });
+
+      /* ---- show posts in feeds ---- */
+      document.querySelector('[data-setting-posts]')?.addEventListener('change', async (event) => {
+        const input = event.currentTarget;
+        input.disabled = true;
+        try {
+          const response = await fetch('/api/feed/preferences', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ show_posts_in_feeds: input.checked })
+          });
+          if (!response.ok) throw new Error('save failed');
+          showToast(input.checked ? 'Posts will appear in your feeds' : 'Posts hidden from feeds');
+        } catch (error) {
+          input.checked = !input.checked;
+          showToast('Could not save this setting');
+        } finally {
+          input.disabled = false;
+        }
+      });
+
+      /* ---- feed controls ---- */
+      (() => {
+        /* Measured panels load when the dialog opens, not on every page render. */
+        const dialog = document.querySelector('#feed-dialog');
+        if (!dialog) return;
+        let loaded = false;
+        const SIGNAL_LABELS = {
+          semantic_affinity: 'Topic similarity', subscription_topic_affinity: 'Subscription topics',
+          watch_time_channel: 'Channels you watch', watch_time_topic: 'Subjects you watch',
+          takeout_channel: 'Imported history', takeout_already_watched: 'Already watched',
+          preferred_topic: 'Followed topics', muted_topic: 'Muted topics',
+          discovery_balance: 'Discovery balance', quick_abandonment: 'Videos you bounced off',
+          partial_watch_penalty: 'Part-watched',
+        };
+
+        async function loadComposition() {
+          if (loaded) return;
+          loaded = true;
+          try {
+            const data = await fetch('/api/feed/composition').then((r) => r.json());
+            const cov = data.coverage || {};
+            const total = cov.videos || 0;
+            const sources = cov.sources || {};
+            const subs = Math.round(((sources.subscription || 0) / (total || 1)) * 100);
+            const box = dialog.querySelector('[data-fc-composition]');
+            if (box && total) {
+              box.innerHTML = `<div class="fc-measure">
+                <div class="fc-bar"><span class="fc-bar-fill" style="width:${subs}%"></span></div>
+                <div class="fc-legend"><span><i class="fc-dot subs"></i>From channels you follow <b>${subs}%</b></span>
+                <span><i class="fc-dot disc"></i>Discovered <b>${100 - subs}%</b></span></div>
+                <p class="fc-caption">Counted from the ${total} videos ranked for you right now &mdash;
+                ${cov.distinct_channels || 0} different creators, and no single one holds more than
+                ${Math.round((cov.top_channel_share || 0) * 100)}% of the feed.</p></div>`;
+            }
+            const signals = dialog.querySelector('[data-fc-signals]');
+            if (signals) {
+              const chips = Object.entries(cov.signal_coverage || {})
+                .filter(([name]) => SIGNAL_LABELS[name])
+                .map(([name, share]) => `<span class="fc-signal"><b>${SIGNAL_LABELS[name]}</b><i>${Math.round(share * 100)}%</i></span>`);
+              signals.innerHTML = chips.join('') || '<span class="fc-signal muted"><b>No signals yet</b></span>';
+            }
+            const channels = dialog.querySelector('[data-fc-channels]');
+            if (channels) {
+              channels.innerHTML = (data.channels || []).map((row) => {
+                const cls = row.muted ? 'fc-channel is-muted' : 'fc-channel';
+                return `<button class="${cls}" type="button" data-mute-channel="${row.key}" aria-pressed="${row.muted}">`
+                  + `<span></span><small>${row.count}</small><i class="fc-channel-mark"></i></button>`;
+              }).join('') || '<p class="fc-caption">Nothing to show yet.</p>';
+              /* Titles set as text, never interpolated into markup. */
+              [...channels.querySelectorAll('.fc-channel')].forEach((node, index) => {
+                node.querySelector('span').textContent = (data.channels[index] || {}).title || '';
+              });
+            }
+          } catch (error) {
+            loaded = false;
+          }
+        }
+        document.addEventListener('click', (event) => {
+          if (event.target.closest('[data-open-feed-dialog]')) loadComposition();
+        });
+
+        const slider = document.querySelector('[data-tune-input]');
+        const value = document.querySelector('[data-tune-value]');
+        if (!slider) return;
+        const paint = () => {
+          slider.style.setProperty('--fill', `${slider.value}%`);
+          if (value) value.textContent = `${slider.value}%`;
+        };
+        paint();
+        slider.addEventListener('input', paint);
+      })();
+
+      document.addEventListener('click', async (event) => {
+        const chip = event.target.closest('[data-mute-channel]');
+        if (!chip) return;
+        event.preventDefault();
+        const muted = chip.classList.toggle('is-muted');
+        chip.setAttribute('aria-pressed', muted ? 'true' : 'false');
+        const keys = [...document.querySelectorAll('[data-mute-channel].is-muted')]
+          .map((node) => node.dataset.muteChannel);
+        try {
+          await fetch('/api/feed/preferences', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ muted_channels: keys })
+          });
+          showToast(muted ? 'Creator muted' : 'Creator unmuted');
+        } catch (error) {
+          chip.classList.toggle('is-muted', !muted);
+          showToast('Could not save that');
+        }
+      });
+
+      /* ---- channel description ---- */
+      document.addEventListener('click', (event) => {
+        if (!event.target.closest('[data-ch-about-open]')) return;
+        /* A dialog rather than an inline expand: the description sits in a grid cell beside
+           the avatar, so growing it in place shoved the avatar down and left nothing to
+           click to put it back. */
+        document.querySelector('[data-ch-about-dialog]')?.showModal();
+      });
+      document.addEventListener('click', (event) => {
+        /* Backdrop click. Only the dialog element itself can be the target here; anything
+           inside it hits a child. */
+        if (event.target.matches?.('dialog.ch-about-dialog')) event.target.close();
+      });
+
+      /* ---- channel search ---- */
+      document.addEventListener('click', (event) => {
+        const toggle = event.target.closest('[data-ch-search-toggle]');
+        if (!toggle) return;
+        const form = toggle.closest('[data-ch-search]');
+        const input = form.querySelector('[data-ch-search-input]');
+        if (form.classList.contains('is-open')) {
+          /* Open with something typed means "search"; open and empty means "put it away". */
+          if (input.value.trim()) { form.submit(); return; }
+          form.classList.remove('is-open');
+          toggle.setAttribute('aria-expanded', 'false');
+          return;
+        }
+        form.classList.add('is-open');
+        toggle.setAttribute('aria-expanded', 'true');
+        input.focus();
+      });
+      document.addEventListener('focusout', (event) => {
+        const form = event.target.closest('[data-ch-search]');
+        if (!form || !form.classList.contains('is-open')) return;
+        const input = form.querySelector('[data-ch-search-input]');
+        if (input.value.trim()) return;
+        /* Deferred so clicking the magnifier to close does not race this. */
+        setTimeout(() => {
+          if (form.contains(document.activeElement) || input.value.trim()) return;
+          form.classList.remove('is-open');
+          form.querySelector('[data-ch-search-toggle]')?.setAttribute('aria-expanded', 'false');
+        }, 120);
+      });
+
+      /* ---- details popup ---- */
+      document.addEventListener('click', (event) => {
+        if (!event.target.closest('[data-open-details]')) return;
+        event.preventDefault();
+        document.querySelectorAll('.yt-menu[open]').forEach((menu) => menu.removeAttribute('open'));
+        const dialog = document.querySelector('[data-details-dialog]');
+        /* Forced open so the collapsed <details> inside is not a second thing to click. */
+        dialog?.querySelector('.video-details')?.setAttribute('open', '');
+        dialog?.showModal();
+      });
+
+      /* ---- status pane loads when opened ---- */
+      (() => {
+        let loaded = false;
+        document.addEventListener('click', async (event) => {
+          if (!event.target.closest('[data-settings-pane="status"]') || loaded) return;
+          const body = document.querySelector('[data-status-body]');
+          if (!body) return;
+          loaded = true;
+          try {
+            body.innerHTML = await fetch('/api/status/panel').then((r) => r.text());
+          } catch (error) {
+            loaded = false;
+            body.innerHTML = '<p class="dialog-note">Could not load status.</p>';
+          }
+        });
+      })();
+
+      /* ---- feed refresh ---- */
+      document.addEventListener('click', async (event) => {
+        const button = event.target.closest('[data-feed-refresh]');
+        if (!button) return;
+        event.preventDefault();
+        button.disabled = true;
+        const label = button.textContent;
+        button.textContent = 'Refreshing\u2026';
+        try {
+          const data = await fetch('/api/feed/refresh', { method: 'POST' }).then((r) => r.json());
+          showToast(`Feed rebuilt from ${data.profile_terms || 0} interests`, {
+            label: 'See it', onClick: () => { window.location.href = '/'; },
+          });
+        } catch (error) {
+          showToast('Could not refresh the feed');
+        } finally {
+          button.disabled = false;
+          button.textContent = label;
+        }
+      });
+
+      document.addEventListener('click', async (event) => {
+        const retry = event.target.closest('[data-takeout-retry-subs]');
+        if (!retry) return;
+        event.preventDefault();
+        retry.disabled = true;
+        try {
+          const data = await fetch('/api/takeout/subscriptions/retry', { method: 'POST' }).then((r) => r.json());
+          showToast(`${data.cleared} channels queued to try again`);
+        } catch (error) {
+          showToast('Could not queue those channels');
+        } finally {
+          retry.disabled = false;
+        }
+      });
+
+      /* ---- apply imported subscriptions ---- */
+      document.addEventListener('click', async (event) => {
+        const button = event.target.closest('[data-takeout-apply-subs]');
+        if (!button) return;
+        event.preventDefault();
+        button.disabled = true;
+        let total = 0;
+        try {
+          /* Batched server-side, so this loops until nothing is pending rather than
+             asking FreshRSS to create several hundred feeds in one request. */
+          for (let pass = 0; pass < 40; pass += 1) {
+            const data = await fetch('/api/takeout/subscriptions/apply', { method: 'POST' }).then((r) => r.json());
+            total += data.subscribed || 0;
+            button.textContent = `Subscribed ${total}\u2026`;
+            if (data.done || (!data.subscribed && !data.failed)) break;
+          }
+          showToast(`Subscribed to ${total} channels`);
+        } catch (error) {
+          showToast('Could not finish subscribing');
         } finally {
           button.disabled = false;
         }
       });
+
+      /* ---- sponsorblock notification ---- */
+      window.addEventListener('message', (event) => {
+        if (event.origin !== window.location.origin) return;
+        const data = event.data || {};
+        if (data.type !== 'openfeed:sb-skipped') return;
+        const player = document.querySelector('.player-frame');
+        showToast(`Skipped ${data.label}`, {
+          label: 'Undo',
+          onClick: () => player?.contentWindow?.postMessage(
+            { type: 'openfeed:sb-undo', seconds: data.undoTo }, window.location.origin),
+        });
+      });
+
+      /* ---- description overflow ---- */
+      (() => {
+        const box = document.querySelector('[data-description-box]');
+        if (!box) return;
+        const body = box.querySelector('.watch-description-body');
+        const toggle = box.querySelector('[data-description-toggle]');
+        if (!body || !toggle) return;
+        /* Only the browser knows whether the text actually overflows the collapsed
+           height — the server cannot guess it from character count, and offering "More"
+           on a description with nothing more to show is just a dead button. */
+        function sync() {
+          const overflows = body.scrollHeight > body.clientHeight + 2;
+          toggle.hidden = !overflows;
+          if (!overflows) box.classList.remove('is-collapsed');
+        }
+        sync();
+        /* Re-measure when the column width changes, since rewrapping changes the height. */
+        if (window.ResizeObserver) new ResizeObserver(() => {
+          if (box.classList.contains('is-collapsed') || toggle.hidden) sync();
+        }).observe(body);
+      })();
+
+      /* ---- watch progress ---- */
+      (() => {
+        const layout = document.querySelector('[data-watch-layout]');
+        if (!layout) return;
+        const videoId = layout.dataset.videoId || '';
+        const duration = Number(layout.dataset.duration || 0);
+        if (!videoId) return;
+
+        /* Say so when a video opens partway in, with a way back to the start — resuming
+           silently looks like a bug the first time it happens to you. */
+        const resumeAt = Number(layout.dataset.resume || 0);
+        if (resumeAt > 0) {
+          const mins = Math.floor(resumeAt / 60);
+          const secs = Math.round(resumeAt % 60);
+          showToast(`Resuming from ${mins}:${String(secs).padStart(2, '0')}`, {
+            label: 'Start over',
+            onClick: () => { window.location.href = `/watch/${encodeURIComponent(videoId)}?restart=1`; }
+          });
+        }
+
+        /* The player is a cross-origin iframe, so its currentTime cannot be read. Time
+           spent on the page with the tab visible is the closest honest proxy, and it is
+           what lets opening a video count as watching it with no button to press. */
+        let dwell = 0;
+        let reported = 0;
+        let last = Date.now();
+        let marked = false;
+
+        function tick() {
+          const now = Date.now();
+          if (document.visibilityState === 'visible') dwell += (now - last) / 1000;
+          last = now;
+        }
+
+        function report(final) {
+          tick();
+          if (dwell < 5) return;
+          /* Only the time since the last report is sent. current_seconds restarts at zero
+             on every page open, so the server cannot difference it — a rewatch would
+             subtract. Counted optimistically because a beacon cannot be confirmed, and a
+             few lost seconds matter far less to ranking than double counting them. */
+          const delta = Math.max(0, dwell - reported);
+          reported = dwell;
+          const body = JSON.stringify({
+            youtube_video_id: videoId,
+            current_seconds: duration ? Math.min(dwell, duration) : dwell,
+            duration_seconds: duration || null,
+            event_type: 'progress',
+            watch_delta_seconds: delta,
+            payload: { source: 'watch_dwell' }
+          });
+          if (final && navigator.sendBeacon) {
+            navigator.sendBeacon('/api/playback/progress', new Blob([body], { type: 'application/json' }));
+            return;
+          }
+          /* A dropped ping just means the next one carries the total — nothing to report. */
+          fetch('/api/playback/progress', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }).catch(() => {});
+        }
+
+        /* Videos whose length we never imported cannot produce a percentage, so they get
+           marked watched outright once you have stayed long enough to have watched them. */
+        function markUntimedWatched() {
+          if (marked || duration || dwell < 60) return;
+          marked = true;
+          fetch('/api/feedback', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ youtube_video_id: videoId, event_type: 'mark_watched', payload: { source: 'watch_dwell' } })
+          }).catch(() => { marked = false; });
+        }
+
+        setInterval(() => { report(false); markUntimedWatched(); }, 15000);
+        document.addEventListener('visibilitychange', tick);
+        window.addEventListener('pagehide', () => report(true));
+      })();
+
+      /* ---- per-channel notification level ---- */
+      document.addEventListener('click', async (event) => {
+        const choice = event.target.closest('[data-notify-level]');
+        if (!choice) return;
+        event.preventDefault();
+        const menu = choice.closest('[data-notify-menu]');
+        const channelId = choice.dataset.channelId || menu?.dataset.channelId || '';
+        const level = choice.dataset.notifyLevel || 'all';
+        if (!channelId) return;
+        try {
+          const response = await fetch(`/api/channels/${encodeURIComponent(channelId)}/notifications`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ level })
+          });
+          if (!response.ok) throw new Error('notify failed');
+          const data = await response.json();
+          applyNotifyLevel(menu, data.level || level);
+          showToast(NOTIFY_TOASTS[data.level || level] || 'Notifications updated');
+        } catch (error) {
+          showToast('Could not update notifications');
+        } finally {
+          if (menu) menu.removeAttribute('open');
+        }
+      });
+
+      function applyNotifyLevel(menu, level) {
+        if (!menu) return;
+        const trigger = menu.querySelector('[data-notify-trigger]');
+        if (trigger) {
+          const label = NOTIFY_LABELS[level] || 'Notifications';
+          trigger.classList.toggle('is-muted', level === 'none');
+          trigger.setAttribute('aria-label', `Notifications: ${label}`);
+          trigger.setAttribute('title', `Notifications: ${label}`);
+          const bell = trigger.firstElementChild;
+          if (bell) bell.outerHTML = NOTIFY_ICONS[level] || NOTIFY_ICONS.all;
+        }
+        menu.querySelectorAll('[data-notify-level]').forEach((row) => {
+          const trailing = row.querySelector('.menu-trailing');
+          if (trailing) trailing.textContent = row.dataset.notifyLevel === level ? '\\u2713' : '';
+        });
+      }
 
       /* ---- horizontal shelves ---- */
       function syncShelf(shelf) {
@@ -5028,7 +7550,7 @@ def _app_header(search_value: str = "", user: dict[str, Any] | None = None, user
         <header class="app-header">
           <div class="header-left">
             <button class="icon-button nav-toggle" type="button" data-nav-toggle aria-label="Toggle navigation">{_icon("menu")}</button>
-            <a class="brand" href="/" aria-label="OpenFeed home"><span class="brand-mark">Open</span><span>Feed</span></a>
+            <a class="brand" href="/" aria-label="OpenFeed home">{_brand_mark()}<span class="brand-word">Open<b>Feed</b></span></a>
           </div>
           <div class="header-center">
             <form class="search-form" action="/search" method="get">
@@ -5137,6 +7659,132 @@ def _media_row(video: dict[str, Any], settings: Any, label: str = "") -> str:
     '''
 
 
+def _subscription_posts_shelf(user_key: str = "local", limit: int = 6) -> str:
+    """Recent community posts from subscribed channels, for the feeds.
+
+    Bounded hard: each channel is one upstream request, so this reads a slice of the
+    subscription list rather than all of it. A page render must not turn into seventy
+    calls to Invidious.
+    """
+    from . import posts as posts_module
+
+    try:
+        subscriptions = db.list_subscriptions(200)
+    except Exception:
+        return ""
+    channel_ids = [str(item.get("youtube_channel_id") or "") for item in subscriptions]
+    channel_ids = [cid for cid in channel_ids if posts_module.valid_channel_id(cid)][:12]
+    if not channel_ids:
+        return ""
+    try:
+        found = posts_module.subscription_posts(channel_ids, per_channel=2, limit=12)[:limit]
+    except Exception as exc:  # noqa: BLE001 - the video feed matters more than the shelf
+        logger.info("subscription posts shelf failed: %s", exc)
+        return ""
+    if not found:
+        return ""
+    votes = {post["post_id"]: db.get_poll_vote(post["post_id"], user_key) for post in found}
+    cards = "".join(_post_card(post, votes.get(post["post_id"]), compact=True) for post in found)
+    return (
+        '<section class="section-block post-shelf" aria-label="Community posts">'
+        '<div class="section-heading"><h2>Posts from your subscriptions</h2></div>'
+        f'<div class="post-list is-shelf">{cards}</div></section>'
+    )
+
+
+def _post_attachment_html(attachment: dict[str, Any] | None, post_id: str, vote: int | None) -> str:
+    """Draw whatever the post carries, or say plainly that we cannot draw it."""
+    if not attachment:
+        return ""
+    kind = attachment.get("type")
+
+    if kind == "video":
+        video_id = escape(str(attachment.get("youtube_video_id") or ""), quote=True)
+        title = escape(str(attachment.get("title") or ""))
+        duration = escape(_duration_text(attachment.get("duration_seconds")) or "")
+        views = _compact_count(attachment.get("view_count"))
+        meta = " &middot; ".join(part for part in (f"{escape(views)} views" if views else "", escape(attachment.get("author") or "")) if part)
+        return (
+            f'<a class="post-video" href="/watch/{video_id}">'
+            f'<span class="post-video-thumb"><img src="/vi/{video_id}/hqdefault.jpg" alt="" loading="lazy">'
+            f'{f"<span class=\'duration\'>{duration}</span>" if duration else ""}</span>'
+            f'<span class="post-video-copy"><strong>{title}</strong><small>{meta}</small></span></a>'
+        )
+
+    if kind == "image":
+        images = [escape(str(url), quote=True) for url in (attachment.get("images") or [])]
+        cells = "".join(f'<img src="{url}" alt="" loading="lazy" onerror="this.remove()">' for url in images)
+        multi = " is-multi" if len(images) > 1 else ""
+        return f'<div class="post-images{multi}">{cells}</div>'
+
+    if kind == "playlist":
+        return (
+            f'<a class="post-playlist" href="https://www.youtube.com/playlist?list={escape(str(attachment.get("playlist_id")), quote=True)}"'
+            f' target="_blank" rel="noopener noreferrer">{_icon("playlist")}'
+            f'<span><strong>{escape(str(attachment.get("title") or "Playlist"))}</strong>'
+            f'<small>{escape(str(attachment.get("video_count") or ""))} videos</small></span></a>'
+        )
+
+    if kind == "poll":
+        choices = attachment.get("choices") or []
+        total = _compact_count(attachment.get("total_votes"))
+        rows = []
+        for index, choice in enumerate(choices):
+            picked = vote == index
+            rows.append(
+                f'<button class="poll-choice{" is-picked" if picked else ""}" type="button" '
+                f'data-poll-vote="{escape(post_id, quote=True)}" data-choice="{index}" '
+                f'aria-pressed="{"true" if picked else "false"}">'
+                f'<span class="poll-bar" aria-hidden="true"></span>'
+                f'<span class="poll-text">{escape(str(choice))}</span>'
+                f'<span class="poll-mark">{_icon("check")}</span></button>'
+            )
+        cleared = "" if vote is None else (
+            f'<button class="link-action" type="button" data-poll-clear="{escape(post_id, quote=True)}">Clear my answer</button>'
+        )
+        return (
+            f'<div class="post-poll" data-poll="{escape(post_id, quote=True)}">{"".join(rows)}'
+            f'<p class="poll-note">{_icon("block")}<span><strong>Your answer stays here.</strong> '
+            f'YouTube does not publish how a poll was split and does not accept votes without a signed-in '
+            f'account, so this records what you picked locally and changes nothing on YouTube. '
+            f'{f"{escape(total)} people voted there." if total else ""} {cleared}</span></p></div>'
+        )
+
+    return (
+        f'<p class="post-unsupported">{_icon("hide")}<span>This post has a '
+        f'{escape(str(attachment.get("raw_type") or "n unknown"))} attachment that OpenFeed cannot show yet. '
+        f'The text above is complete.</span></p>'
+    )
+
+
+def _post_card(post: dict[str, Any], vote: int | None = None, *, compact: bool = False) -> str:
+    """One community post."""
+    post_id = str(post.get("post_id") or "")
+    channel_id = str(post.get("youtube_channel_id") or "")
+    author = str(post.get("author") or "Unknown")
+    avatar = _avatar_html(author, post.get("author_thumbnail"))
+    when = escape(post.get("published_text") or _relative_time(post.get("published_at")) or "")
+    likes = _compact_count(post.get("like_count"))
+    replies = _compact_count(post.get("reply_count"))
+    edited = '<span class="post-flag">edited</span>' if post.get("is_edited") else ""
+    body = post.get("content_html") or escape(str(post.get("content") or "")).replace("\n", "<br>")
+    detail = f"/channel/{escape(channel_id, quote=True)}/posts/{escape(post_id, quote=True)}"
+    meta = " &middot; ".join(part for part in (
+        f'{likes} likes' if likes else "", f'{replies} replies' if replies else "") if part)
+    return f'''
+      <article class="post-card{" is-compact" if compact else ""}" data-post-id="{escape(post_id, quote=True)}">
+        <header class="post-head">
+          {avatar}
+          <div><strong>{escape(author)}</strong><small>{when}{edited}</small></div>
+          <a class="post-permalink" href="{detail}" aria-label="Open this post">{_icon("external")}</a>
+        </header>
+        <div class="post-body">{body}</div>
+        {_post_attachment_html(post.get("attachment"), post_id, vote)}
+        {f'<p class="post-meta">{meta}</p>' if meta else ""}
+      </article>
+    '''
+
+
 def _channel_card(channel: dict[str, Any]) -> str:
     title_text = str(channel.get("title") or "Unknown channel")
     title = escape(title_text)
@@ -5186,7 +7834,7 @@ def _subscription_card(subscription: dict[str, Any]) -> str:
         subscribe_pill = (
             f'<button class="subscribe-pill subscribed" type="button" data-unsubscribe-feed '
             f'data-channel-id="{channel_id}" data-feed-url="{escape(feed_url_raw, quote=True)}" '
-            f'data-title="{escape(title_text, quote=True)}">{_icon("bell")}<span>Subscribed</span></button>'
+            f'data-title="{escape(title_text, quote=True)}">{_icon("check")}<span>Subscribed</span></button>'
         )
     subscription_id = escape(str(subscription.get("id") or ""), quote=True)
     return f'''
@@ -5357,6 +8005,7 @@ def collection_page(request: Request, collection_id: str, limit: int = 36):
           <h1>{name}</h1>
           <p class="collection-hero-meta">{escape(" · ".join(meta_parts))}</p>
           {description_html}
+          {links_html}
           <div class="collection-hero-actions">
             <button class="primary-action" type="button" data-add-channels="{collection_id_attr}" data-collection-name="{escape(name_text, quote=True)}">{_icon("plus")}<span>Add channels</span></button>
             <button class="text-action" type="button" data-edit-collection="{collection_id_attr}" data-collection-name="{escape(name_text, quote=True)}" data-collection-description="{escape(description_text, quote=True)}">{_icon("pencil")}<span>Rename</span></button>
@@ -5559,9 +8208,14 @@ def index(request: Request):
     '''
 
 
-@app.get("/recommendations", response_class=HTMLResponse)
-def recommendations_page(request: Request):
-    return index(request)
+@app.get("/recommendations", response_class=HTMLResponse, tags=["pages"], summary="Redirects to Home")
+def recommendations_page():
+    """Home already *is* the recommendation feed.
+
+    This route returned the home page verbatim, so the sidebar appeared to offer two
+    different feeds that were the same thing. Kept as a redirect so old links resolve.
+    """
+    return RedirectResponse(url="/", status_code=308)
 
 
 @app.get("/watch/{youtube_video_id}", response_class=HTMLResponse)
@@ -5573,9 +8227,27 @@ def watch_video(request: Request, youtube_video_id: str):
     video = db.get_video_by_youtube_id(youtube_video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
-    if video.get("view_count") is None and not video.get("metadata_error"):
-        enrich_video(youtube_video_id, video.get("id"))
-        video = db.get_video_by_youtube_id(youtube_video_id) or video
+    # Views alone was too narrow a trigger: a video acquired by channel backfill or topic
+    # search arrives with a view count but no description and no like count, so the page
+    # rendered "No description has been imported" forever and never tried again.
+    needs_detail = (
+        video.get("view_count") is None
+        or not str(video.get("summary") or video.get("description") or "").strip()
+        or video.get("like_count") is None
+    )
+    if needs_detail and not video.get("metadata_error"):
+        if video.get("view_count") is None:
+            # Nothing to show at all: worth the wait, since the page would otherwise be
+            # mostly empty.
+            enrich_video(youtube_video_id, video.get("id"))
+            video = db.get_video_by_youtube_id(youtube_video_id) or video
+        else:
+            # Partial data. Fill the gaps in the background rather than holding the page
+            # open for an Invidious round trip on every single open.
+            threading.Thread(
+                target=enrich_video, args=(youtube_video_id, video.get("id")),
+                name=f"enrich-{youtube_video_id}", daemon=True,
+            ).start()
 
     settings = get_settings()
     title_text = str(video.get("title") or youtube_video_id)
@@ -5588,8 +8260,8 @@ def watch_video(request: Request, youtube_video_id: str):
     youtube_url_raw = str(video.get("url") or f"https://www.youtube.com/watch?v={youtube_video_id}")
     youtube_url = escape(youtube_url_raw, quote=True)
     invidious_url = escape(f"{settings.invidious_public_url}/watch?v={youtube_video_id}", quote=True) if settings.invidious_public_url else youtube_url
-    summary_text = _text_excerpt(video.get("summary") or video.get("description") or "", 2400)
-    summary = escape(summary_text)
+    summary_text = _description_text(video.get("summary") or video.get("description") or "")
+    summary = _rich_text(summary_text)
     published_relative = _relative_time(video.get("published_at"))
     published_date = _date_text(video.get("published_at"))
     published_text = escape(published_relative or published_date)
@@ -5598,7 +8270,9 @@ def watch_video(request: Request, youtube_video_id: str):
     view_text = f"{escape(views)} views" if views else "Views unavailable"
     subscribers = _compact_count(video.get("channel_subscriber_count"))
     subscriber_text = f"{escape(subscribers)} subscribers" if subscribers else ""
-    description_meta = " &middot; ".join(part for part in [view_text, f"Released {published_detail}" if published_detail else ""] if part)
+    # Views and the release date live here rather than under the channel name — they
+    # describe the video, not the person who made it.
+    description_meta = " &middot; ".join(part for part in [view_text, published_text] if part)
     subscription = escape(video.get("subscription_title") or _source_label(video))
     read_state = "read" if video.get("is_read") else "unread"
     starred_state = "starred" if video.get("is_starred") else "not starred"
@@ -5607,10 +8281,18 @@ def watch_video(request: Request, youtube_video_id: str):
     captions_status = escape(video.get("captions_status") or "unknown")
     initials = escape(_avatar_initials(channel_text))
     hue = _avatar_hue(channel_text)
-    subscription_feed_url_raw = str(video.get("subscription_feed_url") or "").strip()
+    subscription_feed_url_raw = _subscription_feed_for_video(video)
     feed_url_raw = subscription_feed_url_raw or (_youtube_feed_url(channel_id_raw) if channel_id_raw else "")
-    feed_url = escape(feed_url_raw, quote=True)
     subscribed = bool(subscription_feed_url_raw)
+    # Where this video was left off, if a real player reading was ever stored for it. A
+    # ?t= override in the URL wins, so "start over" is a link rather than extra state.
+    progress_row = db.get_playback_progress(youtube_video_id, user_key) or {}
+    stored_resume = int(float(progress_row.get("resume_seconds") or 0))
+    restart = str(request.query_params.get("restart") or "") == "1"
+    resume_at = 0 if restart else stored_resume
+    resume_query = f"?t={resume_at}" if resume_at else ""
+    resume_label = _duration_text(resume_at) if resume_at else ""
+
     feedback = db.get_video_feedback(youtube_video_id, user_key) or {}
     reaction = str(feedback.get("reaction") or "")
     like_selected = " is-selected" if reaction == "like" else ""
@@ -5623,10 +8305,33 @@ def watch_video(request: Request, youtube_video_id: str):
     dislike_raw = video.get("dislike_count")
     dislike_total = _compact_count(dislike_raw) if dislike_raw else ""
     like_count_html = f'<span class="reaction-count" data-like-count>{escape(like_total)}</span>' if like_total else ""
+    # An RYD figure is an estimate reconstructed by a third party, not a number YouTube
+    # published, and the tooltip says so rather than presenting it as fact.
+    dislike_from_ryd = str(video.get("dislike_source") or "") == "ryd"
+    dislike_title = (
+        "Estimated by Return YouTube Dislike — not an official count"
+        if dislike_from_ryd
+        else "Dislike count as published before YouTube removed them in 2021"
+    )
+    # Nothing stored yet: start a cover batch that includes this video so the count can
+    # appear shortly, without a lone request announcing what is being watched.
+    dislike_pending = False
+    # `not dislike_raw` rather than `is None`: YouTube's own metadata reports 0 for every
+    # video now, and treating that as a real count meant the fetch never fired.
+    if not dislike_raw and not video.get("dislike_fetched_at"):
+        dislike_pending = ryd.schedule_cover_batch(youtube_video_id, user_key)
+
     dislike_count_html = (
-        f'<span class="reaction-count" data-dislike-count>{escape(dislike_total)}</span>'
+        f'<span class="reaction-count{" is-estimate" if dislike_from_ryd else ""}" data-dislike-count '
+        f'title="{escape(dislike_title, quote=True)}">{escape(dislike_total)}</span>'
         if dislike_total
-        else '<span class="reaction-count muted" title="YouTube stopped publishing dislike counts in 2021">&mdash;</span>'
+        else (
+            f'<span class="reaction-count muted" data-dislike-count data-dislike-pending="{escape(youtube_video_id, quote=True)}" '
+            f'title="Fetching an estimate&hellip;">&mdash;</span>'
+            if dislike_pending
+            else '<span class="reaction-count muted" data-dislike-count title="YouTube stopped publishing dislike counts in 2021. '
+                 'Estimates can be enabled in Settings.">&mdash;</span>'
+        )
     )
     metadata = video.get("metadata") if isinstance(video.get("metadata"), dict) else {}
     transcript_segments = metadata.get("transcript_segments") if isinstance(metadata, dict) else None
@@ -5635,16 +8340,10 @@ def watch_video(request: Request, youtube_video_id: str):
     db.update_playback_progress(youtube_video_id, 0, video.get("duration_seconds"), "open", {"source": "watch_page"}, user_key)
     _sync_gorse_event(user_key, youtube_video_id, "watch_page_open", {"source": "watch_page"})
 
-    suggestion_items = []
-    seen_suggestions = {youtube_video_id}
-    for candidate in db.list_recommended_videos(32, 0, "all", user_key) + db.list_subscription_recommendations(12, user_key):
-        candidate_id = str(candidate.get("youtube_video_id") or "")
-        if not candidate_id or candidate_id in seen_suggestions:
-            continue
-        seen_suggestions.add(candidate_id)
-        suggestion_items.append(_media_row(candidate, settings, _source_label(candidate)))
-        if len(suggestion_items) >= 14:
-            break
+    # Ranked against the video on screen and with shorts left out - they have their own
+    # vertical viewer, and a 30-second clip is not a sensible follow-on from a long video.
+    related = db.list_related_videos(youtube_video_id, 14, user_key)
+    suggestion_items = [_media_row(candidate, settings, _source_label(candidate)) for candidate in related]
     suggestions_html = "".join(suggestion_items) or '<p class="chat-placeholder">No suggestions available yet.</p>'
     transcript_button = ""
     transcript_panel = ""
@@ -5659,17 +8358,16 @@ def watch_video(request: Request, youtube_video_id: str):
             transcript_button = '<button class="tab" type="button" data-tab="transcript">Transcript</button>'
             transcript_panel = f'<section id="tab-transcript" class="tab-panel">{"".join(transcript_rows)}</section>'
     description_body = f'<p>{summary}</p>' if summary else '<p class="description-empty">No description has been imported for this video yet.</p>'
+    details_html = _video_details_pane(video, download=db.get_download(youtube_video_id, user_key))
+    # Hidden until the script measures the text; showing it up front means it flashes on
+    # short descriptions that never needed it.
     description_html = f'''<section class="watch-description is-collapsed" data-description-box aria-label="Video description">
-            <p class="watch-description-meta">{description_meta}</p>
+            <p class="watch-description-meta" title="Released {published_detail}">{description_meta}</p>
             <div class="watch-description-body">{description_body}</div>
-            <button class="description-toggle" type="button" data-description-toggle data-more-label="More" data-less-label="Show less">More</button>
+            <button class="description-toggle" type="button" data-description-toggle data-more-label="More" data-less-label="Show less" hidden>More</button>
           </section>'''
-    subscribe_button = ""
-    if channel_id_raw and feed_url_raw:
-        if subscribed:
-            subscribe_button = f'''<button class="watch-subscribe subscribed" type="button" data-unsubscribe-feed data-channel-id="{channel_id}" data-feed-url="{feed_url}" data-title="{escape(channel_text, quote=True)}" aria-label="Unsubscribe from {channel}">{_icon("check")}<span>Subscribed</span></button>'''
-        else:
-            subscribe_button = f'''<button class="watch-subscribe" type="button" data-subscribe-feed data-channel-id="{channel_id}" data-feed-url="{feed_url}" data-title="{escape(channel_text, quote=True)}" aria-label="Subscribe to {channel}">{_icon("channels")}<span>Subscribe</span></button>'''
+    notify_level = db.get_channel_notification(channel_id_raw, user_key) if subscribed and channel_id_raw else "all"
+    subscribe_button = _subscribe_control(channel_id_raw, feed_url_raw, channel_text, subscribed, notify_level)
 
     short_class = " is-short" if db.is_short_video(video) else ""
     show_comments = False
@@ -5686,36 +8384,35 @@ def watch_video(request: Request, youtube_video_id: str):
     ) if show_comments else ""
 
     content = f'''
-      <div class="watch-layout">
-        <article class="watch-content">
+      <div class="watch-layout" data-watch-layout data-video-id="{escape(youtube_video_id)}" data-duration="{int(video.get("duration_seconds") or 0)}" data-resume="{resume_at}">
+        <div class="watch-stage">
           <div class="watch-player-shell{short_class}">
-            <iframe class="player-frame" src="/watch/{escape(youtube_video_id)}/player" title="Invidious player" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>
+            <iframe class="player-frame" src="/watch/{escape(youtube_video_id)}/player{resume_query}" title="Invidious player" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>
           </div>
+        </div>
+        <article class="watch-content">
           <h1 class="watch-title">{title}</h1>
           <div class="watch-meta-line">
             <div class="watch-channel">
               {_avatar_html(channel_text, video.get("channel_avatar_url"), tag="a", href=channel_href)}
               <div>
-                <a class="watch-channel-name" href="{channel_href}">{channel}</a>
+                {_creator_links(video, channel_href)}
                 <p class="metadata">{subscriber_text or subscription}</p>
-                <p class="metadata">{view_text}{f' &middot; {published_text}' if published_text else ''}</p>
               </div>
             </div>
             <div class="watch-inline-actions">{subscribe_button}</div>
-          </div>
-          <div class="watch-actions" aria-label="Video actions">
+            <div class="watch-actions" aria-label="Video actions">
             <div class="watch-reactions">
-              <button class="watch-icon-action has-count{like_selected}" type="button" data-feedback="like" data-video-id="{escape(youtube_video_id)}" aria-label="Like{f' ({like_total} likes)' if like_total else ''}" title="Like" aria-pressed="{like_pressed}">{_icon("like")}{like_count_html}<span class="sr-only">Like</span></button>
-              <button class="watch-icon-action has-count{dislike_selected}" type="button" data-feedback="dislike" data-video-id="{escape(youtube_video_id)}" aria-label="Dislike" title="Dislike" aria-pressed="{dislike_pressed}">{_icon("dislike")}{dislike_count_html}<span class="sr-only">Dislike</span></button>
+              <button class="pill-action reaction-action has-count{like_selected}" type="button" data-feedback="like" data-video-id="{escape(youtube_video_id)}" aria-label="Like{f' ({like_total} likes)' if like_total else ''}" title="Like" aria-pressed="{like_pressed}">{_icon("like")}{like_count_html}<span class="sr-only">Like</span></button>
+              <button class="pill-action reaction-action has-count{dislike_selected}" type="button" data-feedback="dislike" data-video-id="{escape(youtube_video_id)}" aria-label="Dislike" title="Dislike" aria-pressed="{dislike_pressed}">{_icon("dislike")}{dislike_count_html}<span class="sr-only">Dislike</span></button>
             </div>
-            <button type="button" data-copy-url="/watch/{escape(youtube_video_id)}" aria-label="Copy share link" title="Share">{_icon("share")}<span>Share</span></button>
-            <button type="button" data-save-to-playlist="{escape(youtube_video_id)}" data-video-title="{escape(_text_excerpt(title_text, 90), quote=True)}">{_icon("playlist")}<span>Save</span></button>
-            <button type="button" data-download-video="{escape(youtube_video_id)}" data-video-title="{escape(_text_excerpt(title_text, 90), quote=True)}">{_icon("download")}<span>Download</span></button>
-            <button class="theater-toggle" type="button" data-theater-toggle aria-pressed="false" aria-label="Toggle theater mode" title="Theater mode (t)">{_icon("theater")}<span>Theater</span></button>
-            <button type="button" data-feedback="mark_watched" data-video-id="{escape(youtube_video_id)}">{_icon("check")}<span>Watched</span></button>
-            {_watch_options_menu(youtube_video_id, invidious_url, youtube_url)}
+            <button class="pill-action" type="button" data-copy-url="/watch/{escape(youtube_video_id)}" aria-label="Copy share link" title="Share">{_icon("share")}<span>Share</span></button>
+            <button class="pill-action" type="button" data-save-to-playlist="{escape(youtube_video_id)}" data-video-title="{escape(_text_excerpt(title_text, 90), quote=True)}">{_icon("playlist")}<span>Save</span></button>
+            {_watch_options_menu(youtube_video_id, invidious_url, youtube_url, title_text)}
+            </div>
           </div>
           {description_html}
+          {f'<dialog class="feed-dialog details-dialog" data-details-dialog><div class="fc-head"><div><p class="fc-kicker">Video</p><h2>Details</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close">{_icon("x")}</button></div><div class="fc-body">{details_html}</div></dialog>' if details_html else ""}
           {comments_html}
         </article>
         <aside class="watch-panel" aria-label="Watch side panel">
@@ -5724,6 +8421,7 @@ def watch_video(request: Request, youtube_video_id: str):
           {transcript_panel}
         </aside>
       </div>
+      {_download_dialog()}
     '''
     return _app_shell(title_text, "home", content, main_class="watch-main", request=request, immersive=True)
 
@@ -5852,7 +8550,7 @@ def _embed_playable(youtube_video_id: str, use_cache: bool = True) -> tuple[bool
     return ok, reason
 
 
-def _all_playback_sources(user_key: str = "local") -> list[dict[str, Any]]:
+def _all_playback_sources(user_key: str = "local", downloaded: bool = False) -> list[dict[str, Any]]:
     """Every source this user *could* play from, enabled or not, in their chosen order.
 
     Disabled sources are still returned so Settings can list them with the switch off —
@@ -5875,6 +8573,18 @@ def _all_playback_sources(user_key: str = "local") -> list[dict[str, Any]]:
         sources.append({"id": source_id, "label": host, "kind": "invidious-public", "base": base,
                         "hint": "Someone else's Invidious instance — it sees what you watch."})
 
+    # A file already on disk beats every network source: it always works, it is the
+    # quality the user chose, and it needs nothing from YouTube. Only offered for videos
+    # that actually have one, so this entry appears and disappears per video.
+    if downloaded:
+        sources.append({"id": "downloaded", "label": "Downloaded copy", "kind": "downloaded", "base": "",
+                        "hint": "Plays the file saved in your library — works offline and never touches YouTube."})
+
+    if settings.ytdlp_enabled and settings.ytdlp_playback_fallback and ytdlp.available():
+        sources.append({"id": "ytdlp", "label": "Direct stream (yt-dlp)", "kind": "ytdlp", "base": "",
+                        "hint": "Extracts the stream itself and proxies it through OpenFeed — private, "
+                                "but limited to the muxed rendition, usually 360p or 720p."})
+
     if settings.youtube_fallback_enabled:
         sources.append({"id": "youtube", "label": "YouTube", "kind": "youtube", "base": "",
                         "hint": "youtube-nocookie.com embed — the most reliable option."})
@@ -5888,23 +8598,40 @@ def _all_playback_sources(user_key: str = "local") -> list[dict[str, Any]]:
     if order:
         rank = {source_id: index for index, source_id in enumerate(order)}
         sources.sort(key=lambda source: rank.get(source["id"], len(rank) + 1))
+
+    # A file already on disk is not a preference call — it always works, it is the quality
+    # the user picked, and it reaches YouTube not at all. A saved source order would
+    # otherwise bury it at the bottom, since it is not a source anyone ever ranked.
+    sources.sort(key=lambda source: 0 if source["kind"] == "downloaded" else 1)
     return sources
 
 
-def _configured_playback_sources(user_key: str = "local") -> list[dict[str, Any]]:
+def _configured_playback_sources(user_key: str = "local", downloaded: bool = False) -> list[dict[str, Any]]:
     """The enabled sources only, in preference order, before health is applied."""
-    return [source for source in _all_playback_sources(user_key) if source.get("enabled", True)]
+    return [source for source in _all_playback_sources(user_key, downloaded) if source.get("enabled", True)]
 
 
-def _source_url(source: dict[str, str], video_id: str, play: str) -> str:
+def _source_url(source: dict[str, str], video_id: str, play: str, start: int = 0) -> str:
+    """Where to point the iframe, including the resume point.
+
+    Each backend spells the start offset differently, and getting it into the URL is what
+    makes the video open at the right place instead of seeking there a moment later.
+    """
     if source["kind"] == "invidious-local":
-        return f"/embed/{video_id}?autoplay={play}"
+        return f"/embed/{video_id}?autoplay={play}" + (f"&t={start}" if start else "")
     if source["kind"] == "invidious-public":
-        return f"{source['base']}/embed/{video_id}?autoplay={play}"
-    return f"https://www.youtube-nocookie.com/embed/{video_id}?autoplay={play}&rel=0&modestbranding=1&playsinline=1"
+        return f"{source['base']}/embed/{video_id}?autoplay={play}" + (f"&t={start}" if start else "")
+    if source["kind"] == "downloaded":
+        return f"/watch/{video_id}/local?autoplay={play}" + (f"&t={start}" if start else "")
+    if source["kind"] == "ytdlp":
+        return f"/watch/{video_id}/ytdlp?autoplay={play}" + (f"&t={start}" if start else "")
+    return (
+        f"https://www.youtube-nocookie.com/embed/{video_id}?autoplay={play}&rel=0&modestbranding=1&playsinline=1"
+        + (f"&start={start}" if start else "")
+    )
 
 
-def _playback_sources(youtube_video_id: str, autoplay: bool = True, user_key: str = "local") -> tuple[list[dict[str, str]], str]:
+def _playback_sources(youtube_video_id: str, autoplay: bool = True, user_key: str = "local", start: int = 0, downloaded: bool = False) -> tuple[list[dict[str, str]], str]:
     """The ordered list of players to try for one video.
 
     Order is the user's preference, re-sorted so sources currently in cooldown sink to
@@ -5913,7 +8640,7 @@ def _playback_sources(youtube_video_id: str, autoplay: bool = True, user_key: st
     """
     video_id = urllib.parse.quote(youtube_video_id, safe="")
     play = "1" if autoplay else "0"
-    configured = _configured_playback_sources(user_key)
+    configured = _configured_playback_sources(user_key, downloaded)
     if not configured:
         return [], "No playback source is enabled in settings."
 
@@ -5938,14 +8665,19 @@ def _playback_sources(youtube_video_id: str, autoplay: bool = True, user_key: st
             "id": source["id"],
             "label": source["label"],
             "kind": source["kind"],
-            "url": _source_url(source, video_id, play),
-            "same_origin": "1" if source["kind"] == "invidious-local" else "",
+            "url": _source_url(source, video_id, play, start),
+            "same_origin": "1" if source["kind"] in {"invidious-local", "ytdlp", "downloaded"} else "",
         })
     return ordered, reason
 
 
 @app.get("/watch/{youtube_video_id}/player", response_class=HTMLResponse)
-def watch_player(request: Request, youtube_video_id: str):
+def watch_player(request: Request, youtube_video_id: str, t: int = 0, autoplay: int = 1):
+    """The player shell.
+
+    `autoplay=0` is what makes Shorts preloading possible: the frame fetches the player
+    and buffers, but waits for an openfeed:play message before it starts.
+    """
     auth_redirect = _login_required_redirect(request)
     if auth_redirect:
         return auth_redirect
@@ -5953,7 +8685,10 @@ def watch_player(request: Request, youtube_video_id: str):
     public = get_settings().invidious_public_url
     invidious_url = f"{public}/watch?v={video_id}" if public else ""
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-    sources, reason = _playback_sources(youtube_video_id, user_key=_user_key(request))
+    start = max(0, min(int(t or 0), 86400))
+    user_key = _user_key(request)
+    downloaded = bool(db.get_download(youtube_video_id, user_key))
+    sources, reason = _playback_sources(youtube_video_id, autoplay=bool(autoplay), user_key=user_key, start=start, downloaded=downloaded)
     playable = bool(sources)
 
     shell_styles = """
@@ -5975,7 +8710,7 @@ def watch_player(request: Request, youtube_video_id: str):
     if playable:
         body_html = f'''
         <div class="stage" data-player-stage data-sources="{escape(json.dumps(sources), quote=True)}" data-video-id="{video_id}" data-fallback-reason="{escape(reason, quote=True)}">
-          <img class="poster" src="https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" alt="" aria-hidden="true">
+          <img class="poster" src="/vi/{video_id}/hqdefault.jpg" alt="" aria-hidden="true">
           <div class="spinner" data-player-spinner aria-hidden="true"></div>
         </div>
         <div class="source-note" data-source-note hidden><span data-source-label></span><button type="button" data-retry-preferred>Retry Invidious</button></div>
@@ -6092,6 +8827,7 @@ def _player_script() -> str:
         let sources = [];
         try { sources = JSON.parse(stage.dataset.sources || '[]'); } catch (error) { sources = []; }
         if (!sources.length) return;
+        const VIDEO_ID = stage.dataset.videoId || '';
 
         const note = document.querySelector('[data-source-note]');
         const noteLabel = document.querySelector('[data-source-label]');
@@ -6130,7 +8866,18 @@ def _player_script() -> str:
             const preferred = source.id === 'invidious';
             note.hidden = preferred;
             const why = stage.dataset.fallbackReason || '';
-            noteLabel.textContent = preferred ? '' : `Playing via ${source.label}${why ? ' — ' + why : ''}`;
+            const base = preferred ? '' : `Playing via ${source.label}${why ? ' — ' + why : ''}`;
+            noteLabel.textContent = base;
+            if (!source.same_origin) {
+              /* Nothing inside a third-party player is reachable from here: we cannot read
+                 its clock, so we cannot skip anything or draw a marker on its scrubber.
+                 Saying that is better than a SponsorBlock toggle that silently does
+                 nothing on exactly the videos that needed the fallback. */
+              sbFetch().then((segments) => {
+                if (!segments.length || noteLabel.textContent !== base) return;
+                noteLabel.textContent = `${base} — SponsorBlock cannot skip in this player`;
+              });
+            }
           }
         }
 
@@ -6144,12 +8891,233 @@ def _player_script() -> str:
           mount();
         }
 
+        /* Position reporting. The local Invidious embed and the yt-dlp player are both
+           served through this origin, so their playhead is readable — that real reading is
+           what gets stored as the resume point. A cross-origin embed is opaque, and rather
+           than guess it simply reports nothing and the video will not offer to resume. */
+        function trackPosition(video) {
+          let lastSent = 0;
+          function send(final) {
+            const at = Number(video.currentTime || 0);
+            if (!at || Math.abs(at - lastSent) < 5) return;
+            lastSent = at;
+            const body = JSON.stringify({
+              youtube_video_id: VIDEO_ID,
+              resume_seconds: at,
+              duration_seconds: Number(video.duration) || null,
+              event_type: 'position',
+              payload: { source: 'player' }
+            });
+            if (final && navigator.sendBeacon) {
+              navigator.sendBeacon('/api/playback/progress', new Blob([body], { type: 'application/json' }));
+              return;
+            }
+            fetch('/api/playback/progress', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }).catch(() => {});
+          }
+          video.addEventListener('timeupdate', () => send(false));
+          video.addEventListener('pause', () => send(false));
+          /* Leaving the page is exactly when the mark matters most, so it is also sent on
+             the way out — a reload or a back button would otherwise lose the last stretch. */
+          video.addEventListener('ended', () => send(false));
+          window.addEventListener('pagehide', () => send(true));
+          document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') send(true);
+          });
+        }
+
+        /* Timestamps in the description and in comments seek the player. The watch page is
+           the parent frame and same-origin, but going through postMessage keeps the reach
+           one-way: the page asks, this shell decides whether it can honour it. */
+        let seekTarget = null;
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin) return;
+          const data = event.data || {};
+          if (data.type !== 'openfeed:seek') return;
+          const seconds = Number(data.seconds);
+          if (!isFinite(seconds) || seconds < 0) return;
+          if (seekTarget) {
+            seekTarget.currentTime = seconds;
+            const play = seekTarget.play();
+            if (play && play.catch) play.catch(() => {});
+          }
+        });
+
+        /* Shorts preload the next few players muted and paused, then hand control here
+           when one scrolls into view. Without this a preloaded frame would either play
+           unheard in the background or have to be reloaded on arrival, which is the delay
+           the preloading exists to remove. */
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin) return;
+          const type = (event.data || {}).type;
+          if (type === 'openfeed:sb-undo') {
+            const seconds = Number((event.data || {}).seconds);
+            if (seekTarget && isFinite(seconds)) {
+              sbLastSkip = null;
+              seekTarget.dataset.sbUndone = String(seconds);
+              seekTarget.currentTime = seconds;
+            }
+            return;
+          }
+          if (type !== 'openfeed:play' && type !== 'openfeed:pause') return;
+          if (!seekTarget) return;
+          if (type === 'openfeed:pause') { seekTarget.pause(); return; }
+          seekTarget.muted = false;
+          const play = seekTarget.play();
+          if (play && play.catch) play.catch(() => {
+            /* Autoplay with sound can be refused; falling back to muted still means the
+               picture moves the instant the Short arrives. */
+            seekTarget.muted = true;
+            const retry = seekTarget.play();
+            if (retry && retry.catch) retry.catch(() => {});
+          });
+        });
+
+        /* Two jobs, both needing a stylesheet inside the embed document.
+
+           Invidious paints bright red markers on the seek bar for the segments it knows
+           about; that is internal bookkeeping, not something worth putting in front of a
+           viewer, so it is hidden.
+
+           The SponsorBlock marks and the manual skip button are also created *inside* the
+           embed, which does not load the app stylesheet — so the rules for them have to
+           travel here too. Without this the marks are in the DOM with correct positions
+           and no height, colour or positioning, which is exactly as visible as nothing.
+           The embed is same-origin, which is the only reason any of this is possible. */
+        const EMBED_CSS = `
+          .vjs-marker { display: none !important; }
+          .sb-marks { position: absolute; left: 0; right: 0; top: 0; bottom: 0;
+            pointer-events: none; z-index: 4; }
+          .sb-mark { position: absolute; top: 0; height: 100%; min-width: 2px;
+            background: #22c55e; opacity: .9; border-radius: 1px; }
+          .sb-mark[data-category="selfpromo"] { background: #eab308; }
+          .sb-mark[data-category="interaction"] { background: #a855f7; }
+          .sb-mark[data-category="intro"], .sb-mark[data-category="outro"] { background: #38bdf8; }
+          .sb-mark[data-category="preview"] { background: #f97316; }
+          .sb-mark[data-category="filler"] { background: #94a3b8; }
+          .sb-skip { position: absolute; right: 16px; bottom: 68px; z-index: 6;
+            display: inline-flex; align-items: center; padding: 9px 14px; border: 0;
+            border-radius: 8px; background: rgba(10,10,11,.86); color: #fff;
+            font: 600 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+            cursor: pointer; backdrop-filter: blur(6px); }
+          .sb-skip[hidden] { display: none; }
+          .sb-skip:hover { background: rgba(10,10,11,.96); }
+        `;
+
+        function styleEmbed(doc) {
+          if (!doc || doc.getElementById('openfeed-embed-style')) return;
+          const style = doc.createElement('style');
+          style.id = 'openfeed-embed-style';
+          style.textContent = EMBED_CSS;
+          (doc.head || doc.documentElement).appendChild(style);
+        }
+
+        /* --- SponsorBlock ------------------------------------------------------------
+           Segments are fetched once per video from our own backend, which does the hashed
+           lookup. Skipping is driven off timeupdate rather than timers because a seek or a
+           speed change would desynchronise anything scheduled ahead of time. */
+        let sbSegments = [];
+        let sbLastSkip = null;
+
+        /* The "Skipped ... / Undo" notice belongs to the watch page, not to this shell,
+           which is a bare iframe with no room to show it — so a skip posts a message up
+           and the page raises its own toast. */
+
+        function sbSkipButton(doc, segment) {
+          let button = doc.querySelector('.sb-skip');
+          if (!button) {
+            button = doc.createElement('button');
+            button.type = 'button';
+            button.className = 'sb-skip';
+            (doc.body || doc.documentElement).appendChild(button);
+          }
+          button.textContent = `Skip ${segment.label.toLowerCase()}`;
+          button.hidden = false;
+          button.onclick = () => {
+            if (seekTarget) seekTarget.currentTime = segment.end;
+            button.hidden = true;
+          };
+          return button;
+        }
+
+        /* Fetched once per shell, not once per source, and deliberately *before* we know
+           whether the player will end up same-origin: if it does not, the segments are
+           still worth having so the note can admit that nothing will be skipped. */
+        let sbLoad = null;
+
+        function sbFetch() {
+          if (!sbLoad) {
+            sbLoad = !VIDEO_ID ? Promise.resolve([]) :
+              fetch(`/api/sponsorblock/${encodeURIComponent(VIDEO_ID)}`)
+                .then((r) => r.json())
+                .then((data) => { sbSegments = (data && data.segments) || []; return sbSegments; })
+                .catch(() => []);
+          }
+          return sbLoad;
+        }
+
+        function sbAttach(doc, video) {
+          sbFetch().then((segments) => {
+            if (!segments.length) return;
+            sbDrawMarks(doc, video);
+            video.addEventListener('timeupdate', () => sbTick(doc, video));
+          });
+        }
+
+        function sbDrawMarks(doc, video) {
+          const duration = Number(video.duration) || 0;
+          if (!duration) { video.addEventListener('loadedmetadata', () => sbDrawMarks(doc, video), { once: true }); return; }
+          /* The scrubber itself, not the control that contains it: the holder is the 3px
+             bar, so the marks line up with it exactly instead of floating in the 30px
+             hit area around it. */
+          const bar = doc.querySelector('.vjs-progress-holder') || doc.querySelector('.vjs-progress-control');
+          let strip = doc.querySelector('.sb-marks');
+          if (!strip || (bar && strip.parentElement !== bar)) {
+            strip?.remove();
+            strip = doc.createElement('div');
+            strip.className = 'sb-marks';
+            (bar || doc.body || doc.documentElement).appendChild(strip);
+          }
+          strip.textContent = '';
+          for (const segment of sbSegments) {
+            const mark = doc.createElement('span');
+            mark.className = 'sb-mark';
+            mark.dataset.category = segment.category;
+            mark.style.left = `${(segment.start / duration) * 100}%`;
+            mark.style.width = `${Math.max(0.4, ((segment.end - segment.start) / duration) * 100)}%`;
+            mark.title = segment.label;
+            strip.appendChild(mark);
+          }
+        }
+
+        function sbTick(doc, video) {
+          const at = Number(video.currentTime) || 0;
+          const undone = Number(video.dataset.sbUndone || -1);
+          const current = sbSegments.find((s) => at >= s.start && at < s.end - 0.2);
+          const button = doc.querySelector('.sb-skip');
+          if (!current) { if (button) button.hidden = true; return; }
+          /* An undone skip stays undone until playback leaves the segment. */
+          if (undone >= current.start && undone < current.end) return;
+          if (current.action === 'skip') {
+            if (sbLastSkip === current.uuid) return;
+            sbLastSkip = current.uuid;
+            const from = video.currentTime;
+            video.currentTime = current.end;
+            window.parent.postMessage({ type: 'openfeed:sb-skipped', label: current.label, undoTo: from }, window.location.origin);
+          } else if (current.action === 'manual') {
+            sbSkipButton(doc, current);
+          }
+        }
+
         function watchSameOrigin() {
           let doc = null;
           try { doc = frame.contentDocument; } catch (error) { doc = null; }
           if (!doc) return false;
+          styleEmbed(doc);
           const video = doc.querySelector('video');
           if (!video) { next('no video element'); return true; }
+          seekTarget = video;
+          trackPosition(video);
+          sbAttach(doc, video);
           const ready = () => markReady(sources[index]);
           video.addEventListener('playing', ready, { once: true });
           video.addEventListener('timeupdate', ready, { once: true });
@@ -6426,12 +9394,50 @@ def search_page(request: Request, q: str = "", limit: int = 40):
         return auth_redirect
     settings = get_settings()
     cleaned = q.strip()
-    videos = db.search_videos(cleaned, max(1, min(limit, 100)))
-    rows = "".join(_media_row(video, settings, "Search result") for video in videos)
+    capped = max(1, min(limit, 100))
+    local = db.search_videos(cleaned, capped) if cleaned else db.list_recent_videos(capped)
+
+    # Searching only the local library answered "which videos do I already have that match"
+    # rather than the question anyone actually asks. Results come from YouTube via
+    # Invidious, with anything already in the library shown first because we know more
+    # about it — its watch progress, whether the channel is subscribed, and so on.
+    remote: list[dict[str, Any]] = []
+    search_error = ""
+    if cleaned:
+        try:
+            remote = discovery.search_youtube(cleaned)
+        except Exception as exc:
+            search_error = str(exc)
+            logger.warning("youtube search failed for %r: %s", cleaned, exc)
+
+    known = {str(video.get("youtube_video_id") or "") for video in local}
+    fresh = [item for item in remote if item.get("youtube_video_id") not in known]
+    if fresh:
+        # Stored so the watch page, playlists and feedback all work on a search result the
+        # same way they do on anything else — without this a result opened to a 404.
+        try:
+            db.store_search_results(fresh[:capped], cleaned)
+        except Exception as exc:
+            logger.warning("could not store search results for %r: %s", cleaned, exc)
+
+    combined = local + fresh[: max(0, capped - len(local))]
+    rows = "".join(
+        _media_row(video, settings, "In your library" if video.get("youtube_video_id") in known else "From YouTube")
+        for video in combined
+    )
     if not rows:
-        rows = '<p class="empty-copy">No matching videos.</p>'
+        rows = (
+            f'<p class="empty-copy">Search is unavailable right now: {escape(search_error)}</p>'
+            if search_error
+            else '<p class="empty-copy">No matching videos.</p>'
+        )
     heading = f'Results for "{escape(cleaned)}"' if cleaned else "Recent videos"
-    helper = "Use the search bar in the header to refine this feed." if cleaned else "Use the search bar in the header to search OpenFeed."
+    if cleaned:
+        helper = f"{len(local)} from your library, {len(fresh)} from YouTube."
+        if search_error:
+            helper = "Showing library results only — YouTube search could not be reached."
+    else:
+        helper = "Use the search bar in the header to search YouTube and your library."
     content = f'''
       <section class="page-hero search-summary">
         <div>
@@ -6482,6 +9488,167 @@ def _subscription_timeline(videos: list[dict[str, Any]], settings: Any) -> str:
             f'<div class="video-grid">{cards}</div></section>'
         )
     return f'<div class="timeline" data-section-kind="subscription">{"".join(blocks)}</div>'
+
+
+def _takeout_pane_html(user_key: str = "local") -> str:
+    """The Takeout importer, as a Settings pane.
+
+    It lived on its own page reached from the sidebar, which put a one-time setup task
+    permanently between Downloads and Channels. Settings is where one-time setup belongs.
+    """
+    existing = db.latest_takeout_import(user_key)
+    summary = existing.get("summary") if existing and isinstance(existing.get("summary"), dict) else {}
+    status_html = ""
+    if existing:
+        when = escape(_relative_time(existing.get("created_at")) or "recently")
+        counts = db.takeout_subscription_counts(user_key)
+        pending = counts.get("pending", 0)
+        unavailable = counts.get("unavailable", 0)
+        apply_button = (
+            f'<button class="pill-action" type="button" data-takeout-apply-subs>Subscribe to {pending} channels</button>'
+            if pending else ""
+        )
+        # Say why the numbers do not add up, rather than leaving it looking like a failure.
+        unavailable_note = (
+            f'<p class="dialog-note">{unavailable} channel{"" if unavailable == 1 else "s"} in your export no longer '
+            f'exist on YouTube, so there is no feed to subscribe to. '
+            f'<button class="link-action" type="button" data-takeout-retry-subs>Try them again</button></p>'
+        ) if unavailable else ""
+        status_html = f'''
+          <div class="import-status" data-import-status>
+            <div>
+              <strong>Imported {when}</strong>
+              <p>{int(summary.get("watched_videos") or 0):,} videos &middot; {int(summary.get("watched_channels") or 0):,} channels
+                 &middot; {counts.get("total", 0):,} subscriptions</p>
+            </div>
+            <div class="import-status-actions">
+              {apply_button}
+              <button class="pill-action" type="button" data-feed-refresh>Refresh feed</button>
+              <button class="pill-action danger" type="button" data-takeout-delete>Delete imported data</button>
+            </div>
+          </div>
+          {unavailable_note}
+          <p class="dialog-note import-note">{_icon("clock")}<span><strong>Your feed takes a while to catch up.</strong>
+             Importing tells OpenFeed what you like, but it still has to go and fetch videos on those
+             subjects &mdash; from the channels you watch, from searches on your top topics, and from
+             what is trending. That runs in the background every sync, and new videos need their
+             details fetched before topic matching can see them. Expect the feed to keep shifting
+             toward your interests over the next few hours rather than changing the moment you
+             upload. <button class="link-action" type="button" data-feed-refresh>Refresh now</button>
+             runs a pass immediately.</span></p>
+        '''
+    return f'''
+      <section class="page-hero">
+        <div>
+          <p class="page-kicker">Personalization</p>
+          <h1>Import your YouTube history</h1>
+          <p>OpenFeed starts out knowing nothing about you. Your Google Takeout export already
+             contains years of what you watched and whose channels you watch most — importing it
+             skips the cold start and makes recommendations useful immediately.</p>
+        </div>
+      </section>
+
+      {status_html}
+
+      <section class="import-layout">
+        <ol class="import-steps">
+          <li>
+            <h3>Open Google Takeout</h3>
+            <p>Go to <a href="https://takeout.google.com/" target="_blank" rel="noopener noreferrer">takeout.google.com</a>
+               and sign in with the account you watch YouTube on.</p>
+          </li>
+          <li>
+            <h3>Select YouTube only</h3>
+            <p>Click <strong>Deselect all</strong>, scroll down, and tick just
+               <strong>YouTube and YouTube Music</strong>. Selecting everything produces an
+               archive many gigabytes larger with nothing extra that this import can use.</p>
+          </li>
+          <li>
+            <h3>Choose JSON for history</h3>
+            <p>Press <strong>Multiple formats</strong> and set <strong>History</strong> to
+               <strong>JSON</strong>. This is the step people miss — Takeout defaults to HTML,
+               which cannot be parsed reliably, and the import will tell you so if you get it wrong.</p>
+          </li>
+          <li>
+            <h3>Narrow the content</h3>
+            <p>Press <strong>All YouTube data included</strong> and keep only
+               <strong>history</strong> and <strong>subscriptions</strong>. Leaving videos ticked
+               means Takeout exports every video you have ever uploaded.</p>
+          </li>
+          <li>
+            <h3>Export and wait</h3>
+            <p>Choose <strong>Export once</strong>, <strong>.zip</strong>, and the largest size.
+               Google emails you a link, usually within minutes but sometimes hours.</p>
+          </li>
+          <li>
+            <h3>Upload it here</h3>
+            <p>Drop the <code>.zip</code> below exactly as Google gave it to you — no need to unzip.</p>
+          </li>
+        </ol>
+
+        <div class="import-panel">
+          <div class="import-drop" data-import-drop tabindex="0" role="button" aria-label="Choose a Takeout archive">
+            {_icon("download")}
+            <strong>Drop your Takeout .zip here</strong>
+            <small>or click to choose a file</small>
+            <input type="file" accept=".zip,application/zip" data-import-file hidden>
+          </div>
+          <div class="import-progress" data-import-progress hidden>
+            <div class="download-bar is-indeterminate"><span></span></div>
+            <p class="dialog-note" data-import-state>Reading your archive&hellip;</p>
+          </div>
+          <div class="import-result" data-import-result hidden></div>
+          <p class="dialog-note privacy-note">Your archive is parsed on this server and never
+             leaves it. Only the counts that feed ranking are kept — which channels you watch and
+             how often, and the IDs of videos you have already seen. The archive itself is not
+             written to disk, and <strong>Delete imported data</strong> removes everything it added.</p>
+        </div>
+      </section>
+    '''
+
+
+@app.get("/import", response_class=HTMLResponse, tags=["pages"], summary="Redirects to Settings")
+def import_page(request: Request):
+    """Importing is one-time setup, so it lives in Settings now."""
+    return RedirectResponse(url="/?settings=import", status_code=307)
+
+
+@app.get("/subscriptions", response_class=HTMLResponse)
+def subscriptions_page(request: Request, limit: int = 60):
+    """Latest uploads from subscribed channels, newest first.
+
+    Kept separate from /channels, which manages *which* channels you follow. Collapsing
+    the two is what made the old "Subscriptions" entry feel like it went nowhere in
+    particular — it opened a channel grid rather than the feed people expect.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    settings = get_settings()
+    user_key = _user_key(request)
+    preferences = db.get_feed_preferences(user_key)
+    include_shorts = not preferences.get("exclude_shorts", False)
+    page_size = max(1, min(limit, 200))
+    videos = db.list_subscription_uploads(page_size, user_key, include_shorts)
+    posts_html = _subscription_posts_shelf(user_key) if preferences.get("show_posts_in_feeds") else ""
+    cards = "".join(_home_video_card(video, index, settings) for index, video in enumerate(videos))
+    if not cards:
+        cards = (
+            '<p class="empty-copy">No uploads yet. Subscribe to channels in FreshRSS and they '
+            'will appear here after the next sync.</p>'
+        )
+    cards = posts_html + cards
+    content = f'''
+      <section class="page-hero">
+        <div>
+          <p class="page-kicker">Subscriptions</p>
+          <h1>Latest from your subscriptions</h1>
+          <p>Every upload from the channels you follow, newest first. <a href="/channels">Manage channels</a>.</p>
+        </div>
+      </section>
+      <div class="video-grid" data-view-target>{cards}</div>
+    '''
+    return _app_shell("Subscriptions", "subscriptions", content, request=request)
 
 
 @app.get("/channels", response_class=HTMLResponse)
@@ -6545,91 +9712,166 @@ def channels_page(request: Request, limit: int = 200, collection: str = "", view
         <div class="collection-grid">{collection_cards}</div>
       </section>
     '''
-    return _app_shell("Subscriptions", "channels", content, request=request)
+    # The sidebar has separate entries for the two tabs on this screen, so the active
+    # one has to follow the tab rather than always being "All channels".
+    nav_key = "collections" if collections_active else "channels"
+    page_title = "Collections" if collections_active else "Subscriptions"
+    return _app_shell(page_title, nav_key, content, request=request)
 
 
-@app.get("/library", response_class=HTMLResponse)
-def library_page(request: Request, limit: int = 80):
+# --- library sections ---------------------------------------------------------------
+# Each of these renders exactly one thing and nothing else, so a nav item can point at a
+# page that *is* that thing rather than a page that merely contains it.
+
+
+def _history_section_html(user_key: str, settings: Any, limit: int = 120) -> str:
+    history = db.list_history_videos(limit, user_key)
+    groups: list[tuple[str, list[dict[str, Any]]]] = []
+    for video in history:
+        label = _timeline_day_label(video.get("latest_event_at") or video.get("published_at"))
+        if groups and groups[-1][0] == label:
+            groups[-1][1].append(video)
+        else:
+            groups.append((label, [video]))
+    if not groups:
+        return '<p class="empty-copy">No watch history recorded yet. Videos you open show up here.</p>'
+    blocks = []
+    for index, (label, items) in enumerate(groups):
+        rows = "".join(_media_row(video, settings, "History") for video in items)
+        group_class = "timeline-group" if index == 0 else "timeline-group past"
+        blocks.append(f'<section class="{group_class}"><p class="timeline-date">{escape(label)}</p><div class="library-list">{rows}</div></section>')
+    return f'<div class="timeline">{"".join(blocks)}</div>'
+
+
+def _playlists_section_html(user_key: str, settings: Any, limit: int = 120) -> str:
+    custom = db.list_playlists(user_key)
+    cards = "".join(_playlist_card(playlist) for playlist in custom)
+    if not cards:
+        cards = '<p class="empty-copy">No playlists yet. Create one, then use \u201cSave to playlist\u201d on any video.</p>'
+    feeds = db.list_playlist_subscriptions(limit)
+    feed_section = ""
+    if feeds:
+        feed_section = f'''
+          <section class="section-block">
+            <div class="section-heading"><h2>Playlist feeds from FreshRSS</h2></div>
+            <div class="channel-grid">{"".join(_subscription_card(item) for item in feeds)}</div>
+          </section>
+        '''
+    return f'<div class="channel-grid">{cards}</div>{feed_section}'
+
+
+def _liked_section_html(user_key: str, settings: Any, limit: int = 120) -> str:
+    liked = db.list_liked_videos(limit, user_key)
+    grid = "".join(_home_video_card(video, index, settings) for index, video in enumerate(liked, start=1))
+    if not grid:
+        return '<p class="empty-copy">No liked or starred videos yet. Like a video, or star it in FreshRSS.</p>'
+    return f'<div class="video-grid">{grid}</div>'
+
+
+def _downloads_section_html(user_key: str, settings: Any) -> str:
+    rows = db.list_downloads(user_key, "", 500)
+    grid = "".join(_download_card(row, settings) for row in rows) or (
+        '<p class="empty-copy">No downloads yet. Pick <strong>Keep on server</strong> in the download '
+        'dialog and the video will appear here, playable without touching YouTube.</p>'
+    )
+    total = _bytes_text(sum(int(row.get("size_bytes") or 0) for row in rows))
+    return f'''
+      <div class="toolbar">
+        <span class="toolbar-note">{_icon("download")}<span data-downloads-summary>{len(rows)} download{"" if len(rows) == 1 else "s"}{f" &middot; {total}" if total else ""}</span></span>
+        <label class="toolbar-search">{_icon("search")}<input type="search" placeholder="Search downloads" data-downloads-search aria-label="Search downloads"></label>
+      </div>
+      <div class="video-grid" data-downloads-grid>{grid}</div>
+    '''
+
+
+def _library_page_shell(request: Request, title: str, kicker: str, blurb: str, body: str, nav_key: str, actions: str = ""):
+    content = f'''
+      <section class="page-hero">
+        <div>
+          <p class="page-kicker">{escape(kicker)}</p>
+          <h1>{escape(title)}</h1>
+          <p>{escape(blurb)}</p>
+        </div>
+        {f'<div class="page-actions">{actions}</div>' if actions else ""}
+      </section>
+      {body}
+    '''
+    return _app_shell(title, nav_key, content, request=request)
+
+
+@app.get("/history", response_class=HTMLResponse, tags=["pages"], summary="Watch history")
+def history_page(request: Request, limit: int = 120):
     auth_redirect = _login_required_redirect(request)
     if auth_redirect:
         return auth_redirect
-    settings = get_settings()
     user_key = _user_key(request)
-    bounded_limit = max(1, min(limit, 120))
-    freshrss_playlists = db.list_playlist_subscriptions(bounded_limit)
-    custom_playlists = db.list_playlists(user_key)
-    liked = db.list_liked_videos(bounded_limit, user_key)
-    history = db.list_history_videos(bounded_limit, user_key)
+    return _library_page_shell(
+        request, "History", "You", "Everything you have watched, newest first.",
+        _history_section_html(user_key, get_settings(), max(1, min(limit, 400))), "history",
+    )
 
-    playlist_cards = "".join(_playlist_card(playlist) for playlist in custom_playlists)
-    if not playlist_cards:
-        playlist_cards = '<p class="empty-copy">No playlists yet. Create one, then use “Save to playlist” on any video.</p>'
-    freshrss_section = ""
-    if freshrss_playlists:
-        freshrss_section = f'''
-          <section class="section-block">
-            <div class="section-heading"><h2>Playlist feeds from FreshRSS</h2></div>
-            <div class="channel-grid">{"".join(_subscription_card(item) for item in freshrss_playlists)}</div>
-          </section>
-        '''
-    liked_grid = "".join(_home_video_card(video, index, settings) for index, video in enumerate(liked[:36], start=1))
-    if not liked_grid:
-        liked_grid = '<p class="empty-copy">No liked or starred videos yet. Like a video, or star it in FreshRSS.</p>'
 
-    history_groups: list[tuple[str, list[dict[str, Any]]]] = []
-    for video in history[:60]:
-        label = _timeline_day_label(video.get("latest_event_at") or video.get("published_at"))
-        if history_groups and history_groups[-1][0] == label:
-            history_groups[-1][1].append(video)
-        else:
-            history_groups.append((label, [video]))
-    if history_groups:
-        blocks = []
-        for index, (label, items) in enumerate(history_groups):
-            rows = "".join(_media_row(video, settings, "History") for video in items)
-            group_class = "timeline-group" if index == 0 else "timeline-group past"
-            blocks.append(f'<section class="{group_class}"><p class="timeline-date">{escape(label)}</p><div class="library-list">{rows}</div></section>')
-        history_html = f'<div class="timeline">{"".join(blocks)}</div>'
-    else:
-        history_html = '<p class="empty-copy">No watch history recorded yet.</p>'
+@app.get("/playlists", response_class=HTMLResponse, tags=["pages"], summary="Playlists")
+def playlists_page(request: Request, limit: int = 120):
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    user_key = _user_key(request)
+    return _library_page_shell(
+        request, "Playlists", "You", "Collections of videos you have saved.",
+        _playlists_section_html(user_key, get_settings(), max(1, min(limit, 400))), "playlists",
+        actions=f'<button class="primary-action" type="button" data-new-playlist>{_icon("plus")}<span>New playlist</span></button>',
+    )
 
-    content = f'''
-      <div class="page-head">
-        <div>
-          <h1>Library</h1>
-          <p>Playlists, liked videos, and watch history from your private OpenFeed activity.</p>
-        </div>
-        <div class="page-actions">
-          <button class="primary-action" type="button" data-new-playlist>{_icon("plus")}<span>New playlist</span></button>
-        </div>
-      </div>
 
-      <div class="page-tabs" role="tablist" aria-label="Library views">
-        <button class="page-tab active" type="button" data-page-tab="playlists" role="tab">Playlists <span class="count">{len(custom_playlists)}</span></button>
-        <button class="page-tab" type="button" data-page-tab="liked" role="tab">Liked <span class="count">{len(liked)}</span></button>
-        <button class="page-tab" type="button" data-page-tab="history" role="tab">History <span class="count">{len(history)}</span></button>
-      </div>
+@app.get("/liked", response_class=HTMLResponse, tags=["pages"], summary="Liked videos")
+def liked_page(request: Request, limit: int = 120):
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    user_key = _user_key(request)
+    return _library_page_shell(
+        request, "Liked videos", "You", "Videos you liked here, plus anything starred in FreshRSS.",
+        _liked_section_html(user_key, get_settings(), max(1, min(limit, 400))), "liked",
+    )
 
-      <section data-tab-panel="playlists" id="playlists">
-        <div class="toolbar">
-          <span class="toolbar-note">{_icon("playlist")}<span>{len(custom_playlists)} playlist{"" if len(custom_playlists) == 1 else "s"}</span></span>
-          <label class="toolbar-search">{_icon("search")}<input type="search" placeholder="Search playlists" data-filter-input aria-label="Filter playlists"></label>
-        </div>
-        <div class="playlist-grid">{playlist_cards}</div>
-        {freshrss_section}
-      </section>
 
-      <section data-tab-panel="liked" id="liked" hidden>
-        <div class="toolbar"><span class="toolbar-note">{_icon("like")}<span>{len(liked)} saved video{"" if len(liked) == 1 else "s"}</span></span></div>
-        <div class="video-grid">{liked_grid}</div>
-      </section>
+@app.get("/downloads", response_class=HTMLResponse, tags=["pages"], summary="Downloaded videos")
+def downloads_page(request: Request):
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    user_key = _user_key(request)
+    return _library_page_shell(
+        request, "Downloads", "You", "Videos kept on the server. These play without touching YouTube.",
+        _downloads_section_html(user_key, get_settings()), "downloads",
+    )
 
-      <section data-tab-panel="history" id="history" hidden>
-        <div class="toolbar"><span class="toolbar-note">{_icon("history")}<span>{len(history)} item{"" if len(history) == 1 else "s"}</span></span></div>
-        {history_html}
-      </section>
-    '''
-    return _app_shell("Library", "library", content, request=request)
+
+@app.get("/collections", response_class=HTMLResponse, tags=["pages"], summary="Redirects to the Collections tab")
+def collections_page():
+    """Collections live on the Subscriptions screen, which already has a tab for them.
+
+    A standalone page here meant two screens rendering the same collections. This keeps
+    the tidy URL and sends it to the one real screen with the right tab open.
+    """
+    return RedirectResponse(url="/channels?tab=collections", status_code=307)
+
+
+@app.get("/library", response_class=HTMLResponse, tags=["pages"], summary="Redirects into the You pages")
+def library_page(request: Request, tab: str = ""):
+    """The four things this page held are now pages in their own right.
+
+    Kept as a redirect, and it honours the old tab parameter so existing links land on
+    the right content instead of dumping everyone in the same place.
+    """
+    target = {
+        "history": "/history",
+        "playlists": "/playlists",
+        "liked": "/liked",
+        "downloads": "/downloads",
+    }.get(tab, "/history")
+    return RedirectResponse(url=target, status_code=307)
 
 
 @app.get("/playlist/{playlist_id}", response_class=HTMLResponse)
@@ -6687,7 +9929,7 @@ def playlist_page(request: Request, playlist_id: str):
           <div class="playlist-panel-actions">
             {play_all}
             <button class="text-action" type="button" data-edit-playlist="{playlist_id_attr}" data-playlist-name="{escape(name_text, quote=True)}" data-playlist-description="{escape(description_text, quote=True)}">{_icon("pencil")}<span>Rename</span></button>
-            <button class="text-action" type="button" data-delete-playlist="{playlist_id_attr}" data-redirect="/library">{_icon("trash")}<span>Delete</span></button>
+            <button class="text-action" type="button" data-delete-playlist="{playlist_id_attr}" data-redirect="/playlists">{_icon("trash")}<span>Delete</span></button>
           </div>
         </aside>
         <section class="playlist-items">{items_html}</section>
@@ -6696,8 +9938,202 @@ def playlist_page(request: Request, playlist_id: str):
     return _app_shell(name_text, "library", content, request=request)
 
 
+@app.get("/channel/{youtube_channel_id}/posts", response_class=HTMLResponse, tags=["pages"], summary="Channel community posts")
+def channel_posts_page(request: Request, youtube_channel_id: str, continuation: str = ""):
+    """The Posts tab. Available whether or not posts are enabled in the feeds."""
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    from . import posts as posts_module
+
+    channel = db.get_channel_by_youtube_id(youtube_channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    user_key = _user_key(request)
+    try:
+        page = posts_module.channel_posts(youtube_channel_id, continuation)
+        error = ""
+    except posts_module.PostsError as exc:
+        page, error = {"posts": [], "continuation": ""}, str(exc)
+
+    items = page.get("posts") or []
+    votes = {post["post_id"]: db.get_poll_vote(post["post_id"], user_key) for post in items}
+    cards = "".join(_post_card(post, votes.get(post["post_id"])) for post in items)
+    if not cards:
+        cards = (
+            f'<p class="empty-copy">{escape(error) if error else "This channel has no community posts, or has them turned off."}</p>'
+        )
+    more = ""
+    if page.get("continuation"):
+        more = (
+            f'<div class="post-more"><a class="pill-action" href="/channel/{escape(youtube_channel_id, quote=True)}'
+            f'/posts?continuation={urllib.parse.quote(page["continuation"])}">Load older posts</a></div>'
+        )
+    title_text = str(channel.get("title") or "Channel")
+    content = f'''
+      <section class="page-hero">
+        <div>
+          <p class="page-kicker">{escape(title_text)}</p>
+          <h1>Posts</h1>
+          <p>Text, images and polls this channel shared outside its uploads.</p>
+        </div>
+        <div class="page-actions"><a class="pill-action" href="/channel/{escape(youtube_channel_id, quote=True)}">{_icon("chevron-left")}<span>Videos</span></a></div>
+      </section>
+      <div class="post-list">{cards}</div>
+      {more}
+    '''
+    return _app_shell(f"{title_text} posts", "channels", content, request=request)
+
+
+@app.get("/channel/{youtube_channel_id}/posts/{post_id}", response_class=HTMLResponse, tags=["pages"], summary="A single post")
+def post_detail_page(request: Request, youtube_channel_id: str, post_id: str):
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    from . import posts as posts_module
+
+    user_key = _user_key(request)
+    post = posts_module.single_post(post_id, youtube_channel_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    replies = posts_module.post_comments(post_id, youtube_channel_id)
+    reply_html = "".join(
+        f'<article class="comment"><div class="comment-head">'
+        f'<span class="comment-author">{escape(str(item.get("author") or ""))}</span>'
+        f'<span class="comment-time">{escape(str(item.get("publishedText") or ""))}</span></div>'
+        f'<p class="comment-body">{escape(str(item.get("content") or ""))}</p></article>'
+        for item in (replies.get("comments") or [])[:50]
+        if isinstance(item, dict)
+    )
+    content = f'''
+      <section class="page-hero">
+        <div>
+          <p class="page-kicker">Post</p>
+          <h1>{escape(str(post.get("author") or "Post"))}</h1>
+          <p>{escape(post.get("published_text") or "")}</p>
+        </div>
+        <div class="page-actions"><a class="pill-action" href="/channel/{escape(youtube_channel_id, quote=True)}/posts">{_icon("chevron-left")}<span>All posts</span></a></div>
+      </section>
+      <div class="post-list">{_post_card(post, db.get_poll_vote(post_id, user_key))}</div>
+      {f'<section class="comments"><div class="comments-head"><h2>Replies</h2></div>{reply_html}</section>' if reply_html else ""}
+    '''
+    return _app_shell("Post", "channels", content, request=request)
+
+
+@app.post("/api/posts/{post_id}/vote", tags=["playback"], summary="Record a simulated poll answer")
+def api_post_vote(request: Request, post_id: str, payload: PollVoteRequest) -> dict[str, Any]:
+    """Store which option the user picked.
+
+    Local only. YouTube publishes no per-option counts and accepts no votes without an
+    authenticated account, so there is nowhere to send this even if we wanted to.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    from . import posts as posts_module
+
+    if not posts_module.valid_post_id(post_id):
+        raise HTTPException(status_code=400, detail="Invalid post id")
+    user_key = _user_key(request)
+    if payload.choice_index is None or payload.choice_index < 0:
+        return {"ok": True, "cleared": db.clear_poll_vote(post_id, user_key), "choice_index": None, "submitted_to_youtube": False}
+    choice = db.set_poll_vote(post_id, payload.choice_index, user_key)
+    return {"ok": True, "choice_index": choice, "submitted_to_youtube": False}
+
+
+_URL_IN_TEXT = re.compile(r"https?://[^\s<>\"'\)]+")
+
+
+def _link_label(url: str) -> str:
+    """The bare domain and path, the way YouTube prints a link."""
+    return re.sub(r"^https?://(www\.)?", "", url).rstrip("/")[:48]
+
+
+def _description_links(description: str) -> list[tuple[str, str]]:
+    """Named links pulled out of a channel description.
+
+    Invidious exposes no link fields at all, so a creator's own description is the only
+    honest source. Creators almost always write them as "IG: https://…", which is where
+    the name comes from; when there is no such prefix the domain stands in for it.
+    """
+    if not description:
+        return []
+    links: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in description.splitlines():
+        for match in _URL_IN_TEXT.finditer(line):
+            url = match.group(0).rstrip(".,);:")
+            if url in seen:
+                continue
+            seen.add(url)
+            # Text before the URL on the same line, minus the punctuation creators use to
+            # attach it. Anything long is prose rather than a label, so drop it.
+            prefix = line[: match.start()].strip().strip("-–—:•|»>*").strip()
+            label = prefix if 0 < len(prefix) <= 32 else _link_label(url)
+            links.append((label, url))
+            if len(links) >= 12:
+                return links
+    return links
+
+
+def _channel_about_dialog(
+    title_text: str, description: str, links: list[tuple[str, str]], youtube_channel_id: str,
+    handle: str, subscriber_count: str, video_count: int, latest: str, subscription_link: str,
+) -> str:
+    """The "..more" popup, the way YouTube does it.
+
+    Expanding the description in place pushed the page around and left no way to close it
+    again, so the full text lives here instead.
+    """
+    if not description and not links:
+        return ""
+    sections = []
+    if description:
+        sections.append(
+            f'<section class="ch-about-section"><h3>Description</h3>'
+            f'<div class="ch-about-text">{_rich_text(description[:6000])}</div></section>'
+        )
+    if links:
+        rows = "".join(
+            f'<li>{_icon("external")}<div><span class="ch-link-name">{escape(label)}</span>'
+            f'<a href="{escape(url, quote=True)}" target="_blank" rel="noopener noreferrer nofollow">'
+            f'{escape(_link_label(url))}</a></div></li>'
+            for label, url in links
+        )
+        sections.append(f'<section class="ch-about-section"><h3>Links</h3><ul class="ch-link-list">{rows}</ul></section>')
+
+    # Only what we actually know. This Invidious build reports `joined` and `totalViews`
+    # as 0 for every channel, so a "Joined" or "Views" row here would be a fabrication —
+    # and the video count is what OpenFeed has stored, not YouTube's total, so it says so.
+    info_rows = []
+    channel_url = subscription_link or (
+        f"https://www.youtube.com/@{handle.lstrip('@')}" if handle
+        else f"https://www.youtube.com/channel/{youtube_channel_id}"
+    )
+    info_rows.append(
+        f'<li>{_icon("subs")}<a href="{escape(channel_url, quote=True)}" target="_blank" '
+        f'rel="noopener noreferrer nofollow">{escape(_link_label(channel_url))}</a></li>'
+    )
+    if subscriber_count:
+        info_rows.append(f'<li>{_icon("user")}<span>{escape(subscriber_count)} subscribers</span></li>')
+    info_rows.append(f'<li>{_icon("play")}<span>{video_count} videos in your library</span></li>')
+    if latest:
+        info_rows.append(f'<li>{_icon("clock")}<span>Latest upload {escape(latest)}</span></li>')
+    sections.append(f'<section class="ch-about-section"><h3>More info</h3><ul class="ch-info-list">{"".join(info_rows)}</ul></section>')
+
+    return f'''
+      <dialog class="feed-dialog ch-about-dialog" data-ch-about-dialog aria-labelledby="ch-about-title">
+        <div class="fc-head">
+          <h2 id="ch-about-title">{escape(title_text)}</h2>
+          <button class="icon-button" type="button" data-close-dialog aria-label="Close">{_icon("x")}</button>
+        </div>
+        <div class="fc-body">{"".join(sections)}</div>
+      </dialog>
+    '''
+
+
 @app.get("/channel/{youtube_channel_id}", response_class=HTMLResponse)
-def channel_page(request: Request, youtube_channel_id: str, limit: int = 80, sort: str = "latest"):
+def channel_page(request: Request, youtube_channel_id: str, limit: int = 80, sort: str = "latest", filter: str = "", q: str = ""):
     auth_redirect = _login_required_redirect(request)
     if auth_redirect:
         return auth_redirect
@@ -6708,7 +10144,16 @@ def channel_page(request: Request, youtube_channel_id: str, limit: int = 80, sor
     settings = get_settings()
     sort_key = sort if sort in {"latest", "popular", "oldest"} else "latest"
     bounded_limit = max(1, min(limit, 500))
+    kind = filter if filter in {"shorts", "playlists"} else ""
+    query = (q or "").strip()
     videos = db.list_channel_videos(youtube_channel_id, bounded_limit, sort_key)
+    if query:
+        needle = query.lower()
+        videos = [v for v in videos if needle in str(v.get("title") or "").lower()]
+    if kind == "shorts":
+        videos = [v for v in videos if db.is_short_video(v)]
+    elif kind == "playlists":
+        videos = []
     title_text = str(channel.get("title") or "Unknown channel")
     title = escape(title_text)
     video_count = int(channel.get("video_count") or len(videos))
@@ -6718,13 +10163,8 @@ def channel_page(request: Request, youtube_channel_id: str, limit: int = 80, sor
     subscription_link = escape(channel.get("subscription_html_url") or "")
     feed_url_raw = str(channel.get("feed_url") or _youtube_feed_url(youtube_channel_id))
     subscribed = bool(channel.get("subscription_id"))
-    subscribe_button = ""
-    if youtube_channel_id and feed_url_raw:
-        feed_url = escape(feed_url_raw, quote=True)
-        if subscribed:
-            subscribe_button = f'<button class="watch-subscribe subscribed" type="button" data-unsubscribe-feed data-channel-id="{escape(youtube_channel_id, quote=True)}" data-feed-url="{feed_url}" data-title="{escape(title_text, quote=True)}">{_icon("check")}<span>Subscribed</span></button>'
-        else:
-            subscribe_button = f'<button class="watch-subscribe" type="button" data-subscribe-feed data-channel-id="{escape(youtube_channel_id, quote=True)}" data-feed-url="{feed_url}" data-title="{escape(title_text, quote=True)}">{_icon("channels")}<span>Subscribe</span></button>'
+    notify_level = db.get_channel_notification(youtube_channel_id, _user_key(request)) if subscribed else "all"
+    subscribe_button = _subscribe_control(youtube_channel_id, feed_url_raw, title_text, subscribed, notify_level)
     banner_url = str(channel.get("banner_url") or "").strip()
     if banner_url:
         banner_html = (
@@ -6745,37 +10185,125 @@ def channel_page(request: Request, youtube_channel_id: str, limit: int = 80, sor
         )
     video_grid = "".join(_home_video_card(video, index, settings) for index, video in enumerate(videos, start=1))
     if not video_grid:
-        video_grid = '<p class="empty-copy">No videos imported for this channel yet.</p>'
-    external = f'<a class="text-action" href="{subscription_link}" rel="noreferrer">{_icon("external")}<span>Original</span></a>' if subscription_link else ''
-    tab_html = "".join(
-        f'<a class="page-tab{" active" if sort_key == key else ""}" href="/channel/{escape(youtube_channel_id)}?sort={key}&limit={bounded_limit}"{" aria-current=\"page\"" if sort_key == key else ""}>{label}</a>'
+        video_grid = (
+            '<p class="empty-copy">Playlists are not imported yet.</p>' if kind == "playlists"
+            else f'<p class="empty-copy">No results for &ldquo;{escape(query)}&rdquo; in this channel.</p>' if query
+            else '<p class="empty-copy">No Shorts from this channel yet.</p>' if kind == "shorts"
+            else '<p class="empty-copy">No videos imported for this channel yet.</p>'
+        )
+    # Sorting is a filter on one tab, not a tab of its own — the old page presented
+    # Latest/Popular/Oldest as top-level tabs alongside nothing else, which made the page
+    # look like it had three sections when it has one.
+    filter_html = "".join(
+        f'<a class="ch-chip{" active" if sort_key == key else ""}" '
+        f'href="/channel/{escape(youtube_channel_id)}?sort={key}&limit={bounded_limit}"'
+        f'{" aria-current=\"page\"" if sort_key == key else ""}>{label}</a>'
         for key, label in (("latest", "Latest"), ("popular", "Popular"), ("oldest", "Oldest"))
     )
-    more_link = ""
-    if len(videos) >= bounded_limit and bounded_limit < 500:
-        next_limit = min(500, bounded_limit + 80)
-        more_link = f'<a class="text-action" href="/channel/{escape(youtube_channel_id)}?sort={sort_key}&limit={next_limit}">{_icon("playlist")}<span>Load older</span></a>'
+
     subscriber_count = _compact_count(channel.get("subscriber_count"))
-    meta_parts = [f"{video_count} imported videos"]
+    handle = str(channel.get("handle") or "").strip()
+    verified = _icon("verified").replace('class="icon"', 'class="icon verified"') if channel.get("verified") else ""
+    identity_parts = []
+    if handle:
+        identity_parts.append(f'<span class="ch-handle">@{escape(handle.lstrip("@"))}</span>')
     if subscriber_count:
-        meta_parts.insert(0, f"{subscriber_count} subscribers")
+        identity_parts.append(f"{escape(subscriber_count)} subscribers")
+    identity_parts.append(f"{video_count} videos here")
     if latest:
-        meta_parts.append(f"latest {latest}")
-    channel_meta = escape(" · ".join(meta_parts))
+        identity_parts.append(f"latest {escape(latest)}")
+    identity = ' <span class="ch-dot">&middot;</span> '.join(identity_parts)
+
+    description = str(channel.get("description") or "").strip()
+    # YouTube keeps the inline copy to one clamped line ending in "...more", and puts the
+    # whole thing behind a dialog. Expanding in place is what made the avatar jump: the
+    # identity row is a grid, so growing the copy column re-centres the avatar beside it.
+    first_line = description.split("\n", 1)[0].strip() if description else ""
+    description_html = (
+        f'<div class="ch-about">'
+        f'<p class="ch-about-short">{_rich_text(first_line[:220])}</p>'
+        f'<button class="ch-about-more" type="button" data-ch-about-open>&hellip;more</button>'
+        f'</div>'
+    ) if description else ""
+
+    # YouTube shows a dedicated links row. Invidious exposes no link fields, so the only
+    # honest source is the URLs a creator wrote into their own description.
+    found_links = _description_links(description)
+    links_html = ""
+    if found_links:
+        first_label, first_url = found_links[0]
+        extra = f'<span class="ch-dot">and {len(found_links) - 1} more</span>' if len(found_links) > 1 else ""
+        links_html = (
+            f'<p class="ch-links">{_icon("external")}'
+            f'<a href="{escape(first_url, quote=True)}" target="_blank" rel="noopener noreferrer nofollow">'
+            f'{escape(_link_label(first_url))}</a>{extra}</p>'
+        )
+
+    about_dialog = _channel_about_dialog(
+        title_text, description, found_links, youtube_channel_id, handle,
+        subscriber_count, video_count, latest, subscription_link,
+    )
+
+    available = {str(tab).lower() for tab in (channel.get("available_tabs") or [])}
+    tabs = [("videos", "Videos", f"/channel/{escape(youtube_channel_id)}")]
+    if not available or "shorts" in available:
+        tabs.append(("shorts", "Shorts", f"/channel/{escape(youtube_channel_id)}?filter=shorts"))
+    if not available or "playlists" in available:
+        tabs.append(("playlists", "Playlists", f"/channel/{escape(youtube_channel_id)}?filter=playlists"))
+    tabs.append(("posts", "Posts", f"/channel/{escape(youtube_channel_id)}/posts"))
+    active_tab = "shorts" if kind == "shorts" else "playlists" if kind == "playlists" else "videos"
+    tab_html = "".join(
+        f'<a class="ch-tab{" active" if key == active_tab else ""}" href="{href}"'
+        f'{" aria-current=\"page\"" if key == active_tab else ""}>{label}</a>'
+        for key, label, href in tabs
+    )
+
+    overflow_rows = []
+    if subscription_id_raw:
+        overflow_rows.append(_menu_row(
+            "collections", "Add to collection",
+            attrs=f' data-channel-collections="{escape(subscription_id_raw, quote=True)}" data-channel-title="{escape(title_text, quote=True)}"'))
+    if subscription_link:
+        overflow_rows.append(_menu_row("external", "Open on YouTube", href=subscription_link))
+    overflow = f'''
+      <details class="ch-menu yt-menu">
+        <summary class="pill-action pill-icon" aria-label="More channel actions">{_icon("more")}</summary>
+        <div class="menu-panel" role="menu">{"".join(overflow_rows)}</div>
+      </details>
+    '''
+
     content = f'''
+      <div class="ch-wrap">
       {banner_html}
-      <section class="channel-hero">
-        {_avatar_html(title_text, channel.get("avatar_url"), css_class="avatar channel-hero-avatar")}
-        <div>
-          <h1>{title} {_icon("verified").replace('class="icon"', 'class="icon verified"')}</h1>
-          <p class="channel-hero-meta">{channel_meta}</p>
-          <div class="channel-hero-actions">{subscribe_button}{collection_button}<a class="text-action" href="/channels">{_icon("subs")}<span>All channels</span></a>{external}{more_link}</div>
+      <section class="ch-identity">
+        {_avatar_html(title_text, channel.get("avatar_url"), css_class="avatar ch-avatar")}
+        <div class="ch-identity-copy">
+          <h1>{title}{verified}</h1>
+          <p class="ch-meta">{identity}</p>
+          {description_html}
+          {links_html}
+          <div class="ch-actions">{subscribe_button}{overflow}</div>
         </div>
       </section>
-      <div class="page-tabs" aria-label="Channel video sorting">{tab_html}</div>
-      <section class="video-grid">{video_grid}</section>
+      {about_dialog}
+      <nav class="ch-tabs" aria-label="Channel sections">
+        <div class="ch-tab-row">{tab_html}</div>
+        <form class="ch-search{" is-open" if query else ""}" method="get" data-ch-search
+              action="/channel/{escape(youtube_channel_id)}" role="search">
+          <button class="ch-search-toggle" type="button" data-ch-search-toggle aria-label="Search this channel"
+                  aria-expanded="{"true" if query else "false"}">{_icon("search")}</button>
+          <input type="search" name="q" value="{escape(query, quote=True)}" placeholder="Search"
+                 aria-label="Search this channel" data-ch-search-input>
+        </form>
+      </nav>
+      {f'<div class="ch-filters">{filter_html}</div>' if active_tab == "videos" and not query else ""}
+      <section class="video-grid" data-channel-grid data-channel-id="{escape(youtube_channel_id, quote=True)}"
+               data-sort="{sort_key}" data-next-offset="{len(videos)}">{video_grid}</section>
+      <div class="feed-loading" data-channel-loading hidden><span></span><span>Loading more videos</span></div>
+      <div class="feed-sentinel" data-channel-sentinel aria-hidden="true"></div>
+      </div>
     '''
-    return _app_shell(title_text, "channels", content, request=request)
+    return _app_shell(title_text, "channels", content, main_class="channel-main", request=request)
 
 
 @app.get("/api/videos")
@@ -6784,8 +10312,34 @@ def api_videos(limit: int = 50) -> dict[str, Any]:
 
 
 @app.get("/api/search")
-def api_search(q: str = "", limit: int = 50) -> dict[str, Any]:
-    return {"items": _json_ready(db.search_videos(q, max(1, min(limit, 200))))}
+def api_search(q: str = "", limit: int = 50, source: str = "all") -> dict[str, Any]:
+    """Search YouTube and the local library.
+
+    `source=library` restricts it to what is already stored, which is what this endpoint
+    used to do unconditionally.
+    """
+    capped = max(1, min(limit, 200))
+    local = db.search_videos(q, capped)
+    if source == "library" or not q.strip():
+        return {"items": _json_ready(local), "source": "library"}
+
+    known = {str(video.get("youtube_video_id") or "") for video in local}
+    remote: list[dict[str, Any]] = []
+    error = ""
+    try:
+        remote = [item for item in discovery.search_youtube(q) if item.get("youtube_video_id") not in known]
+        if remote:
+            db.store_search_results(remote[:capped], q)
+    except Exception as exc:
+        error = str(exc)
+        logger.warning("youtube search failed for %r: %s", q, exc)
+    return {
+        "items": _json_ready(local + remote[: max(0, capped - len(local))]),
+        "library_count": len(local),
+        "youtube_count": len(remote),
+        "source": "library" if error else "all",
+        "detail": error,
+    }
 
 
 @app.get("/api/recommendations")
@@ -6802,6 +10356,261 @@ def api_home_sections(request: Request, page: int = 0, filter: str = "all") -> d
     return {"ok": True, "html": html, "next_page": max(0, page) + 1, "has_more": bool(html.strip())}
 
 
+def _ingest_channel_uploads(youtube_channel_id: str, needed: int) -> int:
+    """Pull further pages of a channel's uploads into the library.
+
+    Paged rather than fetched all at once, and stopped as soon as a page yields nothing
+    new, so scrolling a channel costs one upstream request per page instead of hammering
+    Invidious for a back catalogue that is mostly already stored.
+    """
+    stored = 0
+    for page in range(1, 4):
+        items = discovery.fetch_channel_uploads(youtube_channel_id, page)
+        if not items:
+            break
+        added = sum(1 for item in items if db.upsert_discovered_video(item, None, "channel", "channel backfill"))
+        stored += added
+        # A page that was entirely already-known means the library has caught up.
+        if not added or stored >= needed:
+            break
+    return stored
+
+
+@app.get("/api/channels/{youtube_channel_id}/videos/html", tags=["subscriptions"], summary="Channel videos as rendered cards")
+def api_channel_videos_html(request: Request, youtube_channel_id: str, offset: int = 0, limit: int = 24, sort: str = "latest") -> dict[str, Any]:
+    """The next page of a channel's videos, already rendered.
+
+    Returns markup for the same reason the home feed does: the card is a substantial piece
+    of HTML with a menu, progress rail and reaction state, and a second implementation of
+    it in JavaScript would drift from this one.
+
+    When the local library runs out, this reaches for more from the channel itself so a
+    channel page is not limited to whatever happened to be synced.
+    """
+    settings = get_settings()
+    sort_key = sort if sort in {"latest", "popular", "oldest"} else "latest"
+    start = max(0, offset)
+    size = max(1, min(limit, 60))
+    videos = db.list_channel_videos(youtube_channel_id, size, sort_key, start)
+
+    fetched = 0
+    if len(videos) < size and sort_key == "latest":
+        # Nothing left locally. Pull the channel's uploads from Invidious, store them, and
+        # re-read so the page continues seamlessly instead of simply stopping.
+        try:
+            fetched = _ingest_channel_uploads(youtube_channel_id, start + size)
+        except Exception as exc:
+            logger.info("channel backfill failed for %s: %s", youtube_channel_id, exc)
+        if fetched:
+            videos = db.list_channel_videos(youtube_channel_id, size, sort_key, start)
+
+    html = "".join(_home_video_card(video, index, settings) for index, video in enumerate(videos))
+    return {
+        "ok": True,
+        "html": html,
+        "count": len(videos),
+        "fetched_remote": fetched,
+        "next_offset": start + len(videos),
+        "has_more": len(videos) >= size,
+    }
+
+
+@app.get("/api/recommendations/evaluate", tags=["recommendations"], summary="Offline ranker evaluation")
+def api_evaluate_recommendations(request: Request, holdout: int = 20, depth: int = 100) -> dict[str, Any]:
+    """Quality and coverage metrics for the ranker.
+
+    Quality is measured by holding out the most recently watched videos and asking how
+    many the ranker resurfaces. Coverage reports what the feed is made of, because a
+    ranker can score well while showing four creators over and over.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    from . import evaluation
+
+    return evaluation.full_report(_user_key(request), max(5, min(holdout, 100)), max(20, min(depth, 300)))
+
+
+@app.post("/api/recommendations/rebuild-vectors", tags=["recommendations"], summary="Recompute topic vectors")
+def api_rebuild_vectors(request: Request, limit: int = 500, force: bool = False) -> dict[str, Any]:
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    from . import topics
+
+    return topics.rebuild_vectors(max(1, min(limit, 2000)), force)
+
+
+@app.get("/api/takeout/subscriptions", tags=["recommendations"], summary="Imported subscriptions")
+def api_takeout_subscriptions(request: Request, limit: int = 500) -> dict[str, Any]:
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    user_key = _user_key(request)
+    counts = db.takeout_subscription_counts(user_key)
+    pending = db.pending_takeout_subscriptions(user_key, limit)
+    return {"ok": True, "counts": counts, "pending": _json_ready(pending)}
+
+
+@app.post("/api/takeout/subscriptions/apply", tags=["recommendations"], summary="Subscribe to imported channels")
+def api_apply_takeout_subscriptions(request: Request, limit: int = 50) -> dict[str, Any]:
+    """Subscribe in FreshRSS to channels the archive says you follow.
+
+    Deliberately batched and deliberately not automatic on upload. This writes real feeds
+    into FreshRSS, and an archive can name several hundred channels — creating all of them
+    because somebody uploaded a file is not a decision to make on their behalf.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    settings = get_settings()
+    if not settings.freshrss_configured:
+        raise HTTPException(status_code=409, detail="FreshRSS is not configured")
+
+    user_key = _user_key(request)
+    batch = db.pending_takeout_subscriptions(user_key, max(1, min(limit, 200)))
+    if not batch:
+        return {"ok": True, "subscribed": 0, "failed": 0, "counts": db.takeout_subscription_counts(user_key), "done": True}
+
+    client = FreshRSSClient(settings)
+    done: list[str] = []
+    failed: list[dict[str, str]] = []
+    for item in batch:
+        channel_id = str(item.get("youtube_channel_id") or "")
+        title = str(item.get("title") or channel_id)
+        feed_url = _youtube_feed_url(channel_id)
+        try:
+            client.subscribe_feed(feed_url, title)
+            stream_id = client.stream_id_for_feed_url(feed_url) or f"feed/{feed_url}"
+            db.upsert_subscription(
+                {"id": stream_id, "title": title, "url": feed_url,
+                 "htmlUrl": f"https://www.youtube.com/channel/{channel_id}", "categories": []},
+                channel_id,
+            )
+            db.upsert_channel(title, channel_id, feed_url)
+            done.append(channel_id)
+        except Exception as exc:  # noqa: BLE001 - one bad channel must not stop the batch
+            message = str(exc)
+            logger.info("takeout subscribe failed for %s: %s", channel_id, message)
+            # A channel deleted on YouTube has no feed to subscribe to, so FreshRSS will
+            # refuse it forever. Mark it rather than retrying it on every pass, which is
+            # what made the button sit there offering the same handful of channels.
+            permanent = "400" in message or "404" in message
+            if permanent:
+                db.mark_takeout_subscription_failed(channel_id, message, user_key)
+            failed.append({
+                "youtube_channel_id": channel_id, "title": title,
+                "error": message[:160], "permanent": permanent,
+            })
+
+    db.mark_takeout_subscribed(done, user_key)
+    # Newly subscribed channels have no avatar yet, which is most of why a freshly
+    # imported list looks empty. Paced, on a thread, so the response is not held open.
+    if done:
+        threading.Thread(target=lambda: enrich_channels_paced(len(done)), name="channel-art", daemon=True).start()
+    counts = db.takeout_subscription_counts(user_key)
+    return {"ok": True, "subscribed": len(done), "failed": len(failed), "errors": failed[:10],
+            "counts": counts, "done": counts["pending"] == 0}
+
+
+@app.post("/api/feed/refresh", tags=["recommendations"], summary="Rebuild the ranked feed")
+def api_refresh_feed(request: Request, vectors: bool = True, grow: bool = True) -> dict[str, Any]:
+    """Recompute everything the feed is ranked from, now.
+
+    The worker does this on its own schedule, which is fine day to day and useless right
+    after an import: thousands of new watch events land and the feed keeps serving a
+    profile built before any of them existed.
+    """
+    user_key = _user_key(request)
+    result: dict[str, Any] = {"ok": True}
+    if grow:
+        # Ranking cannot surface a subject the library has no videos about, so a refresh
+        # fetches before it re-ranks.
+        result["growth"] = discovery.grow_library(user_key)
+    if vectors:
+        from . import topics
+
+        topics.clear_cache()
+        result["vectors"] = topics.rebuild_vectors(1200)
+    # Both profiles are cached; without clearing them the rebuild above changes nothing
+    # that the next page render can see.
+    db.clear_watch_time_cache(user_key)
+    db.clear_takeout_cache(user_key)
+    from . import topics as _topics
+
+    result["profile_terms"] = len(_topics.profile_vector(user_key))
+    result["takeout_channels"] = len((db.takeout_profile(user_key).get("channels") or {}))
+    return result
+
+
+@app.post("/api/takeout/subscriptions/retry", tags=["recommendations"], summary="Retry failed subscriptions")
+def api_retry_takeout_subscriptions(request: Request) -> dict[str, Any]:
+    """Clear permanent-failure marks so those channels are offered again."""
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    user_key = _user_key(request)
+    return {"ok": True, "cleared": db.retry_failed_takeout_subscriptions(user_key),
+            "counts": db.takeout_subscription_counts(user_key)}
+
+
+@app.get("/api/sponsorblock/{youtube_video_id}", tags=["playback"], summary="SponsorBlock segments")
+def api_sponsorblock_segments(request: Request, youtube_video_id: str) -> dict[str, Any]:
+    """Segments for one video, looked up server-side by hash prefix.
+
+    The browser never talks to SponsorBlock: it asks this server, and this server asks
+    about 65,536 videos at once. That is what keeps the lookup from identifying either the
+    viewer or the video.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    from . import sponsorblock
+
+    return sponsorblock.segments_for(youtube_video_id, _user_key(request))
+
+
+@app.get("/api/status/panel", response_class=HTMLResponse, tags=["status"], summary="Status pane markup")
+def api_status_panel(request: Request):
+    """The status body, fetched when the pane is opened.
+
+    Rendering it inline meant running live health checks against Postgres, Redis,
+    FreshRSS and Invidious on *every* page load, because the settings dialog is part of
+    the app shell. That alone took home renders from ~0.35s to ~1.4s.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    return HTMLResponse(_status_page_html(_user_key(request)))
+
+
+@app.get("/api/feed/composition", tags=["recommendations"], summary="What the feed is actually made of")
+def api_feed_composition(request: Request, depth: int = 60) -> dict[str, Any]:
+    """Measured composition, signal coverage and the creators filling the feed.
+
+    Served on demand rather than rendered into every page: producing it means running a
+    full ranking pass, which is far too expensive to spend on a dialog most page loads
+    never open.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    from . import evaluation
+
+    user_key = _user_key(request)
+    depth = max(20, min(depth, 120))
+    coverage = evaluation.coverage_report(user_key, depth)
+    muted = {str(c).lower() for c in (db.get_feed_preferences(user_key).get("muted_channels") or [])}
+    return {
+        "ok": True,
+        "coverage": coverage,
+        "channels": [
+            {**row, "muted": str(row["key"]).lower() in muted}
+            for row in db.top_feed_channels(user_key, 14)
+        ],
+    }
+
+
 @app.get("/api/feed/preferences")
 def api_feed_preferences(request: Request) -> dict[str, Any]:
     return {"ok": True, "preferences": _json_ready_value(db.get_feed_preferences(_user_key(request)))}
@@ -6809,16 +10618,148 @@ def api_feed_preferences(request: Request) -> dict[str, Any]:
 
 @app.post("/api/feed/preferences")
 def api_update_feed_preferences(request: Request, payload: FeedPreferencesRequest) -> dict[str, Any]:
+    """Apply a partial update, filling anything omitted from what is already stored."""
+    user_key = _user_key(request)
+    current = db.get_feed_preferences(user_key)
+
+    def keep(value: Any, key: str) -> Any:
+        return current.get(key) if value is None else value
+
     preferences = db.set_feed_preferences(
-        preferred_topics=payload.preferred_topics,
-        muted_topics=payload.muted_topics,
-        prioritize_subscriptions=payload.prioritize_subscriptions,
-        show_comments=payload.show_comments,
-        exclude_shorts=payload.exclude_shorts,
-        discovery_level=payload.discovery_level,
-        user_key=_user_key(request),
+        preferred_topics=keep(payload.preferred_topics, "preferred_topics"),
+        muted_topics=keep(payload.muted_topics, "muted_topics"),
+        prioritize_subscriptions=keep(payload.prioritize_subscriptions, "prioritize_subscriptions"),
+        show_comments=keep(payload.show_comments, "show_comments"),
+        ryd_enabled=keep(payload.ryd_enabled, "ryd_enabled"),
+        sponsorblock_enabled=keep(payload.sponsorblock_enabled, "sponsorblock_enabled"),
+        sponsorblock_actions=keep(payload.sponsorblock_actions, "sponsorblock_actions"),
+        show_posts_in_feeds=keep(payload.show_posts_in_feeds, "show_posts_in_feeds"),
+        muted_channels=keep(payload.muted_channels, "muted_channels"),
+        exclude_shorts=keep(payload.exclude_shorts, "exclude_shorts"),
+        discovery_level=keep(payload.discovery_level, "discovery_level"),
+        user_key=user_key,
     )
     return {"ok": True, "preferences": _json_ready_value(preferences)}
+
+
+@app.get("/watch/{youtube_video_id}/local", response_class=HTMLResponse)
+def watch_local_player(request: Request, youtube_video_id: str, autoplay: str = "1", t: int = 0):
+    """Plays the downloaded file. No network involved beyond this server."""
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    record = db.get_download(youtube_video_id, _user_key(request))
+    if not record:
+        raise HTTPException(status_code=404, detail="Not downloaded")
+    video_id = escape(youtube_video_id, quote=True)
+    play = " autoplay" if autoplay == "1" else ""
+    start = max(0, min(int(t or 0), 86400))
+    quality = escape(str(record.get("quality") or ""))
+    note = f"Downloaded &middot; {quality}" if quality else "Downloaded"
+    return HTMLResponse(f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1"><title>OpenFeed player</title>
+      <style>
+        html, body {{ margin: 0; width: 100%; height: 100%; background: #000; }}
+        video {{ width: 100%; height: 100%; display: block; background: #000; }}
+        .note {{ position: absolute; left: 10px; bottom: 10px; padding: 4px 9px; border-radius: 999px;
+          background: rgba(10,10,11,.72); color: #ededef; font: 11px system-ui, sans-serif; pointer-events: none; }}
+      </style></head><body>
+      <video controls playsinline preload="metadata"{play} src="/api/downloads/{video_id}/file#t={start}"></video>
+      <span class="note">{note}</span>
+    </body></html>''')
+
+
+@app.get("/watch/{youtube_video_id}/ytdlp", response_class=HTMLResponse)
+def watch_ytdlp_player(request: Request, youtube_video_id: str, autoplay: str = "1", t: int = 0):
+    """The yt-dlp fallback player: a plain <video> over our own stream proxy.
+
+    This is the last rung before handing the viewer to YouTube's own embed. It plays the
+    muxed rendition, which is whatever YouTube still publishes as a single file — usually
+    360p, sometimes 720p. That is a real quality ceiling, and the page says so rather
+    than letting it look like a bug.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    video_id = escape(youtube_video_id, quote=True)
+    play = " autoplay" if autoplay == "1" else ""
+    quality = ""
+    try:
+        quality = escape(str(ytdlp.playback_stream(youtube_video_id).get("quality") or ""))
+    except Exception as exc:
+        logger.info("yt-dlp could not resolve a stream for %s: %s", youtube_video_id, exc)
+        return HTMLResponse(
+            f'<!doctype html><meta charset="utf-8"><style>html,body{{margin:0;height:100%;background:#000;color:#a8a8a8;'
+            f'display:grid;place-items:center;font:13px/1.5 system-ui,sans-serif;text-align:center;padding:16px}}</style>'
+            f'<p>yt-dlp could not extract a playable stream for this video.</p>',
+            status_code=200,
+        )
+    note = f"Direct stream &middot; {quality}" if quality else "Direct stream"
+    # A media-fragment offset is the one way to start a plain <video> partway in
+    # without waiting for metadata and seeking afterwards.
+    start = max(0, min(int(t or 0), 86400))
+    return HTMLResponse(f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1"><title>OpenFeed player</title>
+      <style>
+        html, body {{ margin: 0; width: 100%; height: 100%; background: #000; }}
+        video {{ width: 100%; height: 100%; display: block; background: #000; }}
+        .note {{ position: absolute; left: 10px; bottom: 10px; padding: 4px 9px; border-radius: 999px;
+          background: rgba(10,10,11,.72); color: #ededef; font: 11px system-ui, sans-serif; pointer-events: none; }}
+      </style></head><body>
+      <video controls playsinline preload="metadata"{play} src="/api/ytdlp/stream/{video_id}#t={start}"></video>
+      <span class="note">{note}</span>
+    </body></html>''')
+
+
+@app.get("/api/ytdlp/stream/{youtube_video_id}")
+def api_ytdlp_stream(request: Request, youtube_video_id: str):
+    """Proxy the yt-dlp-extracted stream, preserving range requests.
+
+    Proxying rather than redirecting keeps the viewer's IP away from Google, the same way
+    thumbnails and avatars are proxied — and it is also the only thing that works, since
+    the signed URLs are bound to the address that requested them.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    try:
+        stream = ytdlp.playback_stream(youtube_video_id)
+    except ytdlp.YtdlpError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    upstream_headers = {"user-agent": "Mozilla/5.0"}
+    # Seeking is the whole reason to forward this: without it the browser has to fetch
+    # the file from the start to reach any point in the timeline.
+    if request.headers.get("range"):
+        upstream_headers["range"] = request.headers["range"]
+
+    client = _invidious_client()
+    # The pooled client does not follow redirects, which is right for Invidious assets but
+    # wrong here: googlevideo answers with a 302 to a different host, and handing that back
+    # would send the browser straight to Google — leaking the address this proxy exists to
+    # keep private, while looking like it worked.
+    upstream = client.send(
+        client.build_request("GET", str(stream["stream_url"]), headers=upstream_headers),
+        stream=True,
+        follow_redirects=True,
+    )
+    if upstream.status_code >= 400:
+        upstream.close()
+        mark_source_result("ytdlp", False)
+        raise HTTPException(status_code=502, detail=f"The stream host returned HTTP {upstream.status_code}")
+    mark_source_result("ytdlp", True)
+
+    headers = {"accept-ranges": "bytes", "cache-control": "no-store"}
+    for name in ("content-length", "content-range", "content-type"):
+        if upstream.headers.get(name):
+            headers[name] = upstream.headers[name]
+    headers.setdefault("content-type", str(stream.get("stream_type") or "video/mp4"))
+    return StreamingResponse(
+        upstream.iter_bytes(),
+        status_code=upstream.status_code,
+        headers=headers,
+        background=BackgroundTask(upstream.close),
+    )
 
 
 PLAYBACK_PROBE_VIDEO = "dQw4w9WgXcQ"
@@ -7094,7 +11035,12 @@ def api_subscribe_freshrss(payload: SubscribeRequest) -> dict[str, Any]:
     try:
         client.subscribe_feed(feed_url, title)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"FreshRSS subscribe failed: {exc}") from exc
+        # A feed FreshRSS already carries is the goal state, not a failure — the local row
+        # may simply be missing, so fall through and reconcile it below rather than
+        # leaving the user with a button that refuses to work.
+        if not client.stream_id_for_feed_url(feed_url):
+            raise HTTPException(status_code=502, detail=f"FreshRSS subscribe failed: {exc}") from exc
+        logger.info("feed %s was already in FreshRSS; reconciling the local row", feed_url)
 
     # Ask FreshRSS for the id it just assigned. Storing a "feed/<url>" placeholder instead
     # would collide with the real "feed/<n>" row the next sync imports, listing the
@@ -7113,6 +11059,8 @@ def api_subscribe_freshrss(payload: SubscribeRequest) -> dict[str, Any]:
     )
     if youtube_channel_id:
         db.upsert_channel(title, youtube_channel_id, feed_url)
+        # One channel, off-thread: the subscribe response should not wait on artwork.
+        threading.Thread(target=lambda: enrich_channel(youtube_channel_id), name="channel-art", daemon=True).start()
     return {"ok": True, "feed_url": feed_url, "youtube_channel_id": youtube_channel_id or None, "title": title}
 
 
@@ -7233,6 +11181,21 @@ def api_enrich_channels(limit: int = 10, refresh: bool = False) -> dict[str, Any
     return enrich_channels(max(1, min(limit, 100)), refresh)
 
 
+@app.post("/api/enrich/subscription-art", tags=["metadata"], summary="Fetch avatars for every subscribed channel")
+def api_enrich_subscription_art(wait: bool = False) -> dict[str, Any]:
+    """Force the sidebar's blank avatars to fill in now.
+
+    Paced internally, so a 70-channel list takes a little under a minute. By default it
+    runs on a thread and answers immediately with how many are still missing.
+    """
+    if wait:
+        return backfill_subscription_art()
+    missing = db.count_subscription_channels_missing_media()
+    if missing:
+        threading.Thread(target=backfill_subscription_art, name="subscription-art", daemon=True).start()
+    return {"ok": True, "started": bool(missing), "missing": missing}
+
+
 @app.post("/api/enrich/recent")
 def api_enrich_recent(limit: int = 5) -> dict[str, Any]:
     return enrich_recent_videos(max(1, min(limit, 25)))
@@ -7269,7 +11232,13 @@ def api_playback_progress(request: Request, progress: PlaybackProgressRequest) -
         event_type,
         progress.payload,
         user_key,
+        watch_delta_seconds=progress.watch_delta_seconds,
+        resume_seconds=progress.resume_seconds,
     )
+    # The ranking profile is aggregated and cached, so it has to be invalidated when new
+    # watch time lands or the feed keeps ranking on a stale picture for two minutes.
+    if progress.watch_delta_seconds:
+        db.clear_watch_time_cache(user_key)
     if not state:
         raise HTTPException(status_code=404, detail="Video not found")
     gorse_payload = dict(progress.payload or {})
@@ -7348,6 +11317,28 @@ COMMENT_LIMIT = 40
 COMMENT_REPLY_LIMIT = 60
 
 
+def _proxied_avatar(url: Any) -> str:
+    """A single avatar URL routed through our own proxy.
+
+    creatorHeart gives one URL rather than the thumbnail list every other author field
+    uses, so it needs its own path.
+    """
+    text = str(url or "")
+    if not text:
+        return ""
+    # Hosts vary: yt3.ggpht.com/ytc/..., yt3.googleusercontent.com/..., and paths already
+    # containing /ggpht/. Stripping the scheme and host covers all of them; matching on a
+    # path marker alone missed yt3.ggpht.com and leaked the request to Google.
+    for host in ("yt3.ggpht.com/", "yt4.ggpht.com/", "yt3.googleusercontent.com/", "googleusercontent.com/"):
+        index = text.find(host)
+        if index != -1:
+            return "/ggpht/" + text[index + len(host):]
+    index = text.find("/ggpht/")
+    if index != -1:
+        return "/ggpht/" + text[index + len("/ggpht/"):]
+    return text
+
+
 def _comment_avatar(thumbnails: Any) -> str:
     if not isinstance(thumbnails, list):
         return ""
@@ -7369,24 +11360,40 @@ def _comment_avatar(thumbnails: Any) -> str:
 
 
 def _download_filename(title: str, video_id: str, extension: str = "mp4") -> str:
-    """A filename a file manager will accept, without leaking path separators."""
-    cleaned = re.sub(r"[^\w\s.-]", "", title, flags=re.UNICODE).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)[:120].strip(" .")
-    return f"{cleaned or video_id} [{video_id}].{extension}"
+    """A filename a file manager will accept, without leaking path separators.
+
+    Shared with the job runner so a direct passthrough and a merged download cannot end
+    up naming the same video differently.
+    """
+    return downloads.safe_filename(title, video_id, extension)
+
+
+@app.get("/api/download/jobs", tags=["downloads"], summary="List download jobs")
+def api_list_download_jobs(request: Request) -> dict[str, Any]:
+    """Every download job this process knows about, running or finished.
+
+    Declared above /api/download/{youtube_video_id} on purpose: routes match in
+    declaration order, so the parameterised one would otherwise capture "jobs" as a
+    video id and answer 502.
+    """
+    _user_key(request)
+    return {"ok": True, "items": [job.public() for job in downloads.manager.list_jobs()]}
 
 
 @app.get("/api/download/{youtube_video_id}")
-def api_download_video(request: Request, youtube_video_id: str):
-    """Stream the best progressive rendition back as a file download.
+def api_download_video(request: Request, youtube_video_id: str, itag: str = ""):
+    """Stream one progressive rendition back as a file download.
 
     Only muxed streams are offered: the high-resolution DASH renditions are separate
     audio and video tracks and would need remuxing before they are useful as a file.
+    `itag` picks a specific rendition from /api/download/{id}/formats; without it the
+    best muxed stream is used, which is what the button did before the picker existed.
     """
     auth_redirect = _login_required_redirect(request)
     if auth_redirect:
         return auth_redirect
     try:
-        playback = playback_for_video(youtube_video_id)
+        playback = playback_for_video(youtube_video_id, itag.strip())
     except PlaybackError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
@@ -7404,9 +11411,12 @@ def api_download_video(request: Request, youtube_video_id: str):
     filename = _download_filename(title, youtube_video_id, extension)
 
     client = _invidious_client()
+    # Followed here for the same reason as the yt-dlp stream: a 302 handed back to the
+    # browser would quietly turn a proxied download into a direct one.
     upstream = client.send(
         client.build_request("GET", stream_url, headers={"user-agent": "Mozilla/5.0"}),
         stream=True,
+        follow_redirects=True,
     )
     if upstream.status_code >= 400:
         upstream.close()
@@ -7445,6 +11455,474 @@ def api_download_info(request: Request, youtube_video_id: str) -> dict[str, Any]
     }
 
 
+@app.get("/api/download/{youtube_video_id}/formats")
+def api_download_formats(request: Request, youtube_video_id: str) -> dict[str, Any]:
+    """Every rendition the picker can offer, from both backends.
+
+    Invidious supplies the muxed streams it can hand over directly — a plain HTTP
+    passthrough, no processing. yt-dlp supplies everything above that, which YouTube
+    publishes as separate video and audio tracks and which therefore has to be fetched
+    and muxed as a background job. Both kinds appear in one list, tagged so the UI can
+    say which is instant and which needs work.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+
+    formats: list[dict[str, Any]] = []
+    title = ""
+    invidious_error = ""
+    try:
+        options = download_options(youtube_video_id)
+        title = str(options.get("title") or "")
+        for item in options.get("formats") or []:
+            container = item.get("container") or "mp4"
+            formats.append({
+                "mode": "direct",
+                "height": item.get("height") or 0,
+                "label_height": item.get("height") or 0,
+                "quality": item.get("quality") or "",
+                "container": container,
+                "size_bytes": item.get("size_bytes"),
+                "itag": item.get("itag") or "",
+                "needs_merge": False,
+                "filename": _download_filename(title or youtube_video_id, youtube_video_id, container),
+            })
+    except Exception as exc:
+        invidious_error = str(exc)
+        logger.info("invidious had no download formats for %s: %s", youtube_video_id, exc)
+
+    ytdlp_error = ""
+    if ytdlp.available():
+        try:
+            extra = ytdlp.download_formats(youtube_video_id)
+            title = title or str(extra.get("title") or "")
+            known = {item["height"] for item in formats if item["height"]}
+            for item in extra.get("formats") or []:
+                # Compare on the label, not the pixel height: Invidious reports "360p" as
+                # 360, while yt-dlp's height for that same portrait rendition is 640.
+                label_height = item.get("label_height") or 0
+                if label_height and label_height in known:
+                    continue
+                container = "mp4" if item.get("ext") == "mp4" else "mkv"
+                formats.append({
+                    "mode": "merge" if item.get("needs_merge") else "ytdlp",
+                    # `height` drives the format selector and must stay the real one.
+                    "height": item.get("height") or 0,
+                    "label_height": label_height,
+                    "quality": item.get("quality") or (f"{label_height}p" if label_height else ""),
+                    "container": container,
+                    "size_bytes": item.get("size_bytes"),
+                    "size_estimated": bool(item.get("size_estimated")),
+                    "itag": "",
+                    "needs_merge": bool(item.get("needs_merge")),
+                    "filename": _download_filename(title or youtube_video_id, youtube_video_id, container),
+                })
+        except Exception as exc:
+            ytdlp_error = str(exc)
+            logger.warning("yt-dlp had no download formats for %s: %s", youtube_video_id, exc)
+
+    formats.sort(key=lambda item: (item["label_height"] or 0, item["mode"] == "direct"), reverse=True)
+    detail = ""
+    if not formats:
+        detail = invidious_error or ytdlp_error or "No downloadable stream is available for this video"
+    return {
+        "ok": bool(formats),
+        "title": title or youtube_video_id,
+        "formats": formats,
+        "ytdlp": ytdlp.available(),
+        "ffmpeg": ytdlp.ffmpeg_available(),
+        "detail": detail,
+    }
+
+
+@app.post("/api/download/{youtube_video_id}/jobs")
+def api_start_download_job(request: Request, youtube_video_id: str, payload: DownloadJobRequest) -> dict[str, Any]:
+    """Kick off a merged download. Returns immediately with a job to poll."""
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    if not ytdlp.available():
+        raise HTTPException(status_code=503, detail="yt-dlp is not available in this deployment")
+    if payload.needs_merge and not ytdlp.ffmpeg_available():
+        raise HTTPException(status_code=503, detail="ffmpeg is required to merge video and audio, and is not installed")
+
+    video = db.get_video_by_youtube_id(youtube_video_id) or {}
+    title = str(payload.title or video.get("title") or youtube_video_id)
+    height = max(0, min(int(payload.height or 0), get_settings().download_max_height))
+    try:
+        job = downloads.manager.start(
+            youtube_video_id,
+            height,
+            payload.container,
+            title,
+            destination=payload.destination,
+            user_key=_user_key(request),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    return {"ok": True, "job": job.public()}
+
+
+@app.get("/api/download/jobs/{job_id}")
+def api_download_job(request: Request, job_id: str) -> dict[str, Any]:
+    """Progress for one download job."""
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    job = downloads.manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No such download job")
+    return {"ok": True, "job": job.public()}
+
+
+@app.delete("/api/download/jobs/{job_id}")
+def api_cancel_download_job(request: Request, job_id: str) -> dict[str, Any]:
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    if not downloads.manager.get(job_id):
+        raise HTTPException(status_code=404, detail="No such download job")
+    return {"ok": True, "cancelled": downloads.manager.cancel(job_id)}
+
+
+@app.get("/api/download/jobs/{job_id}/file")
+def api_download_job_file(request: Request, job_id: str):
+    """Hand over the finished file."""
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    job = downloads.manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No such download job")
+    if job.status != "done":
+        raise HTTPException(status_code=409, detail=f"Download is {job.status}, not finished")
+    path = downloads.resolve_completed_path(job)
+    if not path:
+        raise HTTPException(status_code=410, detail="The finished file is no longer on disk")
+    filename = job.filename or path.name
+    return FileResponse(
+        path,
+        media_type="video/mp4" if path.suffix == ".mp4" else "application/octet-stream",
+        filename=filename,
+        headers={"cache-control": "no-store"},
+    )
+
+
+def _comment_identity(raw: dict[str, Any]) -> str:
+    """A stable id for one comment.
+
+    Invidious does not hand back YouTube's comment id, so it is derived from the fields
+    that identify a comment and do not change between fetches. Hashed rather than stored
+    raw so the key stays a fixed length and holds no comment text.
+    """
+    seed = "|".join([
+        str(raw.get("authorId") or raw.get("author") or ""),
+        str(raw.get("published") or raw.get("publishedText") or ""),
+        str(raw.get("content") or "")[:280],
+    ])
+    return hashlib.sha1(seed.encode("utf-8", "replace")).hexdigest()[:24]
+
+
+@app.post("/api/comments/reaction")
+def api_comment_reaction(request: Request, payload: CommentReactionRequest) -> dict[str, Any]:
+    """Record a local vote on a comment, and a small hint about the video it sits under.
+
+    Nothing is sent to YouTube — Invidious can read comments but cannot vote on them —
+    so this is stored here and used only for the button state and for ranking.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    video_id = payload.youtube_video_id.strip()
+    comment_id = payload.comment_id.strip()
+    if not video_id or not comment_id:
+        raise HTTPException(status_code=400, detail="A video id and comment id are required")
+
+    user_key = _user_key(request)
+    reaction = db.set_comment_reaction(video_id, comment_id, payload.reaction.strip(), user_key)
+    if reaction:
+        db.record_video_event(
+            video_id,
+            f"comment_{reaction}",
+            {"source": "comment_vote", "comment_id": comment_id},
+            user_key,
+        )
+    return {"ok": True, "reaction": reaction}
+
+
+def _download_file_path(record: dict[str, Any]) -> Path | None:
+    """The stored file, but only if it really sits inside the downloads folder."""
+    raw = str(record.get("path") or "")
+    if not raw:
+        return None
+    directory = Path(get_settings().download_dir).resolve()
+    try:
+        path = Path(raw).resolve()
+        path.relative_to(directory)
+    except (OSError, ValueError):
+        return None
+    return path if path.is_file() else None
+
+
+@app.get("/api/downloads")
+def api_list_downloads(request: Request, q: str = "", limit: int = 200) -> dict[str, Any]:
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    rows = db.list_downloads(_user_key(request), q, limit)
+    return {"ok": True, "items": _json_ready(rows), "count": len(rows)}
+
+
+@app.get("/api/downloads/{youtube_video_id}/file")
+def api_download_file(request: Request, youtube_video_id: str):
+    """Stream a kept download, with range support so the player can seek."""
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    record = db.get_download(youtube_video_id, _user_key(request))
+    if not record:
+        raise HTTPException(status_code=404, detail="Not downloaded")
+    path = _download_file_path(record)
+    if not path:
+        raise HTTPException(status_code=410, detail="The downloaded file is no longer on disk")
+    media_type = "video/mp4" if path.suffix == ".mp4" else "video/x-matroska"
+    # FileResponse handles Range itself, which is what makes seeking work.
+    return FileResponse(path, media_type=media_type, filename=str(record.get("filename") or path.name))
+
+
+@app.delete("/api/downloads/{youtube_video_id}")
+def api_delete_download(request: Request, youtube_video_id: str) -> dict[str, Any]:
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    record = db.delete_download(youtube_video_id, _user_key(request))
+    if not record:
+        raise HTTPException(status_code=404, detail="Not downloaded")
+    path = _download_file_path(record)
+    if path:
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning("could not delete %s: %s", path, exc)
+    return {"ok": True, "youtube_video_id": youtube_video_id}
+
+
+@app.get("/api/", tags=["system"], summary="API index")
+def api_index(request: Request) -> dict[str, Any]:
+    """What this API can do, and who you are to it.
+
+    A single request that orients a new client without reading the whole OpenAPI document:
+    it confirms the credential works, says whether it is read-only, and points at the
+    routes for each capability.
+    """
+    user = _current_user(request)
+    routes = sorted(
+        {
+            f"{method} {route.path}"
+            for route in app.routes
+            if getattr(route, "path", "").startswith("/api/")
+            for method in getattr(route, "methods", set()) - {"HEAD", "OPTIONS"}
+        }
+    )
+    return {
+        "ok": True,
+        "service": "OpenFeed",
+        "version": __version__,
+        "authenticated": bool(user.get("authenticated")),
+        "via_token": bool(user.get("via_token")),
+        "read_only": bool(user.get("token_read_only")),
+        "user_key": str(user.get("user_key") or "local"),
+        "documentation": {"swagger": "/docs", "redoc": "/redoc", "openapi": "/openapi.json"},
+        "capabilities": {
+            "feed": ["/api/home/sections", "/api/recommendations", "/api/shorts", "/api/search"],
+            "videos": ["/api/videos", "/api/videos/{id}", "/api/transcript/{id}", "/api/feedback"],
+            "playback": ["/api/playback/sources", "/api/playback/progress/{id}", "/api/playback/diagnose"],
+            "downloads": ["/api/download/{id}/formats", "/api/download/{id}/jobs", "/api/downloads"],
+            "subscriptions": ["/api/subscriptions", "/api/channels", "/api/subscription-collections"],
+            "playlists": ["/api/playlists"],
+            "preferences": ["/api/feed/preferences", "/api/playback/preferences"],
+            "metadata": ["/api/enrich/recent", "/api/discover/related", "/api/ryd/refresh"],
+            "tokens": ["/api/tokens"],
+            "system": ["/api/status/full", "/api/sync/freshrss", "/healthz"],
+        },
+        "route_count": len(routes),
+        "routes": routes,
+    }
+
+
+@app.post("/api/takeout/import", tags=["metadata"], summary="Import a YouTube Takeout archive")
+async def api_takeout_import(request: Request, archive: UploadFile = File(...)) -> dict[str, Any]:
+    """Parse a Takeout .zip and use it as personalization signal.
+
+    Everything is processed in memory in this process. The archive is never written to
+    disk and nothing leaves the server.
+    """
+    user_key = _user_key(request)
+    data = await archive.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="The upload was empty")
+    try:
+        parsed = takeout.inspect(data)
+    except takeout.TakeoutError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning("takeout import failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not read that archive") from exc
+    finally:
+        # Watch history is about as sensitive as it gets; drop the bytes as soon as the
+        # parse is done rather than leaving them for the garbage collector to get to.
+        del data
+
+    summary = takeout.summarize(parsed)
+    record = db.store_takeout_import(parsed, summary, user_key)
+    # Refresh immediately: an import that does not change the feed looks like it
+    # failed, and the worker's next pass could be half an hour away.
+    try:
+        from . import topics
+
+        db.clear_takeout_cache(user_key)
+        # Seed from the channels the archive says they watch before re-ranking:
+        # otherwise the import changes the weights but there is nothing new to weigh.
+        discovery.grow_library(user_key)
+        topics.clear_cache()
+        topics.rebuild_vectors(1200)
+        db.clear_watch_time_cache(user_key)
+    except Exception as exc:  # noqa: BLE001 - the import itself already succeeded
+        logger.warning("post-import refresh failed: %s", exc)
+
+    # Subscriptions are reported, never acted on: subscribing writes to the user's
+    # FreshRSS account, and doing that silently to hundreds of channels from a file
+    # upload is not a decision this endpoint gets to make.
+    return {
+        "ok": True,
+        "summary": summary,
+        "imported_at": _json_ready_value(record.get("created_at")),
+        "note": "Subscriptions were read for ranking only. Use Subscriptions to follow any of them in FreshRSS.",
+    }
+
+
+@app.get("/api/takeout", tags=["metadata"], summary="Imported Takeout status")
+def api_takeout_status(request: Request) -> dict[str, Any]:
+    user_key = _user_key(request)
+    record = db.latest_takeout_import(user_key)
+    profile = db.takeout_profile(user_key)
+    return {
+        "ok": True,
+        "imported": bool(record),
+        "imported_at": _json_ready_value((record or {}).get("created_at")),
+        "summary": _json_ready_value((record or {}).get("summary") or {}),
+        "channels_tracked": len(profile["channels"]),
+        "watched_videos": profile["watched_videos"],
+        "confidence": round(profile["confidence"], 3),
+    }
+
+
+@app.delete("/api/takeout", tags=["metadata"], summary="Delete imported Takeout data")
+def api_takeout_delete(request: Request) -> dict[str, Any]:
+    """Remove every row an import created. The feed reverts to its own observations."""
+    return {"ok": True, "removed": db.clear_takeout_data(_user_key(request))}
+
+
+@app.get("/api/tokens", tags=["tokens"], summary="List API tokens")
+def api_list_tokens(request: Request, include_revoked: bool = False) -> dict[str, Any]:
+    """Existing tokens. The secrets themselves are unrecoverable and never appear here."""
+    user_key = _user_key(request)
+    rows = db.list_api_tokens(user_key, include_revoked)
+    return {"ok": True, "items": [_json_ready_value(tokens.public_view(row)) for row in rows]}
+
+
+@app.post("/api/tokens", tags=["tokens"], summary="Create an API token", status_code=201)
+def api_create_token(request: Request, payload: ApiTokenRequest) -> dict[str, Any]:
+    """Mint a token. The plaintext is returned **once** and cannot be retrieved again."""
+    user_key = _user_key(request)
+    plaintext, prefix, token_hash = tokens.generate()
+    row = db.create_api_token(payload.name, prefix, token_hash, payload.read_only, user_key)
+    return {
+        "ok": True,
+        "token": plaintext,
+        "warning": "Copy this now — it is stored only as a hash and cannot be shown again.",
+        "item": _json_ready_value(tokens.public_view(row)),
+    }
+
+
+@app.delete("/api/tokens/{token_id}", tags=["tokens"], summary="Revoke an API token")
+def api_revoke_token(request: Request, token_id: str) -> dict[str, Any]:
+    user_key = _user_key(request)
+    if not _valid_uuid(token_id):
+        raise HTTPException(status_code=404, detail="No such token")
+    row = db.revoke_api_token(token_id, user_key)
+    if not row:
+        raise HTTPException(status_code=404, detail="No such token")
+    return {"ok": True, "item": _json_ready_value(tokens.public_view(row))}
+
+
+@app.get("/api/videos/{youtube_video_id}", tags=["videos"], summary="Get one video")
+def api_get_video(request: Request, youtube_video_id: str) -> dict[str, Any]:
+    """Everything known about a single video, including this user's state for it."""
+    user_key = _user_key(request)
+    video = db.get_video_by_youtube_id(youtube_video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return {
+        "ok": True,
+        "video": _json_ready_value(video),
+        "feedback": _json_ready_value(db.get_video_feedback(youtube_video_id, user_key) or {}),
+        "progress": _json_ready_value(db.get_playback_progress(youtube_video_id, user_key) or {}),
+        "download": _json_ready_value(db.get_download(youtube_video_id, user_key) or {}),
+        "subscribed": bool(_subscription_feed_for_video(video)),
+    }
+
+
+@app.get("/api/playback/progress/{youtube_video_id}", tags=["playback"], summary="Get playback progress")
+def api_get_playback_progress(request: Request, youtube_video_id: str) -> dict[str, Any]:
+    """Where this video was left off. POST to the same area records it."""
+    progress = db.get_playback_progress(youtube_video_id, _user_key(request))
+    return {"ok": True, "progress": _json_ready_value(progress or {}), "found": bool(progress)}
+
+
+@app.post("/api/ryd/refresh", tags=["metadata"], summary="Fetch missing dislike estimates")
+def api_ryd_refresh(request: Request, limit: int = 40) -> dict[str, Any]:
+    """Run one Return YouTube Dislike batch. A no-op unless the feature is enabled."""
+    user_key = _user_key(request)
+    return {"ok": True, "result": ryd.refresh_missing(max(1, min(limit, 200)), user_key)}
+
+
+@app.get("/api/transcript/{youtube_video_id}", tags=["videos"], summary="Get a transcript")
+def api_transcript(request: Request, youtube_video_id: str) -> dict[str, Any]:
+    """Stored transcript segments, when enrichment captured any."""
+    _user_key(request)
+    video = db.get_video_by_youtube_id(youtube_video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    metadata = video.get("metadata") if isinstance(video.get("metadata"), dict) else {}
+    segments = metadata.get("transcript_segments") if isinstance(metadata, dict) else None
+    segments = segments if isinstance(segments, list) else []
+    return {"ok": True, "youtube_video_id": youtube_video_id, "segments": _json_ready(segments), "count": len(segments)}
+
+
+@app.get("/api/videos/{youtube_video_id}/dislikes")
+def api_video_dislikes(request: Request, youtube_video_id: str) -> dict[str, Any]:
+    """The stored dislike estimate, if one has arrived.
+
+    Read-only against our own database — polling this never reaches RYD, so a page left
+    open cannot turn into repeated outbound requests.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    state = db.video_dislike_state(youtube_video_id)
+    count = state.get("dislike_count")
+    return {
+        "ok": True,
+        "youtube_video_id": youtube_video_id,
+        "dislikes": count,
+        "display": _compact_count(count) if count is not None else "",
+        "estimated": state.get("dislike_source") == "ryd",
+        "checked": bool(state.get("checked")),
+    }
+
+
 @app.get("/api/comments/{youtube_video_id}")
 def api_comments(request: Request, youtube_video_id: str, continuation: str = "") -> dict[str, Any]:
     """Fetch comments from Invidious. Off unless the user opts in.
@@ -7474,12 +11952,22 @@ def api_comments(request: Request, youtube_video_id: str, continuation: str = ""
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail="Comments are unavailable for this video")
     payload = response.json()
+    try:
+        stored_reactions = db.comment_reactions(youtube_video_id, _user_key(request))
+    except Exception as exc:  # noqa: BLE001 - the votes are decorative, the comments are not
+        logger.info("could not load comment reactions for %s: %s", youtube_video_id, exc)
+        stored_reactions = {}
     items = []
     for raw in (payload.get("comments") or [])[: (COMMENT_REPLY_LIMIT if token else COMMENT_LIMIT)]:
         if not isinstance(raw, dict):
             continue
         replies = raw.get("replies") if isinstance(raw.get("replies"), dict) else {}
+        # Invidious exposes no stable per-comment id, so one is derived from the parts
+        # that do not change: who wrote it, when, and what it says.
+        comment_id = _comment_identity(raw)
         items.append({
+            "comment_id": comment_id,
+            "reaction": stored_reactions.get(comment_id, ""),
             "author": str(raw.get("author") or "Unknown"),
             "author_id": str(raw.get("authorId") or ""),
             "avatar_url": _comment_avatar(raw.get("authorThumbnails")),
@@ -7489,6 +11977,11 @@ def api_comments(request: Request, youtube_video_id: str, continuation: str = ""
             "is_owner": bool(raw.get("authorIsChannelOwner")),
             "is_pinned": bool(raw.get("isPinned")),
             "verified": bool(raw.get("verified")),
+            # Invidious surfaces the creator's heart, including whose it is.
+            "creator_heart": _proxied_avatar((raw.get("creatorHeart") or {}).get("creatorThumbnail"))
+                             if isinstance(raw.get("creatorHeart"), dict) else "",
+            "creator_heart_name": str((raw.get("creatorHeart") or {}).get("creatorName") or "")
+                                  if isinstance(raw.get("creatorHeart"), dict) else "",
             "reply_count": int(replies.get("replyCount") or 0),
             # Handed to the client so only the threads a reader opens cost a request.
             "reply_continuation": str(replies.get("continuation") or ""),
@@ -7499,6 +11992,9 @@ def api_comments(request: Request, youtube_video_id: str, continuation: str = ""
         "comment_count": payload.get("commentCount"),
         "items": items,
         "is_replies": bool(token),
+        # Was dropped, so the client had no way to ask for page two — a video with 2,700
+        # comments showed the first twenty and stopped.
+        "continuation": str(payload.get("continuation") or ""),
     }
 
 
@@ -7554,11 +12050,33 @@ def _shorts_shelf(videos: list[dict[str, Any]], section_id: str = "shorts") -> s
     '''
 
 
+def _notification_allows(row: dict[str, Any], level: str, preferred_topics: set[str]) -> bool:
+    """Whether one upload survives its channel's bell setting.
+
+    'personalized' is the only level that needs a judgement call: it keeps uploads whose
+    tags overlap the topics you follow. With no followed topics there is nothing to
+    narrow by, so it behaves as 'all' rather than silently muting the channel.
+    """
+    if level == "none":
+        return False
+    if level != "personalized" or not preferred_topics:
+        return True
+    tags = {str(tag).strip().lower() for tag in (row.get("tags") or []) if str(tag).strip()}
+    return bool(tags & preferred_topics)
+
+
 def _notification_items(user_key: str, limit: int = 24) -> tuple[list[dict[str, Any]], int]:
     """Recent subscription uploads plus how many arrived since the panel was last opened."""
     preferences = db.get_feed_preferences(user_key)
     include_shorts = not preferences.get("exclude_shorts", False)
-    rows = db.list_subscription_uploads(limit, user_key, include_shorts)
+    levels = db.channel_notification_levels(user_key)
+    preferred_topics = {str(topic).strip().lower() for topic in (preferences.get("preferred_topics") or []) if str(topic).strip()}
+    # Over-fetch so muted channels cannot starve the panel down to a handful of rows.
+    fetch = limit * 3 if levels else limit
+    rows = [
+        row for row in db.list_subscription_uploads(fetch, user_key, include_shorts)
+        if _notification_allows(row, levels.get(str(row.get("youtube_channel_id") or ""), "all"), preferred_topics)
+    ][:limit]
     seen_raw = db.get_notifications_seen_at(user_key)
     seen_at = None
     if seen_raw:
@@ -7604,6 +12122,23 @@ def api_notifications_seen(request: Request) -> dict[str, Any]:
     stamp = datetime.now(timezone.utc).isoformat()
     db.set_notifications_seen_at(stamp, _user_key(request))
     return {"ok": True, "seen_at": stamp}
+
+
+@app.post("/api/channels/{youtube_channel_id}/notifications")
+def api_set_channel_notifications(
+    request: Request,
+    youtube_channel_id: str,
+    payload: ChannelNotificationRequest,
+) -> dict[str, Any]:
+    """Set the bell level for one channel: all, personalized, or none."""
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    level = payload.level.strip().lower()
+    if level not in db.NOTIFICATION_LEVELS:
+        raise HTTPException(status_code=400, detail="level must be all, personalized, or none")
+    stored = db.set_channel_notification(youtube_channel_id.strip(), level, _user_key(request))
+    return {"ok": True, "youtube_channel_id": youtube_channel_id, "level": stored}
 
 
 def _shorts_slide(video: dict[str, Any], user_key: str = "local") -> str:

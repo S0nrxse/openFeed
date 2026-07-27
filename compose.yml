@@ -37,56 +37,6 @@ services:
     networks:
       - openfeed_net
 
-  openfeed-gorse-db:
-    image: postgres:17-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${GORSE_POSTGRES_DB:-gorse}
-      POSTGRES_USER: ${GORSE_POSTGRES_USER:-gorse}
-      POSTGRES_PASSWORD: ${GORSE_POSTGRES_PASSWORD:?set GORSE_POSTGRES_PASSWORD in .env}
-      TZ: ${TZ:-UTC}
-    volumes:
-      - ${OPENFEED_DATA_DIR:-./data}/gorse-postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${GORSE_POSTGRES_USER:-gorse} -d ${GORSE_POSTGRES_DB:-gorse}"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    networks:
-      - openfeed_net
-
-  openfeed-gorse:
-    image: zhenghaoz/gorse-in-one:latest
-    restart: unless-stopped
-    depends_on:
-      openfeed-gorse-db:
-        condition: service_healthy
-      openfeed-redis:
-        condition: service_healthy
-    environment:
-      GORSE_CACHE_STORE: postgres://${GORSE_POSTGRES_USER:-gorse}:${GORSE_POSTGRES_PASSWORD}@openfeed-gorse-db:5432/${GORSE_POSTGRES_DB:-gorse}?sslmode=disable
-      GORSE_DATA_STORE: postgres://${GORSE_POSTGRES_USER:-gorse}:${GORSE_POSTGRES_PASSWORD}@openfeed-gorse-db:5432/${GORSE_POSTGRES_DB:-gorse}?sslmode=disable
-      GORSE_SERVER_API_KEY: ${GORSE_SERVER_API_KEY:?set GORSE_SERVER_API_KEY in .env}
-      GORSE_ADMIN_API_KEY: ${GORSE_ADMIN_API_KEY:?set GORSE_ADMIN_API_KEY in .env}
-      GORSE_DASHBOARD_USER_NAME: ${GORSE_DASHBOARD_USER_NAME:-admin}
-      GORSE_DASHBOARD_PASSWORD: ${GORSE_DASHBOARD_PASSWORD:?set GORSE_DASHBOARD_PASSWORD in .env}
-      GORSE_MASTER_HTTP_HOST: 0.0.0.0
-      GORSE_MASTER_HOST: 0.0.0.0
-      GORSE_BLOB_URI: /var/lib/gorse/blob
-    command: >
-      -c /etc/gorse/config.toml
-      --log-path /var/log/gorse/master.log
-      --cache-path /var/lib/gorse/master
-    volumes:
-      - ./config/gorse/config.toml:/etc/gorse/config.toml:ro
-      - ${OPENFEED_DATA_DIR:-./data}/gorse:/var/lib/gorse
-      - ${OPENFEED_DATA_DIR:-./data}/gorse-log:/var/log/gorse
-    expose:
-      - "8086"
-      - "8088"
-    networks:
-      - openfeed_net
-
   openfeed-freshrss-db:
     image: postgres:17-alpine
     restart: unless-stopped
@@ -184,24 +134,36 @@ services:
       OPENFEED_OIDC_SCOPE: ${OPENFEED_OIDC_SCOPE:-openid email profile}
       DATABASE_URL: postgresql://${POSTGRES_USER:-openfeed}:${POSTGRES_PASSWORD}@openfeed-postgres:5432/${POSTGRES_DB:-openfeed}
       REDIS_URL: ${REDIS_URL:-redis://openfeed-redis:6379/0}
-      GORSE_BASE_URL: ${GORSE_BASE_URL:-http://openfeed-gorse:8088}
-      GORSE_SERVER_API_KEY: ${GORSE_SERVER_API_KEY:-}
       FRESHRSS_BASE_URL: ${FRESHRSS_BASE_URL:-http://freshrss}
       FRESHRSS_USERNAME: ${FRESHRSS_USERNAME:-}
       FRESHRSS_API_PASSWORD: ${FRESHRSS_API_PASSWORD:-}
       FRESHRSS_READING_LIST_LIMIT: ${FRESHRSS_READING_LIST_LIMIT:-250}
       SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-1800}
-      ENRICH_AFTER_SYNC_LIMIT: ${ENRICH_AFTER_SYNC_LIMIT:-5}
+      ENRICH_AFTER_SYNC_LIMIT: ${ENRICH_AFTER_SYNC_LIMIT:-40}
       ENRICHMENT_TIMEOUT_SECONDS: ${ENRICHMENT_TIMEOUT_SECONDS:-12}
       INVIDIOUS_BASE_URL: ${INVIDIOUS_BASE_URL:-http://openfeed-invidious:3000}
       INVIDIOUS_PUBLIC_URL: ${INVIDIOUS_PUBLIC_URL:-http://localhost:8061}
       OPENFEED_PLAYBACK_FALLBACK: ${OPENFEED_PLAYBACK_FALLBACK:-youtube}
       OPENFEED_INVIDIOUS_FALLBACKS: ${OPENFEED_INVIDIOUS_FALLBACKS:-}
       OPENFEED_PLAYBACK_PROBE_TIMEOUT: ${OPENFEED_PLAYBACK_PROBE_TIMEOUT:-4}
+      OPENFEED_YTDLP_ENABLED: ${OPENFEED_YTDLP_ENABLED:-true}
+      OPENFEED_YTDLP_PLAYBACK: ${OPENFEED_YTDLP_PLAYBACK:-true}
+      OPENFEED_YTDLP_TIMEOUT: ${OPENFEED_YTDLP_TIMEOUT:-90}
+      OPENFEED_YTDLP_CACHE_SECONDS: ${OPENFEED_YTDLP_CACHE_SECONDS:-240}
+      OPENFEED_YTDLP_COOKIES_FILE: ${OPENFEED_YTDLP_COOKIES_FILE:-}
+      OPENFEED_YTDLP_EXTRA_ARGS: ${OPENFEED_YTDLP_EXTRA_ARGS:-}
+      OPENFEED_DOWNLOAD_DIR: ${OPENFEED_DOWNLOAD_DIR:-/data/downloads}
+      OPENFEED_DOWNLOAD_RETENTION: ${OPENFEED_DOWNLOAD_RETENTION:-21600}
+      OPENFEED_DOWNLOAD_CONCURRENCY: ${OPENFEED_DOWNLOAD_CONCURRENCY:-2}
+      OPENFEED_DOWNLOAD_MAX_HEIGHT: ${OPENFEED_DOWNLOAD_MAX_HEIGHT:-2160}
       DISCOVER_AFTER_SYNC_LIMIT: ${DISCOVER_AFTER_SYNC_LIMIT:-3}
       DISCOVER_RELATED_PER_VIDEO: ${DISCOVER_RELATED_PER_VIDEO:-6}
     ports:
       - "${OPENFEED_BIND_IP:-127.0.0.1}:${OPENFEED_PORT:-8060}:8000"
+    volumes:
+      # Downloads kept on the server are a library, so they live on a bind mount rather
+      # than inside the container where a rebuild would wipe them.
+      - ${OPENFEED_DATA_DIR:-./data}/downloads:/data/downloads
     healthcheck:
       test: ["CMD", "python", "-m", "openfeed.healthcheck"]
       interval: 30s
@@ -228,14 +190,12 @@ services:
       OPENFEED_SECRET_KEY: ${OPENFEED_SECRET_KEY:?set OPENFEED_SECRET_KEY in .env}
       DATABASE_URL: postgresql://${POSTGRES_USER:-openfeed}:${POSTGRES_PASSWORD}@openfeed-postgres:5432/${POSTGRES_DB:-openfeed}
       REDIS_URL: ${REDIS_URL:-redis://openfeed-redis:6379/0}
-      GORSE_BASE_URL: ${GORSE_BASE_URL:-http://openfeed-gorse:8088}
-      GORSE_SERVER_API_KEY: ${GORSE_SERVER_API_KEY:-}
       FRESHRSS_BASE_URL: ${FRESHRSS_BASE_URL:-http://freshrss}
       FRESHRSS_USERNAME: ${FRESHRSS_USERNAME:-}
       FRESHRSS_API_PASSWORD: ${FRESHRSS_API_PASSWORD:-}
       FRESHRSS_READING_LIST_LIMIT: ${FRESHRSS_READING_LIST_LIMIT:-250}
       SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-1800}
-      ENRICH_AFTER_SYNC_LIMIT: ${ENRICH_AFTER_SYNC_LIMIT:-5}
+      ENRICH_AFTER_SYNC_LIMIT: ${ENRICH_AFTER_SYNC_LIMIT:-40}
       ENRICHMENT_TIMEOUT_SECONDS: ${ENRICHMENT_TIMEOUT_SECONDS:-12}
       INVIDIOUS_BASE_URL: ${INVIDIOUS_BASE_URL:-http://openfeed-invidious:3000}
       INVIDIOUS_PUBLIC_URL: ${INVIDIOUS_PUBLIC_URL:-http://localhost:8061}
