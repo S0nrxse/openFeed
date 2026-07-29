@@ -10527,6 +10527,16 @@ def api_refresh_feed(request: Request, vectors: bool = True, grow: bool = True) 
         # Ranking cannot surface a subject the library has no videos about, so a refresh
         # fetches before it re-ranks.
         result["growth"] = discovery.grow_library(user_key)
+        # Growing the library adds videos dated from relative text ("2 days ago"), which
+        # is wrong by up to a year and which the recency boost then rewards. Re-reading a
+        # batch here means the dates converge as the feed is used rather than needing a
+        # manual repair; the worker runs the same pass on its own schedule.
+        from . import enrichment as _enrichment
+
+        try:
+            result["publish_dates"] = _enrichment.verify_publish_dates()
+        except Exception as exc:  # noqa: BLE001
+            result["publish_dates"] = {"ok": False, "message": str(exc)[:200]}
     if vectors:
         from . import topics
 
