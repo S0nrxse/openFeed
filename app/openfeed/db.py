@@ -2744,9 +2744,13 @@ def update_video_metadata(youtube_video_id: str, metadata: dict[str, Any], sourc
                     summary = COALESCE(NULLIF(%s, ''), summary),
                     description = COALESCE(NULLIF(%s, ''), description),
                     duration_seconds = COALESCE(%s, duration_seconds),
-                    -- Only filled when missing: the feed's own date is authoritative
-                    -- where we have one, and this backfills the discovered videos.
-                    published_at = COALESCE(published_at, to_timestamp(NULLIF(%s, 0))),
+                    -- This one wins over whatever is stored. It comes from the
+                    -- single-video endpoint, the only Invidious route that reports a real
+                    -- publish timestamp; the list endpoints decode relative text and
+                    -- fall back to the time of the request. Filling only when missing
+                    -- meant a date fabricated at discovery was permanent, because the one
+                    -- call able to correct it was forbidden from doing so.
+                    published_at = COALESCE(to_timestamp(NULLIF(%s, 0)), published_at),
                     view_count = COALESCE(%s, view_count),
                     like_count = COALESCE(%s, like_count),
                     dislike_count = COALESCE(%s, dislike_count),
@@ -3631,3 +3635,35 @@ def channel_ids_for_titles(titles: list[str]) -> dict[str, str]:
                 ([title.lower() for title in cleaned],),
             )
             return {str(row["key"]): str(row["youtube_channel_id"]) for row in cur.fetchall()}
+
+
+def list_videos_with_decoded_dates(limit: int = 40) -> list[dict[str, Any]]:
+    """Videos whose publish date was decoded from relative text rather than read.
+
+    Invidious's list endpoints report "2 days ago" and turn it into an absolute time at
+    request time, so the value they yield carries the wall-clock of the fetch. The
+    single-video endpoint reports a real date, which lands at midnight UTC. That
+    difference is the signature, and it is what this selects on.
+
+    This deliberately does not exclude rows the ordinary enrichment queue would also
+    reach. That queue moves at a handful per cycle and is shared with everything else
+    needing metadata, which put the backlog at roughly two weeks; the rows it will never
+    reach at all are the ones already enriched, where metadata_fetched_at is set and a
+    date written before enrichment was allowed to overwrite it is otherwise permanent.
+    Both need the same fix, so both are selected here and the newest are corrected first —
+    those are the ones a decoded date wrongly promotes to the top of the feed.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, youtube_video_id, title, published_at
+                FROM videos
+                WHERE published_at IS NOT NULL
+                  AND (published_at AT TIME ZONE 'UTC')::time <> '00:00:00'
+                ORDER BY published_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return list(cur.fetchall())

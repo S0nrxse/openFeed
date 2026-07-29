@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import httpx
@@ -30,6 +30,20 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+# Invidious's list endpoints do not carry a real publish timestamp. They carry the
+# relative text YouTube renders ("2 days ago") and decode it to an absolute time at
+# request time — so the value is only ever as precise as that text, and when the text is
+# missing or unrecognised the decoder yields *now*. Stored unchecked, that dates a video
+# to the moment we happened to fetch it: an episode from January arrives as the newest
+# thing on the channel, and the feed's recency boost promotes it on top of that.
+#
+# Anything claiming to be published within this window of the fetch is treated as unknown.
+# A list endpoint has no business reporting a video this new, and leaving the date empty
+# is recoverable — enrichment reads the real timestamp from the single-video endpoint,
+# which does report one — whereas a fabricated date silently outranks everything.
+_FABRICATED_DATE_WINDOW = timedelta(minutes=5)
+
+
 def _published_at(item: dict[str, Any]) -> datetime | None:
     """Invidious reports publish time as unix seconds; the column wants a timestamp.
 
@@ -40,9 +54,12 @@ def _published_at(item: dict[str, Any]) -> datetime | None:
     if not raw or raw <= 0:
         return None
     try:
-        return datetime.fromtimestamp(raw, tz=timezone.utc)
+        published = datetime.fromtimestamp(raw, tz=timezone.utc)
     except (OverflowError, OSError, ValueError):
         return None
+    if published >= datetime.now(tz=timezone.utc) - _FABRICATED_DATE_WINDOW:
+        return None
+    return published
 
 
 def _normalize_related(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -59,7 +76,11 @@ def _normalize_related(item: dict[str, Any]) -> dict[str, Any] | None:
         "channel_title": item.get("author"),
         "youtube_channel_id": author_id,
         "duration_seconds": _int_or_none(item.get("lengthSeconds")),
-        "view_count": _int_or_none(item.get("viewCount")),
+        # Same trap as the publish date, and the same endpoints: a list entry reports 0
+        # views when YouTube did not render a view count in that row, not when nobody has
+        # watched it. Stored as 0 it renders as "0 views" on a video with 371K, and no
+        # later pass can tell the difference between a real zero and a missing one.
+        "view_count": _int_or_none(item.get("viewCount")) or None,
         "summary": item.get("description"),
         # Invidious reports this as unix seconds. It used to be discarded, which meant
         # every video acquired this way arrived undated — and a feed sorted by date cannot

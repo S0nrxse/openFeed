@@ -6,7 +6,13 @@ import time
 from . import db, ryd, topics
 from .config import get_settings
 from .discovery import backfill_subscription_uploads, discover_related_videos, grow_library
-from .enrichment import backfill_subscription_art, enrich_channels, enrich_channels_paced, enrich_recent_videos
+from .enrichment import (
+    backfill_subscription_art,
+    enrich_channels,
+    enrich_channels_paced,
+    enrich_recent_videos,
+    verify_publish_dates,
+)
 from .sync import sync_freshrss_once
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -25,6 +31,15 @@ def main() -> None:
             if settings.enrich_after_sync_limit > 0:
                 result = enrich_recent_videos(settings.enrich_after_sync_limit)
                 logger.info("metadata enrichment batch: %s", result)
+            # Dates decoded from "2 days ago" are wrong by up to a year, and the video
+            # they belong to keeps outranking everything because the feed rewards recency.
+            # A bounded batch per cycle drains the backlog without hammering Invidious.
+            try:
+                dates = verify_publish_dates()
+                if dates.get("corrected"):
+                    logger.info("publish dates re-read: %s", dates)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("publish date pass skipped: %s", exc)
             # Subscribed channels first and to completion: they are the ones with a blank
             # circle sitting in the sidebar, and there are ten discovered channels for
             # every one of them, so a shared queue never reaches them.

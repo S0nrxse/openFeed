@@ -278,3 +278,36 @@ def enrich_channels_paced(limit: int = CHANNEL_MEDIA_BATCH, refresh: bool = Fals
         result = enrich_channel(item["youtube_channel_id"])
         ok += 1 if result.get("ok") else 0
     return {"ok": True, "candidates": len(candidates), "updated": ok, "remaining_hint": len(candidates) == limit}
+
+
+# Dates decoded from relative text are re-read a few at a time rather than in one sweep:
+# every one is a request Invidious forwards to YouTube, and a fast loop makes it answer
+# 500 for everything, which is indistinguishable from a video that is genuinely gone.
+PUBLISH_DATE_BATCH = 60
+PUBLISH_DATE_GAP_SECONDS = 1.0
+
+
+def verify_publish_dates(limit: int = PUBLISH_DATE_BATCH) -> dict[str, Any]:
+    """Re-read publish dates that were decoded from "N days ago" instead of reported.
+
+    Runs alongside the feed so the library converges on real dates instead of needing a
+    manual repair: each pass corrects a bounded batch and the next pass takes the next
+    one. Videos Invidious cannot answer for are left exactly as they are — an unknown
+    date is recoverable, an invented one is what caused this in the first place.
+    """
+    import time as _time
+
+    candidates = db.list_videos_with_decoded_dates(max(1, min(limit, 100)))
+    corrected = 0
+    for index, item in enumerate(candidates):
+        if index:
+            _time.sleep(PUBLISH_DATE_GAP_SECONDS)
+        before = item.get("published_at")
+        result = enrich_video(item["youtube_video_id"], item.get("id"))
+        if not result.get("ok"):
+            continue
+        # enrich_video writes through update_video_metadata, which now prefers the fetched
+        # timestamp over the stored one, so a successful pass has already corrected it.
+        corrected += 1
+        logger.debug("publish date re-read for %s (was %s)", item["youtube_video_id"], before)
+    return {"ok": True, "candidates": len(candidates), "corrected": corrected}
