@@ -490,14 +490,14 @@ class StatusPageTests(unittest.TestCase):
         import inspect
 
         # It was a sidebar entry pointing at a standalone page; it is a Settings pane.
-        from .support import offline_db
+        from openfeed.tests.support import offline_db
 
         self.assertIn("RedirectResponse", inspect.getsource(main.admin_status))
         with offline_db():
             self.assertIn('data-settings-pane="status"', main._settings_dialog(user={"authenticated": False}))
 
     def test_the_status_body_still_renders(self) -> None:
-        from .support import offline_db
+        from openfeed.tests.support import offline_db
 
         with offline_db():
             self.assertIn("Service health", main._status_page_html("local"))
