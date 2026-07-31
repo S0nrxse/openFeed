@@ -490,11 +490,17 @@ class StatusPageTests(unittest.TestCase):
         import inspect
 
         # It was a sidebar entry pointing at a standalone page; it is a Settings pane.
+        from .support import offline_db
+
         self.assertIn("RedirectResponse", inspect.getsource(main.admin_status))
-        self.assertIn('data-settings-pane="status"', main._settings_dialog(user={"authenticated": False}))
+        with offline_db():
+            self.assertIn('data-settings-pane="status"', main._settings_dialog(user={"authenticated": False}))
 
     def test_the_status_body_still_renders(self) -> None:
-        self.assertIn("Service health", main._status_page_html("local"))
+        from .support import offline_db
+
+        with offline_db():
+            self.assertIn("Service health", main._status_page_html("local"))
 
     def test_status_tables_scroll_in_their_own_box(self) -> None:
         # A long error message must not be able to widen the whole page.

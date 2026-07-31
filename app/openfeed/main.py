@@ -507,17 +507,6 @@ def _youtube_feed_url(youtube_channel_id: str) -> str:
     return f"https://www.youtube.com/feeds/videos.xml?channel_id={youtube_channel_id}"
 
 
-def _sync_gorse_event(user_key: str, youtube_video_id: str, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Retained as a no-op so the feedback API keeps its shape.
-
-    Gorse was removed: collaborative filtering learns from co-occurrence across many
-    users, and a self-hosted feed reader has one. It contributed to zero of forty ranked
-    recommendations while costing two containers and a Postgres instance. Ranking is now
-    content-based, which is what actually fits this deployment.
-    """
-    return {"ok": False, "skipped": "gorse_removed"}
-
-
 ALLOWED_FEEDBACK_EVENTS = {
     "hide",
     "not_interested",
@@ -8338,7 +8327,6 @@ def watch_video(request: Request, youtube_video_id: str):
     has_transcript = isinstance(transcript_segments, list) and bool(transcript_segments)
     db.record_video_event(youtube_video_id, "watch_page_open", {"source": "watch_page", "weight": 0}, user_key)
     db.update_playback_progress(youtube_video_id, 0, video.get("duration_seconds"), "open", {"source": "watch_page"}, user_key)
-    _sync_gorse_event(user_key, youtube_video_id, "watch_page_open", {"source": "watch_page"})
 
     # Ranked against the video on screen and with shorts left out - they have their own
     # vertical viewer, and a 30-second clip is not a sensible follow-on from a long video.
@@ -11226,8 +11214,7 @@ def api_feedback(request: Request, feedback: FeedbackRequest) -> dict[str, Any]:
         db.update_playback_progress(youtube_video_id, 0, None, "open", feedback.payload, user_key)
     if not state:
         state = db.get_video_feedback(youtube_video_id, user_key) or {}
-    gorse_state = _sync_gorse_event(user_key, youtube_video_id, event_type, feedback.payload)
-    return {"ok": True, "event": _json_ready_value(event), "feedback": _json_ready_value(state), "gorse": _json_ready_value(gorse_state)}
+    return {"ok": True, "event": _json_ready_value(event), "feedback": _json_ready_value(state)}
 
 
 @app.post("/api/playback/progress")
@@ -11251,11 +11238,7 @@ def api_playback_progress(request: Request, progress: PlaybackProgressRequest) -
         db.clear_watch_time_cache(user_key)
     if not state:
         raise HTTPException(status_code=404, detail="Video not found")
-    gorse_payload = dict(progress.payload or {})
-    gorse_payload["percent_completed"] = state.get("percent_completed")
-    gorse_event = "complete" if state.get("completed") else "watch_progress"
-    gorse_state = _sync_gorse_event(user_key, youtube_video_id, gorse_event, gorse_payload)
-    return {"ok": True, "progress": _json_ready_value(state), "gorse": _json_ready_value(gorse_state)}
+    return {"ok": True, "progress": _json_ready_value(state)}
 
 
 @app.post("/api/playlists")

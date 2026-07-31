@@ -512,7 +512,10 @@ class DisclosureTests(unittest.TestCase):
         # The note used to claim lookups never happen on open. That stopped being true.
         from openfeed import main
 
-        html = main._settings_dialog(user={"authenticated": False}, user_key="local")
+        from .support import offline_db
+
+        with offline_db():
+            html = main._settings_dialog(user={"authenticated": False}, user_key="local")
         self.assertIn("shuffled into a batch", html)
         self.assertNotIn("never\nwhen you open one", html)
 
