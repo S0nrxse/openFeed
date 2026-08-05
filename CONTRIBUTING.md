@@ -3,8 +3,6 @@
 Thanks for your interest. Contributions are welcome, and the process is deliberately
 simple: **fork, branch, open a pull request, and it gets reviewed before it merges.**
 
-Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
-
 OpenFeed is in **alpha** and has a single maintainer. Every pull request is reviewed by
 [@S0nrxse](https://github.com/S0nrxse) before merging(will most likely change in the future but for the moment I would like to decide the direction we take on the project). Expect review to take a few days.
 
