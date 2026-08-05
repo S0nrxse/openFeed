@@ -1,4 +1,8 @@
-# OpenFeed
+<p align="center">
+  <img src="assets/openfeed-logo.png" width="120" alt="OpenFeed">
+</p>
+
+<h1 align="center">OpenFeed</h1>
 
 OpenFeed is a privacy-focused self-hosted YouTube front end. It builds a personalised feed from your own
 subscriptions and watch history, plays videos through a local Invidious instance, and
