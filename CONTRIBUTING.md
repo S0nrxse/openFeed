@@ -11,8 +11,7 @@ OpenFeed is in **alpha** and has a single maintainer. Every pull request is revi
 **Open an issue first for anything non-trivial.** A bug fix or a typo can go straight to a
 pull request. A new feature, a dependency, a schema change, or a refactor that touches
 several files should start as an issue so the approach can be agreed before you spend time
-on it. Rejecting a finished feature is a worse outcome for everyone than redirecting an
-idea early.
+on it. Rejecting a finished feature is a worse outcome for everyone and I would rather reject or redirect an idea early on.
 
 Things most likely to be turned down:
 
