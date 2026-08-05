@@ -1,8 +1,8 @@
 # OpenFeed
 
-OpenFeed is a self-hosted YouTube front end. It builds a personalised feed from your own
+OpenFeed is a privacy-focused self-hosted YouTube front end. It builds a personalised feed from your own
 subscriptions and watch history, plays videos through a local Invidious instance, and
-keeps every signal it learns from on your own hardware.
+keeps every piece of your watch data on your computer.
 
 > **Alpha.** This project is early and under active development. Expect bugs, expect
 > rough edges, and expect things to change as features land. Back up `OPENFEED_DATA_DIR`
@@ -16,6 +16,14 @@ OpenFeed is an independent implementation of that idea rather than anything affi
 with, endorsed by, or derived from the video's author.
 
 ## Features
+
+### Library and account
+
+- Search, channels, playlists, collections, likes, and watch history
+- Channel pages with tabs, filters, links and community posts
+- FreshRSS synchronisation for subscriptions
+- Optional Authentik OIDC login with group-based access
+- Responsive desktop and mobile interface
 
 ### Feed and recommendations
 
@@ -47,8 +55,8 @@ with, endorsed by, or derived from the video's author.
 
 ### Optional integrations
 
-Each is **off by default**, read-only, server-side, and carries its own privacy note in
-Settings. Nothing is enabled without you asking for it.
+Each is **off by default**, read-only, server-side, and contains a privacy note in
+Settings. Nothing is enabled without you asking for it -- making you, the user aware of the consequences of 3rd party software.
 
 - **SponsorBlock** — segment skipping with timeline markers and per-category actions.
   Looked up by a 4-character hash prefix, so the SponsorBlock server never learns which
@@ -57,14 +65,6 @@ Settings. Nothing is enabled without you asking for it.
   are never submitted.
 - **Community posts and polls** — read-only. Poll voting is simulated locally and
   labelled as such, because YouTube publishes no per-option breakdown.
-
-### Library and account
-
-- Search, channels, playlists, collections, likes, and watch history
-- Channel pages with tabs, filters, links and community posts
-- FreshRSS synchronisation for subscriptions
-- Optional Authentik OIDC login with group-based access
-- Responsive desktop and mobile interface
 
 ## Requirements
 
@@ -153,7 +153,7 @@ Validate Compose configuration with:
 ./deploy.sh config --quiet
 ```
 
-## Security
+## Best security practices
 
 - Do not expose PostgreSQL, Redis, or the optional Qdrant and Typesense services publicly.
 - Keep `.env`, local Compose overrides, database files, and backups outside version control.
@@ -163,7 +163,7 @@ Validate Compose configuration with:
 
 ## Contributing
 
-Contributions are welcome. Everything goes through a reviewed pull request — see
+Contributions are welcome. Currently everything goes through a reviewed pull request — see
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow and what a change needs before it
 can be merged.
 
