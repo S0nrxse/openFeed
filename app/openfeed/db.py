@@ -2966,7 +2966,14 @@ def upsert_discovered_video(item: dict[str, Any], source_video_id: int | None, s
                   thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, videos.thumbnail_url),
                   author = COALESCE(EXCLUDED.author, videos.author),
                   summary = COALESCE(EXCLUDED.summary, videos.summary),
-                  published_at = COALESCE(EXCLUDED.published_at, videos.published_at),
+                  -- Fill only. This arrives from a list endpoint, where the date is
+                  -- decoded from "2 days ago" at request time and is wrong by up to a
+                  -- year. Whatever is already stored came from the RSS feed or from
+                  -- enrichment's single-video lookup, both of which report a real
+                  -- timestamp, so an incoming decoded value must never replace it.
+                  -- Overwriting here silently undid a full repair: a subscription
+                  -- backfill rewrote 3,267 corrected rows in one pass.
+                  published_at = COALESCE(videos.published_at, EXCLUDED.published_at),
                   duration_seconds = COALESCE(EXCLUDED.duration_seconds, videos.duration_seconds),
                   view_count = COALESCE(EXCLUDED.view_count, videos.view_count),
                   source_kind = CASE WHEN videos.source_kind = 'subscription' THEN videos.source_kind ELSE 'discovery' END,
