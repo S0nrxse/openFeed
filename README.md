@@ -66,36 +66,80 @@ Settings. Nothing is enabled without you asking for it -- making you, the user a
 - **Community posts and polls** — read-only. Poll voting is simulated locally and
   labelled as such, because YouTube publishes no per-option breakdown.
 
+## Installation
+
+### 1. Get the code
+
+```bash
+git clone https://github.com/S0nrxse/openFeed.git && cd openFeed
+```
+
+### 2. Configure
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and replace every `replace-with-*` placeholder. Any random string works:
+
+```bash
+openssl rand -hex 32
+```
+
+### 3. Start
+
+```bash
+./deploy.sh --profile worker up -d --build
+```
+
+The first run builds the app image and pulls roughly 700 MB of containers, so give it a
+few minutes. Later starts take seconds.
+
+### 4. Open it
+
+| Service | URL | What it is |
+| --- | --- | --- |
+| **OpenFeed** | http://localhost:8060 | The app |
+| FreshRSS | http://localhost:8050 | Subscription sync |
+| Invidious | http://localhost:8061 | Playback and metadata backend |
+
+All ports bind to `127.0.0.1` unless you change them in `.env`, so nothing is reachable
+from outside the machine by default.
+
+## Managing the Stack
+
+`deploy.sh` passes everything through to `docker compose`, so any Compose command works:
+
+```bash
+./deploy.sh logs -f openfeed-app     # follow the app log
+```
+
+```bash
+./deploy.sh ps                       # what is running
+```
+
+```bash
+./deploy.sh restart openfeed-app     # restart one service
+```
+
+```bash
+./deploy.sh down                     # stop everything
+```
+
+To update to the latest code:
+
+```bash
+git pull && ./deploy.sh --profile worker up -d --build
+```
+
+`openfeed-app` and `openfeed-worker` share one image, so a rebuild has to recreate both —
+the command above does.
+
 ## Requirements
 
 - Docker Compose v2 (bundled with Docker Desktop, or the `docker-compose-plugin` package)
 - Roughly 4 GB of RAM for the full stack, and disk for whatever you download
 - Linux, macOS, or Windows with WSL2
-
-## Quick Start
-
-1. Create your local environment:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-2. Replace every `replace-with-*` value in `.env`. Generate secrets with:
-
-   ```bash
-   openssl rand -hex 32
-   ```
-
-3. Start the application and worker:
-
-   ```bash
-   ./deploy.sh --profile worker up -d --build
-   ```
-
-4. Open `http://localhost:8060`.
-
-FreshRSS is available on `http://localhost:8050` and Invidious on `http://localhost:8061`
-by default. All published ports bind to loopback unless changed in `.env`.
 
 ## Platform Notes
 
@@ -194,8 +238,7 @@ Validate Compose configuration with:
 
 Contributions are welcome. Currently everything goes through a reviewed pull request — see
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow and what a change needs before it
-can be merged, and [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for participation
-expectations.
+can be merged.
 
 ## License
 
