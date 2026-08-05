@@ -1,0 +1,17 @@
+# Shell scripts must keep LF endings. Checked out with CRLF on Windows, deploy.sh fails
+# with "bad interpreter: /usr/bin/env bash^M" — an error that gives no hint of its cause.
+*.sh            text eol=lf
+deploy.sh       text eol=lf
+
+# Entrypoints and configuration read inside Linux containers, same reason.
+Dockerfile      text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.sql           text eol=lf
+.env.example    text eol=lf
+
+# Let Git decide for everything else, and never mangle binaries.
+*               text=auto
+*.png           binary
+*.jpg           binary
+*.ico           binary
