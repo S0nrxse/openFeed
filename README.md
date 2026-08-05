@@ -70,7 +70,7 @@ Settings. Nothing is enabled without you asking for it -- making you, the user a
 
 - Docker Compose v2 (bundled with Docker Desktop, or the `docker-compose-plugin` package)
 - Roughly 4 GB of RAM for the full stack, and disk for whatever you download
-- A POSIX shell to run `deploy.sh` — see the Windows notes below if you do not have one
+- Linux, macOS, or Windows with WSL2
 
 ## Quick Start
 
@@ -80,112 +80,57 @@ Settings. Nothing is enabled without you asking for it -- making you, the user a
    cp .env.example .env
    ```
 
-2. Restrict it:
-
-   ```bash
-   chmod 600 .env
-   ```
-
-3. Replace every `replace-with-*` value in `.env`. Generate secrets with:
+2. Replace every `replace-with-*` value in `.env`. Generate secrets with:
 
    ```bash
    openssl rand -hex 32
    ```
 
-4. Start the application and worker:
+3. Start the application and worker:
 
    ```bash
    ./deploy.sh --profile worker up -d --build
    ```
 
-5. Open `http://localhost:8060`.
+4. Open `http://localhost:8060`.
 
 FreshRSS is available on `http://localhost:8050` and Invidious on `http://localhost:8061`
 by default. All published ports bind to loopback unless changed in `.env`.
 
 ## Platform Notes
 
-The stack is the same everywhere — it is all containers. What differs is how you get a
-Docker daemon and a shell that can run `deploy.sh`.
+Everything runs in containers, so the stack itself is identical everywhere. Only the setup
+differs.
 
-### Linux
+**Linux.** Install Docker Engine and the Compose plugin, then add yourself to the `docker`
+group so you do not need `sudo`:
 
-Nothing special. Install Docker Engine and the Compose plugin from your distribution or
-from Docker's repository, then follow the quick start as written.
+```bash
+sudo usermod -aG docker $USER
+```
 
-Two things to know:
+Log out and back in for it to apply. On Fedora and RHEL, SELinux blocks containers from
+writing to `./data`; `sudo chcon -Rt svirt_sandbox_file_t ./data` fixes it.
 
-- **Add yourself to the `docker` group** (`sudo usermod -aG docker $USER`, then log out and
-  back in) or every command needs `sudo`. If you run `deploy.sh` under `sudo`, the files in
-  `./data` end up owned by root and the non-sudo run afterwards cannot read them.
-- **SELinux** (Fedora, RHEL, Rocky) blocks container access to bind-mounted directories.
-  If containers start but cannot write to `./data`, relabel it:
+**macOS.** Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) and
+give it at least 4 GB under Settings → Resources. The default is sometimes 2 GB, which is
+not enough for the whole stack and shows up as containers dying without explanation. Apple
+Silicon is fully supported.
 
-  ```bash
-  sudo chcon -Rt svirt_sandbox_file_t ./data
-  ```
-
-Rootless Docker works, but it cannot bind ports below 1024 — irrelevant here, since every
-published port is above 8000.
-
-### macOS
-
-Install [Docker Desktop](https://www.docker.com/products/docker-desktop/), or
-[Colima](https://github.com/abiosoft/colima) or [OrbStack](https://orbstack.dev/) if you
-prefer. Then follow the quick start as written.
-
-- **Give the VM enough memory.** Docker Desktop defaults to 2 GB on some versions, which
-  is not enough for Postgres, Redis, Invidious and the app together — containers get
-  OOM-killed with no obvious explanation. Settings → Resources → 4 GB or more.
-- **Apple Silicon is fine.** Every image in the stack has an `arm64` build, so nothing
-  falls back to emulation.
-- **Keep VirtioFS enabled** (Settings → General). It is the default on current versions and
-  makes bind-mounted volumes considerably faster than the older gRPC-FUSE.
-
-### Windows
-
-`deploy.sh` is a bash script and will not run in PowerShell or `cmd`. You have two options.
-
-**WSL2 (recommended.)** Install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-with the WSL2 backend, then run everything from inside your WSL2 distribution.
-
-**Clone into the Linux filesystem, not `/mnt/c`.** This is the one that bites people:
+**Windows.** Install Docker Desktop with the WSL2 backend and run everything from inside
+WSL2. Clone into the Linux home directory rather than `/mnt/c` — a clone on the Windows
+filesystem makes Postgres very slow and can stop containers starting at all:
 
 ```bash
 cd ~ && git clone https://github.com/S0nrxse/openFeed.git
 ```
 
-A clone under `/mnt/c/Users/...` puts every database write across the Windows/Linux
-filesystem boundary. Postgres becomes dramatically slower, and file permissions do not map
-cleanly, so containers can fail to start for reasons that look like a bug in the stack.
-
-From there the quick start works unchanged.
-
-**Git Bash (without WSL2).** `deploy.sh` runs, but Git Bash rewrites paths in a way that
-can confuse Docker. If a volume mount misbehaves, disable the conversion:
-
-```bash
-MSYS_NO_PATHCONV=1 ./deploy.sh --profile worker up -d --build
-```
-
-**Or skip the script.** It only assembles a `docker compose` invocation, so PowerShell can
-do the same thing directly:
+If you would rather not use WSL2, `deploy.sh` will not run in PowerShell, but the command
+it wraps does:
 
 ```powershell
 docker compose --env-file .env -f compose.yml --profile worker up -d --build
 ```
-
-Two Windows-specific notes:
-
-- **`chmod 600 .env` does nothing on NTFS.** Restrict it through file properties, or keep
-  the repository in the WSL2 filesystem where the permission is real.
-- **Line endings.** `.gitattributes` forces LF on shell scripts, so a fresh clone is
-  correct. If you have an older clone and `deploy.sh` fails with
-  `bad interpreter: /usr/bin/env bash^M`, re-normalise it:
-
-  ```bash
-  git config core.autocrlf false && git rm --cached -r . && git reset --hard
-  ```
 
 ## Configuration
 
