@@ -414,7 +414,7 @@ def _auth_error_page(title: str, detail: str, missing: list[str] | None = None, 
     missing_html = ""
     if missing:
         missing_html = "<ul>" + "".join(f"<li><code>{escape(item)}</code></li>" for item in missing) + "</ul>"
-    content = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{escape(title)} - OpenFeed</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f0f10;color:#f1f1f1;font-family:Inter,system-ui,sans-serif}}main{{width:min(560px,calc(100vw - 32px));border:1px solid rgba(255,255,255,.09);border-radius:18px;background:#181818;padding:24px}}h1{{margin:0 0 10px;font-size:24px}}p{{color:#a8a8a8;line-height:1.5}}code{{background:#242424;border-radius:6px;padding:2px 6px}}a{{color:#ff4d67}}</style></head><body><main><h1>{escape(title)}</h1><p>{escape(detail)}</p>{missing_html}<p><a href="/">Return to OpenFeed</a></p></main></body></html>'''
+    content = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{escape(title)} - OpenFeed</title>{_head_icons()}<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f0f10;color:#f1f1f1;font-family:Inter,system-ui,sans-serif}}main{{width:min(560px,calc(100vw - 32px));border:1px solid rgba(255,255,255,.09);border-radius:18px;background:#181818;padding:24px}}h1{{margin:0 0 10px;font-size:24px}}p{{color:#a8a8a8;line-height:1.5}}code{{background:#242424;border-radius:6px;padding:2px 6px}}a{{color:#ff4d67}}</style></head><body><main><h1>{escape(title)}</h1><p>{escape(detail)}</p>{missing_html}<p><a href="/">Return to OpenFeed</a></p></main></body></html>'''
     return Response(content, status_code=status_code, media_type="text/html; charset=utf-8")
 
 
@@ -892,6 +892,37 @@ def proxy_invidious(request: Request, upstream_path: str):
         # Only the response is closed — the pooled client is shared and stays open.
         background=BackgroundTask(upstream_response.close),
     )
+
+
+# The only static files the app serves. An explicit map rather than a directory mount:
+# the name from the URL never reaches the filesystem, so there is no path to traverse.
+_STATIC_ASSETS: dict[str, str] = {
+    "favicon-32.png": "image/png",
+    "apple-touch-icon.png": "image/png",
+}
+_ASSET_DIR = Path(__file__).parent / "assets"
+
+
+@app.get("/assets/{name}", include_in_schema=False)
+@app.head("/assets/{name}", include_in_schema=False)
+def static_asset(name: str) -> Response:
+    media_type = _STATIC_ASSETS.get(name)
+    if not media_type:
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        body = (_ASSET_DIR / name).read_bytes()
+    except OSError:
+        raise HTTPException(status_code=404, detail="Not found")
+    # Immutable in practice — the filenames change if the artwork does.
+    return Response(body, media_type=media_type, headers={"cache-control": "public, max-age=604800, immutable"})
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+@app.head("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    """Browsers ask for this path whatever the markup says, so answer it with the PNG
+    rather than letting every page load carry a 404."""
+    return static_asset("favicon-32.png")
 
 
 @app.get("/healthz")
@@ -7570,6 +7601,20 @@ def _app_sidebar(active: str, meta_html: str) -> str:
     '''
 
 
+def _head_icons() -> str:
+    """Favicon markup, in one place because there is more than one page template.
+
+    Adding the links to a single head is how tabs ended up iconless everywhere except one
+    route: the app shell, the standalone pages and the error page each build their own
+    <head>. The player iframes deliberately do not call this — nothing shows a favicon for
+    an embedded frame.
+    """
+    return (
+        '<link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png">'
+        '<link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png">'
+    )
+
+
 def _asset_preconnect() -> str:
     """Warm the TLS handshakes for thumbnails and the fallback player up front."""
     hints = ['<link rel="preconnect" href="https://i.ytimg.com" crossorigin>']
@@ -7591,6 +7636,7 @@ def _app_shell(title: str, active: str, content: str, search_value: str = "", ma
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>{escape(title)} - OpenFeed</title>
+        {_head_icons()}
         {_asset_preconnect()}
         <style>{_home_styles()}</style>
       </head>
@@ -8169,6 +8215,7 @@ def index(request: Request):
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>OpenFeed</title>
+        {_head_icons()}
         {_asset_preconnect()}
         <style>{_home_styles()}</style>
       </head>
