@@ -4,10 +4,7 @@ Thanks for your interest. Contributions are welcome, and the process is delibera
 simple: **fork, branch, open a pull request, and it gets reviewed before it merges.**
 
 OpenFeed is in **alpha** and has a single maintainer. Every pull request is reviewed by
-[@S0nrxse](https://github.com/S0nrxse) before merging — no exceptions, including for
-regular contributors. That is not a comment on anyone's work; it is how a one-person
-project keeps a coherent shape while it is still moving quickly. Expect review to take a
-few days.
+[@S0nrxse](https://github.com/S0nrxse) before merging(will most likely change in the future but for the moment I would like to decide the direction we take on the project). Expect review to take a few days.
 
 ## Before you write code
 
@@ -19,8 +16,8 @@ idea early.
 
 Things most likely to be turned down:
 
-- New third-party services that phone out by default. Every integration here is opt-in,
-  read-only and off until the user asks — see SponsorBlock and RYD for the pattern.
+- New third-party services that don't respect user privacy by default. Every integration apart of this app is opt-in,
+  read-only and automatically off until the user asks — see SponsorBlock and RYD for the pattern I've used.
 - Anything that writes to YouTube: posting, voting, commenting, or authenticated actions.
 - Telemetry, analytics, or crash reporting of any kind.
 - Large dependencies where a small amount of code would do.
@@ -61,24 +58,20 @@ A pull request needs all of these before it can merge:
 - **Tests pass.** `python -m unittest discover -s openfeed/tests` with no database and no
   network.
 - **New behaviour has a test.** Bug fixes should have one that fails without the fix.
-- **No secrets, credentials, LAN addresses, absolute paths, or personal data** — in the
-  diff or in the commit history.
-- **Focused scope.** One concern per pull request. Unrelated cleanups make review slow and
-  are usually where mistakes hide.
+- **Focused scope.** One concern per pull request. Unrelated cleanups make review slow and leads to even more mistakes
 
 Style follows the surrounding code rather than a linter. Comments should explain *why*
 something is the way it is, especially where the obvious approach was wrong — most of the
-comments in this codebase exist because something upstream behaved unexpectedly, and that
+comments in this codebase exist because something behaved unexpectedly, and that
 context is the valuable part.
 
 Maintainer review may ask for changes, and sometimes will decline a change that works.
-If that happens you are welcome to keep it in your fork; the AGPL guarantees you that.
+If that happens you are welcome to keep it in your fork ofc.
 
 ## Reporting bugs
 
 Include what you expected, what happened, and how to reproduce it. Relevant logs from
-`docker compose logs openfeed-app` help. Redact anything identifying before pasting —
-logs can contain video IDs, channel names and IP addresses.
+`docker compose logs openfeed-app` help.
 
 **Do not report security vulnerabilities in a public issue.** See [`SECURITY.md`](SECURITY.md).
 
@@ -91,8 +84,6 @@ Never commit:
 - database, cache, log, or backup files
 - credentials, private domains, LAN addresses, or absolute deployment paths
 - screenshots or media without redistribution rights
-
-Run a secret scanner before opening a pull request.
 
 ## Licensing of contributions
 
