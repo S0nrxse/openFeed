@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/S0nrxse/openFeed/blob/main/SECURITY.md
+    about: Do not open a public issue. Read the security policy for how to report privately.
+  - name: Deployment and setup questions
+    url: https://github.com/S0nrxse/openFeed/blob/main/README.md
+    about: The README covers configuration, optional profiles, and the quick start.
