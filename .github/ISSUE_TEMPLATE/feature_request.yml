@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest something OpenFeed should do
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Worth reading [CONTRIBUTING.md](https://github.com/S0nrxse/openFeed/blob/main/CONTRIBUTING.md)
+        first — it lists what is likely to be declined, so you do not spend time on
+        something that cannot be accepted.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve
+      description: The situation you are in, rather than the implementation you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints this respects
+      description: |
+        OpenFeed keeps third-party traffic opt-in and never writes to YouTube. A request
+        that breaks these is unlikely to be accepted — see CONTRIBUTING.
+      options:
+        - label: It does not send data to a third party unless the user opts in
+          required: false
+        - label: It does not require posting, voting, or authenticating to YouTube
+          required: false
+        - label: It does not add telemetry or analytics
+          required: false
+
+  - type: checkboxes
+    id: offer
+    attributes:
+      label: Are you offering to build it
+      options:
+        - label: I would like to open a pull request for this
+          required: false
