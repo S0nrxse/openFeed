@@ -165,7 +165,8 @@ Validate Compose configuration with:
 
 Contributions are welcome. Everything goes through a reviewed pull request — see
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow and what a change needs before it
-can be merged.
+can be merged, and [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for participation
+expectations.
 
 ## License
 

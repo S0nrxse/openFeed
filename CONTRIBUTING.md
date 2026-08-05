@@ -3,6 +3,8 @@
 Thanks for your interest. Contributions are welcome, and the process is deliberately
 simple: **fork, branch, open a pull request, and it gets reviewed before it merges.**
 
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 OpenFeed is in **alpha** and has a single maintainer. Every pull request is reviewed by
 [@S0nrxse](https://github.com/S0nrxse) before merging — no exceptions, including for
 regular contributors. That is not a comment on anyone's work; it is how a one-person
@@ -76,7 +78,9 @@ If that happens you are welcome to keep it in your fork; the AGPL guarantees you
 
 ## Reporting bugs
 
-Include what you expected, what happened, and how to reproduce it. Relevant logs from
+Use the [bug report template](.github/ISSUE_TEMPLATE/bug_report.yml), which asks for what
+is actually needed to act on a report. Include what you expected, what happened, and how
+to reproduce it. Relevant logs from
 `docker compose logs openfeed-app` help. Redact anything identifying before pasting —
 logs can contain video IDs, channel names and IP addresses.
 

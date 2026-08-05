@@ -2,7 +2,19 @@
 
 ## Reporting
 
-Do not disclose suspected vulnerabilities in a public issue. Contact the repository owner privately with reproduction steps, affected versions, and potential impact.
+**Do not disclose suspected vulnerabilities in a public issue.**
+
+Use GitHub's [private vulnerability reporting](https://github.com/S0nrxse/openFeed/security/advisories/new)
+for the repository. That keeps the report private until a fix exists and gives it a
+tracked advisory. If it is unavailable, contact the maintainer privately through GitHub
+instead.
+
+Include reproduction steps, the version or commit affected, and the impact you believe it
+has. Redact anything identifying — reproduction steps for this project tend to contain
+hostnames, IP addresses and account details from your own deployment.
+
+Expect an initial response within a week. This is a single-maintainer alpha project, so
+there is no formal SLA beyond that.
 
 ## Deployment Guidance
 
