@@ -72,6 +72,17 @@ A token may be marked **read-only**, in which case it is refused any method othe
 GET/HEAD/OPTIONS. Token management itself always requires a signed-in session, so a
 leaked token cannot renew itself.
 
+Valid tokens delegate app access from their authorized browser issuer, even when an
+access group is configured. They act as the issuer's `user_key`, not a caller-supplied
+identity. New tokens snapshot the issuer's admin capability on the server; request
+headers and JSON cannot supply that claim. Existing tokens remain non-admin. Only
+admin-delegated tokens can read `/api/status/full` and `/api/sync/runs`; read-only
+restrictions still apply, and even admin tokens cannot list, mint, or revoke tokens.
+`GET /api/` reports `is_admin` and `read_only` for the current credential. Delegation
+lasts until revocation; changes to the issuer's groups do not update existing tokens.
+Invalid or revoked bearer credentials return 401 on the API and `/healthz`, even if
+a browser session is also present. Anonymous `/healthz` checks remain public.
+
 ## Conventions
 
 * Mutations answer `{"ok": true, ...}`; collections answer `{"items": [...]}`.
@@ -197,8 +208,8 @@ def _user_from_token(request: Request | None) -> dict[str, Any] | None:
     """Resolve an Authorization bearer token to a user, or None if there isn't a valid one.
 
     Checked before the session cookie so a script can authenticate without one. A revoked
-    or unknown token simply falls through to the normal session path rather than erroring,
-    which keeps a stale token from locking a browser out of the UI.
+    or unknown token falls through to the normal session path for browser pages. The API
+    middleware refuses invalid presented credentials, including on public health checks.
     """
     if request is None:
         return None
@@ -210,7 +221,7 @@ def _user_from_token(request: Request | None) -> dict[str, Any] | None:
         record = db.find_api_token(prefix)
     except Exception:
         return None
-    if not record or not tokens.matches(presented, record.get("token_hash", "")):
+    if not record or record.get("revoked_at") or not tokens.matches(presented, record.get("token_hash", "")):
         return None
     try:
         db.touch_api_token(record["id"])
@@ -227,6 +238,7 @@ def _user_from_token(request: Request | None) -> dict[str, Any] | None:
         "groups": [],
         "via_token": True,
         "token_read_only": bool(record.get("read_only")),
+        "token_delegated_admin": record.get("delegated_admin") is True,
     }
 
 
@@ -249,6 +261,10 @@ def _auth_groups(user: dict[str, Any]) -> set[str]:
 
 
 def _user_has_required_access(user: dict[str, Any]) -> bool:
+    # A verified token delegates its authorized issuer's app access, not IdP groups.
+    # This also keeps tokens issued before delegation metadata was added usable.
+    if user.get("authenticated") and user.get("via_token"):
+        return True
     settings = get_settings()
     required_group = settings.required_group.strip()
     if not required_group:
@@ -269,12 +285,16 @@ def _access_denied_response() -> Response:
 
 
 def _user_is_admin(user: dict[str, Any]) -> bool:
-    """Admin gating needs both a login to identify people and a group to check against.
+    """Browser admin gating needs a login and a group; tokens use persisted delegation.
 
-    With either missing there is no identity to test, so everyone counts as admin -
+    With either missing there is no identity to test, so browsers count as admin -
     that keeps single-user installs working instead of locking the owner out of their
     own status page.
     """
+    # Tokens never inherit the single-user fallback or fabricated groups. Only the
+    # server-derived capability saved at mint time can delegate administrator access.
+    if user.get("via_token"):
+        return bool(user.get("authenticated") and user.get("token_delegated_admin") is True)
     settings = get_settings()
     if not settings.require_login or not settings.admin_groups:
         return True
@@ -290,16 +310,22 @@ async def enforce_api_access(request: Request, call_next):
     leaving the API - including the subscribe and unsubscribe routes - open to anyone
     who could reach the port. Enforcing it here means a new route cannot forget to.
 
-    Static assets, /healthz and the /auth handshake sit outside these prefixes and are
-    untouched; the Invidious proxies under /api/v1 keep their own guard as well.
+    Static assets and the /auth handshake sit outside these prefixes. Anonymous health
+    checks remain public, but explicitly presented invalid credentials fail closed.
+    The Invidious proxies under /api/v1 keep their own guard as well.
     """
     path = request.url.path
-    if not path.startswith(("/api/", "/admin/")):
+    if path != "/healthz" and not path.startswith(("/api/", "/admin/")):
         return await call_next(request)
 
     settings = get_settings()
     user = _current_user(request)
     wants_json = path.startswith("/api/")
+
+    if tokens.bearer_from_header(request.headers.get("authorization")) and not user.get("via_token"):
+        return JSONResponse({"detail": "invalid_token"}, status_code=status.HTTP_401_UNAUTHORIZED)
+    if path == "/healthz":
+        return await call_next(request)
 
     if settings.require_login and not user.get("authenticated"):
         if wants_json:
@@ -324,6 +350,8 @@ async def enforce_api_access(request: Request, call_next):
             {"detail": "session_required", "message": "API tokens can only be managed from a signed-in session."},
             status_code=status.HTTP_403_FORBIDDEN,
         )
+    if path.startswith("/api/tokens") and not user.get("authenticated"):
+        return JSONResponse({"detail": "session_required"}, status_code=status.HTTP_401_UNAUTHORIZED)
     if path.startswith("/admin/") and not _user_is_admin(user):
         return _access_denied_response()
     if path in {"/api/status/full", "/api/sync/runs"} and not _user_is_admin(user):
@@ -561,7 +589,7 @@ class ChannelNotificationRequest(BaseModel):
 
 class ApiTokenRequest(BaseModel):
     name: str = "API token"
-    # A read-only token can call GET/HEAD only, enforced in the access middleware.
+    # A read-only token can call GET/HEAD/OPTIONS only, enforced in the access middleware.
     read_only: bool = False
 
 
@@ -11157,6 +11185,19 @@ def api_add_subscription_collection_member(request: Request, collection_id: str,
     return {"ok": True, "item": _json_ready_value(item)}
 
 
+@app.delete("/api/subscription-collections/{collection_id}/members", tags=["subscriptions"], summary="Remove a collection member")
+def api_remove_subscription_collection_member_body(
+    request: Request, collection_id: str, payload: SubscriptionCollectionMemberRequest,
+) -> dict[str, Any]:
+    """Remove a member of the caller's collection using its exact FreshRSS identifier.
+
+    Send JSON `{"subscription_id": "feed/4"}`; no URL encoding is needed. Returns
+    `{"ok": true}`, or 404 when the member is absent or the collection belongs to
+    another user. The path-based endpoint remains available as a compatibility alias.
+    """
+    return api_remove_subscription_collection_member(request, collection_id, payload.subscription_id)
+
+
 @app.delete("/api/subscription-collections/{collection_id}/members/{subscription_id:path}")
 def api_remove_subscription_collection_member(request: Request, collection_id: str, subscription_id: str) -> dict[str, Any]:
     # FreshRSS subscription ids contain a slash ("feed/4"), so this segment must be a path param.
@@ -11380,14 +11421,22 @@ def _download_filename(title: str, video_id: str, extension: str = "mp4") -> str
 
 @app.get("/api/download/jobs", tags=["downloads"], summary="List download jobs")
 def api_list_download_jobs(request: Request) -> dict[str, Any]:
-    """Every download job this process knows about, running or finished.
+    """The caller's download jobs, running or finished.
 
     Declared above /api/download/{youtube_video_id} on purpose: routes match in
     declaration order, so the parameterised one would otherwise capture "jobs" as a
     video id and answer 502.
     """
-    _user_key(request)
-    return {"ok": True, "items": [job.public() for job in downloads.manager.list_jobs()]}
+    user_key = _user_key(request)
+    # list_jobs returns internal DownloadJob objects; public() intentionally omits
+    # ownership. Filter before projecting, and never attribute ownerless jobs to local.
+    return {
+        "ok": True,
+        "items": [
+            job.public() for job in downloads.manager.list_jobs()
+            if getattr(job, "user_key", None) == user_key
+        ],
+    }
 
 
 @app.get("/api/download/{youtube_video_id}")
@@ -11574,15 +11623,22 @@ def api_start_download_job(request: Request, youtube_video_id: str, payload: Dow
     return {"ok": True, "job": job.public()}
 
 
+def _owned_download_job(job_id: str, user_key: str) -> downloads.DownloadJob:
+    job = downloads.manager.get(job_id)
+    # Ownerless legacy jobs cannot be attributed safely, even in local mode. Jobs
+    # explicitly owned by "local" still work for the single-user browser installation.
+    if not job or getattr(job, "user_key", None) != user_key:
+        raise HTTPException(status_code=404, detail="No such download job")
+    return job
+
+
 @app.get("/api/download/jobs/{job_id}")
 def api_download_job(request: Request, job_id: str) -> dict[str, Any]:
     """Progress for one download job."""
     auth_redirect = _login_required_redirect(request)
     if auth_redirect:
         raise HTTPException(status_code=401, detail="Login required")
-    job = downloads.manager.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="No such download job")
+    job = _owned_download_job(job_id, _user_key(request))
     return {"ok": True, "job": job.public()}
 
 
@@ -11591,8 +11647,7 @@ def api_cancel_download_job(request: Request, job_id: str) -> dict[str, Any]:
     auth_redirect = _login_required_redirect(request)
     if auth_redirect:
         raise HTTPException(status_code=401, detail="Login required")
-    if not downloads.manager.get(job_id):
-        raise HTTPException(status_code=404, detail="No such download job")
+    _owned_download_job(job_id, _user_key(request))
     return {"ok": True, "cancelled": downloads.manager.cancel(job_id)}
 
 
@@ -11602,9 +11657,7 @@ def api_download_job_file(request: Request, job_id: str):
     auth_redirect = _login_required_redirect(request)
     if auth_redirect:
         return auth_redirect
-    job = downloads.manager.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="No such download job")
+    job = _owned_download_job(job_id, _user_key(request))
     if job.status != "done":
         raise HTTPException(status_code=409, detail=f"Download is {job.status}, not finished")
     path = downloads.resolve_completed_path(job)
@@ -11711,10 +11764,7 @@ def api_delete_download(request: Request, youtube_video_id: str) -> dict[str, An
         raise HTTPException(status_code=404, detail="Not downloaded")
     path = _download_file_path(record)
     if path:
-        try:
-            path.unlink()
-        except OSError as exc:
-            logger.warning("could not delete %s: %s", path, exc)
+        downloads.unlink_unreferenced_download(path)
     return {"ok": True, "youtube_video_id": youtube_video_id}
 
 
@@ -11742,6 +11792,7 @@ def api_index(request: Request) -> dict[str, Any]:
         "authenticated": bool(user.get("authenticated")),
         "via_token": bool(user.get("via_token")),
         "read_only": bool(user.get("token_read_only")),
+        "is_admin": _user_is_admin(user),
         "user_key": str(user.get("user_key") or "local"),
         "documentation": {"swagger": "/docs", "redoc": "/redoc", "openapi": "/openapi.json"},
         "capabilities": {
@@ -11844,10 +11895,16 @@ def api_list_tokens(request: Request, include_revoked: bool = False) -> dict[str
 
 @app.post("/api/tokens", tags=["tokens"], summary="Create an API token", status_code=201)
 def api_create_token(request: Request, payload: ApiTokenRequest) -> dict[str, Any]:
-    """Mint a token. The plaintext is returned **once** and cannot be retrieved again."""
+    """Mint a token with the browser issuer's admin capability snapshotted server-side.
+
+    The plaintext is returned **once** and cannot be retrieved again.
+    """
     user_key = _user_key(request)
     plaintext, prefix, token_hash = tokens.generate()
-    row = db.create_api_token(payload.name, prefix, token_hash, payload.read_only, user_key)
+    row = db.create_api_token(
+        payload.name, prefix, token_hash, payload.read_only, user_key,
+        delegated_admin=_user_is_admin(_current_user(request)),
+    )
     return {
         "ok": True,
         "token": plaintext,

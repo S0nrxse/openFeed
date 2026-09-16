@@ -56,6 +56,41 @@ Authentication is disabled by default. To enable Authentik OIDC, configure the `
 
 Persistent files are stored under `OPENFEED_DATA_DIR`, which defaults to `./data`.
 
+### API Authentication
+
+Sign in with an account authorized to use OpenFeed, then create an API token in
+Settings or through `POST /api/tokens` using that browser session. Send the one-time
+plaintext credential as `Authorization: Bearer ofd_...`. Only its hash is stored.
+For actor-owned integrations, issue a separate credential from each actor's browser
+session and store it in that actor's credential store. The API uses the issuer's
+`user_key`; headers and request payloads cannot choose another token owner or add
+group/admin claims.
+
+- Every valid, unrevoked token delegates ordinary app access, including when
+  `OPENFEED_REQUIRED_GROUP` is configured. Existing tokens work without group metadata.
+- New tokens snapshot the browser issuer's admin capability into a server-derived
+  `delegated_admin` boolean. Existing tokens default to `false` and gain no admin
+  privileges. Only tokens with this persisted claim can access the admin-only
+  `GET /api/status/full` and `GET /api/sync/runs` endpoints.
+- Read-only tokens permit only GET/HEAD/OPTIONS. This restriction applies globally
+  before API mutation handlers, including for admin-delegated tokens.
+- Listing, creating, and revoking tokens require an authorized, authenticated browser
+  session. Bearer tokens cannot manage credentials, even with admin delegation.
+- Delegation is a snapshot, not a live IdP group lookup. Revoke a token to withdraw
+  its access; revoke and reissue to change its delegated capabilities.
+- Invalid or revoked bearer credentials receive 401 on the API and `/healthz`, even
+  alongside a valid browser cookie. Health checks without credentials remain public.
+
+Use `GET /api/` to verify `authenticated`, `via_token`, `user_key`, `read_only`, and
+`is_admin` and discover the API. Route documentation is available at `/docs`,
+`/redoc`, and `/openapi.json`.
+
+On startup, `db.init_db()` applies the idempotent token migration:
+`ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS delegated_admin BOOLEAN NOT NULL DEFAULT false`.
+It applies to new and existing databases and preserves token hashes, ownership,
+read-only flags, and revocations. No credential rotation is needed for ordinary
+access; delegated admin access requires a newly issued token from an admin session.
+
 ### Local Overrides
 
 `deploy.sh` automatically loads an ignored `compose.local.yml` when present. Use it for host-specific reverse-proxy networks, container names, network aliases, or other settings that do not belong in the public repository.

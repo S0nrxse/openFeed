@@ -76,6 +76,7 @@ def init_db() -> None:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(schema)
+            _ensure_api_token_schema(cur)
         conn.commit()
 
 
@@ -1015,16 +1016,29 @@ def takeout_watched_ids(user_key: str = "local") -> set[str]:
             return {str(row["youtube_video_id"]) for row in cur.fetchall()}
 
 
-def create_api_token(name: str, token_prefix: str, token_hash: str, read_only: bool = False, user_key: str = "local") -> dict[str, Any]:
+def _ensure_api_token_schema(cur: psycopg.Cursor[Any]) -> None:
+    """Apply the token migration at startup, for both new and existing databases.
+
+    Legacy credentials delegate ordinary app access only. Never infer their issuer's
+    admin status retroactively from an identity or from current deployment settings.
+    """
+    cur.execute("ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS delegated_admin BOOLEAN NOT NULL DEFAULT false")
+
+
+def create_api_token(
+    name: str, token_prefix: str, token_hash: str, read_only: bool = False,
+    user_key: str = "local", delegated_admin: bool = False,
+) -> dict[str, Any]:
+    """Persist a token; delegated_admin must come from the authenticated browser issuer."""
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO api_tokens (user_key, name, token_prefix, token_hash, read_only)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO api_tokens (user_key, name, token_prefix, token_hash, read_only, delegated_admin)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
-                (user_key, name.strip() or "API token", token_prefix, token_hash, read_only),
+                (user_key, name.strip() or "API token", token_prefix, token_hash, read_only, delegated_admin),
             )
             row = cur.fetchone()
         conn.commit()
@@ -1168,7 +1182,7 @@ def get_download(youtube_video_id: str, user_key: str = "local") -> dict[str, An
 
 
 def delete_download(youtube_video_id: str, user_key: str = "local") -> dict[str, Any] | None:
-    """Drop the record and hand back the path so the caller can remove the file."""
+    """Drop only this owner's record; file cleanup must check remaining references."""
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1178,6 +1192,21 @@ def delete_download(youtube_video_id: str, user_key: str = "local") -> dict[str,
             row = cur.fetchone()
         conn.commit()
     return dict(row) if row else None
+
+
+@contextmanager
+def locked_download_paths() -> Iterator[list[str]]:
+    """All library file references, stable until the caller finishes filesystem cleanup.
+
+    SHARE blocks INSERT/UPDATE/DELETE (including register_download's upsert) while
+    permitting ordinary reads. Include every owner and video, not just the deleted
+    video's rows. Filesystem callers compare canonical paths to cover legacy aliases.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("LOCK TABLE downloads IN SHARE MODE")
+            cur.execute("SELECT DISTINCT path FROM downloads")
+            yield [row["path"] for row in cur.fetchall()]
 
 
 def video_dislike_state(youtube_video_id: str) -> dict[str, Any]:

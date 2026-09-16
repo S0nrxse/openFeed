@@ -255,17 +255,10 @@ class DownloadManager:
             extension = path.suffix.lstrip(".") or job.container
             job.filename = safe_filename(job.title or job.youtube_video_id, job.youtube_video_id, extension)
 
-            if job.destination == "server":
-                # A kept download is named after the video rather than the job id, so the
-                # downloads folder is browsable outside this app and survives a restart
-                # that would otherwise leave orphaned `<token>.mp4` files behind.
-                final = directory / job.filename
-                if final != path:
-                    try:
-                        path.replace(final)
-                        path = final
-                    except OSError as exc:
-                        logger.warning("could not rename %s to %s: %s", path, final, exc)
+            # Keep the job-unique storage path for retained downloads too. A friendly
+            # title/video filename is shared by different owners (and repeat jobs),
+            # so renaming to it would overwrite another library copy. job.filename
+            # remains the friendly Content-Disposition name, independent of storage.
             job.path = str(path)
             job.total_bytes = path.stat().st_size
             job.downloaded_bytes = job.total_bytes
@@ -310,6 +303,11 @@ class DownloadManager:
         if not directory.exists():
             return
         for path in directory.glob(f"{job.id}.*"):
+            if job.destination == "server":
+                # Registration may have committed before its connection failed. Never
+                # discard a possibly registered library file on an ambiguous failure.
+                unlink_unreferenced_download(path)
+                continue
             try:
                 path.unlink()
             except OSError:
@@ -349,6 +347,28 @@ class DownloadManager:
 
 
 manager = DownloadManager()
+
+
+def unlink_unreferenced_download(path: Path) -> bool:
+    """Unlink only after proving no library row references this file.
+
+    Includes other owners and legacy path aliases. The database lock remains held
+    through unlink so a concurrent library mutation cannot change the reference set.
+    Uncertain cleanup leaves an orphan rather than destroying a library copy.
+    """
+    from . import db
+
+    try:
+        with db.locked_download_paths() as references:
+            resolved = path.resolve()
+            for reference in references:
+                if not reference or Path(reference).resolve() == resolved:
+                    return False
+            path.unlink()
+        return True
+    except Exception as exc:  # noqa: BLE001 - DB or filesystem uncertainty must retain the file
+        logger.warning("retaining download file %s: could not prove safe cleanup: %s", path, exc)
+        return False
 
 
 def disk_usage() -> dict[str, Any]:
