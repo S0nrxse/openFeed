@@ -1,0 +1,76 @@
+name: Bug report
+description: Something does not work the way it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        OpenFeed is in alpha, so thank you for taking the time to write this up properly.
+
+        **Do not report security vulnerabilities here.** See
+        [SECURITY.md](https://github.com/S0nrxse/openFeed/blob/main/SECURITY.md).
+
+        Redact before pasting: logs can contain video IDs, channel names, IP addresses and
+        hostnames from your own network.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      placeholder: |
+        1. Open ...
+        2. Click ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of the app
+      options:
+        - Feed / recommendations
+        - Playback
+        - Downloads
+        - Watch page (comments, description, actions)
+        - Channels / subscriptions
+        - Search
+        - Takeout import
+        - SponsorBlock / RYD / community posts
+        - Settings
+        - Deployment / containers
+        - Something else
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The value in `app/openfeed/__init__.py`, or the commit you are running.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        From `docker compose logs openfeed-app` or `openfeed-worker`. Redact first.
+      render: text
+
+  - type: checkboxes
+    id: playback-check
+    attributes:
+      label: If this is a playback problem
+      options:
+        - label: I ran `/api/playback/diagnose` and included what it reported
+          required: false

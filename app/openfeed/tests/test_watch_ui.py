@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -490,12 +491,63 @@ class StatusPageTests(unittest.TestCase):
         import inspect
 
         # It was a sidebar entry pointing at a standalone page; it is a Settings pane.
+        from openfeed.tests.support import offline_db
+
         self.assertIn("RedirectResponse", inspect.getsource(main.admin_status))
-        self.assertIn('data-settings-pane="status"', main._settings_dialog(user={"authenticated": False}))
+        with offline_db():
+            self.assertIn('data-settings-pane="status"', main._settings_dialog(user={"authenticated": False}))
 
     def test_the_status_body_still_renders(self) -> None:
-        self.assertIn("Service health", main._status_page_html("local"))
+        from openfeed.tests.support import offline_db
+
+        with offline_db():
+            self.assertIn("Service health", main._status_page_html("local"))
 
     def test_status_tables_scroll_in_their_own_box(self) -> None:
         # A long error message must not be able to widen the whole page.
         self.assertIn(".status-scroll { overflow-x: auto;", main._home_styles())
+
+
+class FaviconTests(unittest.TestCase):
+    """The app served no icon at all, so every tab was blank."""
+
+    def test_the_asset_map_is_explicit_rather_than_a_directory(self) -> None:
+        # A directory mount would put a URL-supplied name on the filesystem. This maps
+        # names to media types, so there is nothing to traverse.
+        self.assertIn("favicon-32.png", main._STATIC_ASSETS)
+        self.assertIn("apple-touch-icon.png", main._STATIC_ASSETS)
+
+    def test_an_unknown_name_is_a_404_not_a_file_read(self) -> None:
+        from fastapi import HTTPException
+
+        for name in ("../config.py", "../../etc/passwd", "nope.png"):
+            with self.assertRaises(HTTPException) as caught:
+                main.static_asset(name)
+            self.assertEqual(caught.exception.status_code, 404)
+
+    def test_the_icons_ship_inside_the_package(self) -> None:
+        # The Dockerfile copies only `openfeed`, so an asset outside it would 404 in the
+        # container while working fine from a source checkout.
+        for name in main._STATIC_ASSETS:
+            self.assertTrue((main._ASSET_DIR / name).is_file(), f"{name} missing from the package")
+
+    def test_favicon_ico_is_answered(self) -> None:
+        # Browsers request /favicon.ico regardless of the markup.
+        self.assertEqual(main.favicon().status_code, 200)
+
+    def test_every_page_template_gets_the_icon(self) -> None:
+        # Adding the markup to one head is how tabs stayed blank everywhere else: the app
+        # shell, the standalone pages and the error page each build their own <head>.
+        import re
+
+        source = inspect.getsource(main)
+        heads = len(re.findall(r"<head>", source)) + source.count("<head><meta charset")
+        icons = source.count("_head_icons()")
+        # One definition plus one call per user-facing template; the player iframes are
+        # deliberately excluded, so calls must be fewer than heads but more than one.
+        self.assertGreater(icons, 2, "not every page template calls _head_icons()")
+        self.assertLess(icons, heads + 2)
+
+    def test_the_player_iframe_does_not_carry_one(self) -> None:
+        # Nothing displays a favicon for an embedded frame.
+        self.assertNotIn("_head_icons", inspect.getsource(main.watch_player))

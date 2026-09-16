@@ -79,10 +79,6 @@ class EnrichmentIsAuthoritativeTests(unittest.TestCase):
         self.assertNotIn("published_at = COALESCE(published_at, to_timestamp", source)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class DecodedDateDetectionTests(unittest.TestCase):
     """A decoded date carries the wall-clock of the fetch; a real one is midnight UTC."""
 
@@ -151,3 +147,66 @@ class ContinuousRepairTests(unittest.TestCase):
             result = enrichment.verify_publish_dates(1)
         self.assertEqual(result["corrected"], 0)
         self.assertEqual(result["candidates"], 1)
+
+
+class TestSuitePortabilityTests(unittest.TestCase):
+    """The suite has to run from a fresh clone, using the command the docs give."""
+
+    def test_the_offline_helper_is_imported_absolutely(self) -> None:
+        # A relative import of the helper only resolves when discovery is rooted at the
+        # package (-t /). The README and CONTRIBUTING both document the plain
+        # `discover -s openfeed/tests`, where tests load as top-level modules and it
+        # raises ImportError. An absolute import works under both.
+        #
+        # Assembled rather than written out, so this file does not match itself.
+        from pathlib import Path
+
+        needle = "from ." + "support import"
+        for path in Path(__file__).parent.glob("test_*.py"):
+            self.assertNotIn(
+                needle,
+                path.read_text(),
+                f"{path.name} uses a relative import that breaks the documented test command",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class DatePrecedenceTests(unittest.TestCase):
+    """Who is allowed to overwrite a stored publish date, and who only fills gaps."""
+
+    def _sql(self, fn) -> str:
+        import inspect
+
+        return inspect.getsource(fn)
+
+    def test_discovery_never_overwrites_a_stored_date(self) -> None:
+        # Discovery reads list endpoints, where the date is decoded from relative text.
+        # Letting it win meant a subscription backfill silently undid a completed repair,
+        # rewriting thousands of corrected rows with approximations.
+        from openfeed import db
+
+        sql = self._sql(db.upsert_discovered_video)
+        self.assertIn("published_at = COALESCE(videos.published_at, EXCLUDED.published_at)", sql)
+        self.assertNotIn("published_at = COALESCE(EXCLUDED.published_at, videos.published_at)", sql)
+
+    def test_enrichment_does_overwrite(self) -> None:
+        # The opposite rule, for the opposite reason: this one reads the single-video
+        # endpoint, the only route that reports a real timestamp.
+        from openfeed import db
+
+        self.assertIn(
+            "published_at = COALESCE(to_timestamp(NULLIF(%s, 0)), published_at)",
+            self._sql(db.update_video_metadata),
+        )
+
+    def test_the_two_rules_point_opposite_ways_on_purpose(self) -> None:
+        # If these ever match, one of them is wrong: a fill-only enrichment cannot correct
+        # anything, and an overwriting discovery undoes every correction.
+        from openfeed import db
+
+        discovery = "COALESCE(videos.published_at, EXCLUDED.published_at)" in self._sql(db.upsert_discovered_video)
+        enrichment = "COALESCE(to_timestamp(NULLIF(%s, 0)), published_at)" in self._sql(db.update_video_metadata)
+        self.assertTrue(discovery and enrichment)

@@ -1,58 +1,194 @@
-# OpenFeed
+<p align="center">
+  <img src="assets/openfeed-logo.png" width="120" alt="OpenFeed">
+</p>
 
-OpenFeed is a self-hosted private video feed and library. It combines FreshRSS subscriptions, Invidious playback and metadata, PostgreSQL persistence, Redis, and Gorse recommendations behind a FastAPI application.
+<h1 align="center">OpenFeed</h1>
+
+OpenFeed is a privacy-focused self-hosted YouTube front end. It builds a personalised feed from your own
+subscriptions and watch history, plays videos through a local Invidious instance, and
+keeps every piece of your watch data on your computer.
+
+> **Alpha.** This project is early and under active development. Expect bugs, expect
+> rough edges, and expect things to change as features land. Back up `OPENFEED_DATA_DIR`
+> before upgrading, and do not treat an OpenFeed instance as the only copy of anything.
+
+## Inspiration
+
+The interface and the idea come from Juxtopposed's
+[**I Redesigned the ENTIRE YouTube UI from Scratch**](https://youtu.be/OUM6XmhViN4).
+OpenFeed is an independent implementation of that idea rather than anything affiliated
+with, endorsed by, or derived from the video's author.
 
 ## Features
 
-- Personalized and subscription-based video feeds, with recommendations and
-  subscriptions blended together and rotating "catch up" shelves
-- A separate shorts shelf and player
+### Library and account
+
 - Search, channels, playlists, collections, likes, and watch history
-- Watch page with theater mode, like and dislike counts, threaded comment
-  replies, and downloads
-- FreshRSS synchronization
-- Invidious-backed playback and discovery, with a configurable fallback ladder,
-  per-source health tracking, and a diagnostic that names the failing hop
-- Gorse recommendation signals
-- Optional Authentik OIDC login and group-based access
+- Channel pages with tabs, filters, links and community posts
+- FreshRSS synchronisation for subscriptions
+- Optional Authentik OIDC login with group-based access
 - Responsive desktop and mobile interface
+
+### Feed and recommendations
+
+- Content-based ranking built from a TF-IDF topic profile of what you actually watch,
+  with exponential recency decay so interests from years ago stop outweighing current ones
+- Watch time as a ranking signal, not just clicks
+- Candidate acquisition from varied channels, trending and topic seeds — the feed can
+  surface channels you have never subscribed to
+- Feed customisation with per-signal controls and real measured coverage
+- Google Takeout import for watch history *and* subscriptions, with the library
+  backfilled from the channels it finds
+- Offline evaluation harness (recall@k, MRR, nDCG) for measuring ranking changes
+
+### Watching
+
+- Watch page with theater mode, resume position, chapters and a YouTube-style action row
+- Threaded comments with timestamps, creator hearts, and highlighted creator replies
+- Shorts shelf and dedicated player
+- Downloads at full quality via yt-dlp and FFmpeg, with a resolution picker and
+  progress tracking
+
+### Playback reliability
+
+- Invidious as the primary backend, with a configurable fallback ladder and per-source
+  health tracking
+- yt-dlp as a fallback media backend for streams Invidious cannot produce
+- A diagnostic endpoint that walks Invidious → player → manifest → media segment and
+  names the first broken hop
+
+### Optional integrations
+
+Each is **off by default**, read-only, server-side, and contains a privacy note in
+Settings. Nothing is enabled without you asking for it -- making you, the user aware of the consequences of 3rd party software.
+
+- **SponsorBlock** — segment skipping with timeline markers and per-category actions.
+  Looked up by a 4-character hash prefix, so the SponsorBlock server never learns which
+  video you asked about.
+- **Return YouTube Dislike** — dislike counts. Your own likes and dislikes stay local and
+  are never submitted.
+- **Community posts and polls** — read-only. Poll voting is simulated locally and
+  labelled as such, because YouTube publishes no per-option breakdown.
+
+## Installation
+
+### 1. Get the code
+
+```bash
+git clone https://github.com/S0nrxse/openFeed.git && cd openFeed
+```
+
+### 2. Configure
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and replace every `replace-with-*` placeholder. Any random string works:
+
+```bash
+openssl rand -hex 32
+```
+
+### 3. Start
+
+```bash
+./deploy.sh --profile worker up -d --build
+```
+
+The first run builds the app image and pulls roughly 700 MB of containers, so give it a
+few minutes. Later starts take seconds.
+
+### 4. Open it
+
+| Service | URL | What it is |
+| --- | --- | --- |
+| **OpenFeed** | http://localhost:8060 | The app |
+| FreshRSS | http://localhost:8050 | Subscription sync |
+| Invidious | http://localhost:8061 | Playback and metadata backend |
+
+All ports bind to `127.0.0.1` unless you change them in `.env`, so nothing is reachable
+from outside the machine by default.
+
+## Managing the Stack
+
+`deploy.sh` passes everything through to `docker compose`, so any Compose command works:
+
+```bash
+./deploy.sh logs -f openfeed-app     # follow the app log
+```
+
+```bash
+./deploy.sh ps                       # what is running
+```
+
+```bash
+./deploy.sh restart openfeed-app     # restart one service
+```
+
+```bash
+./deploy.sh down                     # stop everything
+```
+
+To update to the latest code:
+
+```bash
+git pull && ./deploy.sh --profile worker up -d --build
+```
+
+`openfeed-app` and `openfeed-worker` share one image, so a rebuild has to recreate both —
+the command above does.
 
 ## Requirements
 
-- Docker Engine
-- Docker Compose v2
-- Linux, macOS, or another Docker-capable host
+- Docker Compose v2 (bundled with Docker Desktop, or the `docker-compose-plugin` package)
+- Roughly 4 GB of RAM for the full stack, and disk for whatever you download
+- Linux, macOS, or Windows with WSL2
 
-## Quick Start
+## Platform Notes
 
-1. Create your local environment:
+Everything runs in containers, so the stack itself is identical everywhere. Only the setup
+differs.
 
-   ```bash
-   cp .env.example .env
-   chmod 600 .env
-   ```
+**Linux.** Install Docker Engine and the Compose plugin, then add yourself to the `docker`
+group so you do not need `sudo`:
 
-2. Replace every `replace-with-*` value in `.env`. Generate secrets with a command such as:
+```bash
+sudo usermod -aG docker $USER
+```
 
-   ```bash
-   openssl rand -hex 32
-   ```
+Log out and back in for it to apply. On Fedora and RHEL, SELinux blocks containers from
+writing to `./data`; `sudo chcon -Rt svirt_sandbox_file_t ./data` fixes it.
 
-3. Start the application and worker:
+**macOS.** Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) and
+give it at least 4 GB under Settings → Resources. The default is sometimes 2 GB, which is
+not enough for the whole stack and shows up as containers dying without explanation. Apple
+Silicon is fully supported.
 
-   ```bash
-   ./deploy.sh --profile worker up -d --build
-   ```
+**Windows.** Install Docker Desktop with the WSL2 backend and run everything from inside
+WSL2. Clone into the Linux home directory rather than `/mnt/c` — a clone on the Windows
+filesystem makes Postgres very slow and can stop containers starting at all:
 
-4. Open `http://localhost:8060`.
+```bash
+cd ~ && git clone https://github.com/S0nrxse/openFeed.git
+```
 
-FreshRSS is available on `http://localhost:8050` and Invidious on `http://localhost:8061` by default. All published ports bind to loopback unless changed in `.env`.
+If you would rather not use WSL2, `deploy.sh` will not run in PowerShell, but the command
+it wraps does:
+
+```powershell
+docker compose --env-file .env -f compose.yml --profile worker up -d --build
+```
 
 ## Configuration
 
-`.env.example` documents the supported settings. `.env` is ignored by Git and must never be committed.
+`.env.example` documents the supported settings. `.env` is ignored by Git and must never
+be committed.
 
-Authentication is disabled by default. To enable Authentik OIDC, configure the `OPENFEED_OIDC_*` values, set `OPENFEED_AUTH_MODE=authentik_oidc`, and set `OPENFEED_REQUIRE_LOGIN=true`. Access and administrator groups are optional comma-separated values in `OPENFEED_REQUIRED_GROUP` and `OPENFEED_ADMIN_GROUPS`.
+Authentication is disabled by default. To enable Authentik OIDC, configure the
+`OPENFEED_OIDC_*` values, set `OPENFEED_AUTH_MODE=authentik_oidc`, and set
+`OPENFEED_REQUIRE_LOGIN=true`. Access and administrator groups are optional
+comma-separated values in `OPENFEED_REQUIRED_GROUP` and `OPENFEED_ADMIN_GROUPS`.
 
 Persistent files are stored under `OPENFEED_DATA_DIR`, which defaults to `./data`.
 
@@ -93,23 +229,33 @@ access; delegated admin access requires a newly issued token from an admin sessi
 
 ### Local Overrides
 
-`deploy.sh` automatically loads an ignored `compose.local.yml` when present. Use it for host-specific reverse-proxy networks, container names, network aliases, or other settings that do not belong in the public repository.
+`deploy.sh` automatically loads an ignored `compose.local.yml` when present. Use it for
+host-specific reverse-proxy networks, container names, network aliases, or other settings
+that do not belong in the public repository.
 
 ## Optional Profiles
 
 ```bash
 ./deploy.sh --profile vectors up -d openfeed-qdrant
+```
+
+```bash
 ./deploy.sh --profile search up -d openfeed-typesense
 ```
 
-The background synchronization worker uses the `worker` profile.
+The background synchronisation worker uses the `worker` profile.
 
 ## Testing
 
-Build the application image and run the unit tests:
+The suite needs no database and no network. Build the image:
 
 ```bash
 docker build -t openfeed-app:test app
+```
+
+Then run it:
+
+```bash
 docker run --rm openfeed-app:test python -m unittest discover -s openfeed/tests -v
 ```
 
@@ -119,24 +265,49 @@ Validate Compose configuration with:
 ./deploy.sh config --quiet
 ```
 
-## Security
+## Best security practices
 
-- Do not expose PostgreSQL, Redis, Gorse, or optional search services publicly.
+- Do not expose PostgreSQL, Redis, or the optional Qdrant and Typesense services publicly.
 - Keep `.env`, local Compose overrides, database files, and backups outside version control.
 - Use unique random values for every password and signing key.
 - Put public deployments behind TLS and enable OIDC authentication.
 - Review [`SECURITY.md`](SECURITY.md) before exposing an instance.
 
-## Project Status
+## Contributing
 
-OpenFeed is under active development. Back up all persistent data before upgrading.
+Contributions are welcome. Currently everything goes through a reviewed pull request — see
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow and what a change needs before it
+can be merged.
 
 ## License
 
-OpenFeed is licensed under the GNU Affero General Public License v3.0. See
-[`LICENSE`](LICENSE) for the full text.
+```
+Copyright (C) 2026 S0nrxse and OpenFeed contributors
 
-Section 13 is the clause worth knowing about: if you run a modified copy where
-other people can reach it over a network, you have to offer those users the
-corresponding source. The sidebar carries a source link for that reason, and
-`OPENFEED_SOURCE_URL` lets you point it at your own fork.
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
+```
+
+The full text is in [`LICENSE`](LICENSE).
+
+Section 13 is the clause worth knowing about: if you run a modified copy where other
+people can reach it over a network, you have to offer those users the corresponding
+source. The sidebar carries a source link for that reason, and `OPENFEED_SOURCE_URL` lets
+you point it at your own fork.
+
+## Acknowledgements
+
+OpenFeed stands on [Invidious](https://invidious.io/),
+[yt-dlp](https://github.com/yt-dlp/yt-dlp), [FreshRSS](https://freshrss.org/),
+[SponsorBlock](https://sponsor.ajay.app/) and
+[Return YouTube Dislike](https://returnyoutubedislike.com/). It is not affiliated with
+YouTube or Google.

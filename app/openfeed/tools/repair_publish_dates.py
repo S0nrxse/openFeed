@@ -25,9 +25,6 @@ import httpx
 from .. import db
 from ..config import get_settings
 
-# Anything dated inside this window is suspect: fabrication always lands at "now", and a
-# genuinely recent upload will simply be confirmed by the lookup rather than changed.
-SUSPECT_WINDOW = "14 days"
 # Invidious proxies each of these to YouTube, so a fast loop rate-limits it and it starts
 # answering 500 "Can't load the video on this instance". That failure is indistinguishable
 # from a genuinely unavailable video, and at 0.15s it produced 820 false unreachables in
@@ -37,16 +34,26 @@ RETRY_BACKOFF_SECONDS = 8.0
 
 
 def candidates(limit: int) -> list[dict]:
+    """The same population the continuous pass corrects, in one go.
+
+    This used to select on a 14-day window plus rows stamped at write time, which picked
+    the wrong videos: the badly wrong dates are decoded from coarse text like "1 year
+    ago" and therefore sit *far in the past*, nowhere near a recency window. A run spent
+    most of its budget re-confirming rows that were already correct while the actual
+    population went untouched.
+
+    Selecting on the wall-clock signature instead — a real date lands at midnight UTC, a
+    decoded one carries the time of the fetch — keeps this tool and
+    enrichment.verify_publish_dates working on exactly the same rows.
+    """
     with db.connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"""
+                """
                 SELECT youtube_video_id, title, published_at, view_count
                 FROM videos
                 WHERE published_at IS NULL
-                   OR published_at > now() - interval '{SUSPECT_WINDOW}'
-                   OR published_at > now()
-                   OR published_at BETWEEN created_at - interval '5 min' AND updated_at + interval '5 min'
+                   OR (published_at AT TIME ZONE 'UTC')::time <> '00:00:00'
                 ORDER BY published_at DESC NULLS LAST
                 LIMIT %s
                 """,

@@ -1,0 +1,4 @@
+# Every file in this repository requires review from the maintainer before merging.
+# With "Require review from Code Owners" enabled in branch protection, this is what
+# makes that automatic rather than a convention people have to remember.
+*       @S0nrxse
