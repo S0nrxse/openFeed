@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -147,3 +148,73 @@ class PreviewEndpointTests(unittest.TestCase):
         self.enterContext(patch.object(main, "enrich_video", return_value={"ok": False}))
 
         self.assertEqual(self.client.get("/api/preview/dQw4w9WgXcQ").status_code, 404)
+
+
+class StoryboardSheetProxyTests(unittest.TestCase):
+    """Same-origin sprite sheets for the storyboard preview fallback."""
+
+    def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"OPENFEED_REQUIRE_LOGIN": "false"}))
+        self.enterContext(patch.object(db, "connect", side_effect=AssertionError("Unexpected database access")))
+        self.client = TestClient(main.app)
+        self.addCleanup(self.client.close)
+        self.captured: tuple[str, str] | None = None
+
+    @contextmanager
+    def _upstream(self, status: int = 200, content_type: str = "image/jpeg", body: bytes = b"\xff\xd8fake"):
+        response = SimpleNamespace(
+            status_code=status,
+            headers={"content-type": content_type},
+            iter_bytes=lambda: iter([body]),
+            close=lambda: None,
+        )
+
+        def _build_request(method: str, url: str, **kwargs: object) -> tuple[str, str]:
+            self.captured = (method, url)
+            return (method, url)
+
+        def _send(request: tuple[str, str], **kwargs: object) -> SimpleNamespace:
+            return response
+
+        with patch.object(
+            main, "_invidious_client", return_value=SimpleNamespace(build_request=_build_request, send=_send)
+        ):
+            yield
+
+    def test_proxies_sheet_keeping_query(self) -> None:
+        with self._upstream():
+            response = self.client.get("/sb/i/dQw4w9WgXcQ/storyboard3_L1/M0.jpg?sqp=abc&sigh=def")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "image/jpeg")
+        self.assertEqual(response.content, b"\xff\xd8fake")
+        assert self.captured is not None
+        method, url = self.captured
+        self.assertEqual(method, "GET")
+        self.assertIn("/sb/i/dQw4w9WgXcQ/storyboard3_L1/M0.jpg", url)
+        self.assertIn("sqp=abc", url)
+
+    def test_passes_upstream_status_through(self) -> None:
+        # A plain same-origin passthrough like /vi/: whatever Invidious says
+        # about the sheet goes back to the browser untouched.
+        with self._upstream(status=404, content_type="text/plain", body=b"nope"):
+            response = self.client.get("/sb/i/dQw4w9WgXcQ/storyboard3_L1/M9.jpg")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.content, b"nope")
+
+
+class HoverPreviewScriptTests(unittest.TestCase):
+    """The served script must keep its regex escapes intact.
+
+    The script is assembled from a plain (non-raw) Python string, so a single
+    backslash in a JS regex is cooked by Python string parsing (``\\r`` becomes
+    a carriage return) and the whole page script fails to parse in the
+    browser. These pin the runtime escapes.
+    """
+
+    def test_storyboard_parsers_survive_python_string_parsing(self) -> None:
+        script = main._home_script()
+        self.assertIn(r"split(/\r?\n/)", script)
+        self.assertIn(r"#xywh=(\d+),(\d+),(\d+),(\d+)", script)
+        self.assertIn(r"/^https?:\/\/[^/]+\/sb\//", script)

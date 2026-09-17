@@ -3171,9 +3171,11 @@ def _home_styles() -> str:
       .thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
       /* Hover preview player: covers the thumbnail once it can play, never intercepts
          clicks (they fall through to the watch link), and fades in so a slow first
-         paint does not flash. The duration badge hides underneath while it plays. */
-      .thumb .card-preview { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; object-fit: cover; background: #000; pointer-events: none; opacity: 0; transition: opacity .18s ease; }
-      .is-previewing .thumb .card-preview { opacity: 1; }
+         paint does not flash. The backdrop stays transparent until the session is
+         shown, so a loading or failed preview never flashes black over the art.
+         The duration badge hides underneath while it plays. */
+      .thumb .card-preview { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; object-fit: cover; background: transparent; pointer-events: none; opacity: 0; transition: opacity .18s ease; }
+      .is-previewing .thumb .card-preview { opacity: 1; background: #000; }
       .is-previewing .thumb .duration { opacity: 0; }
       .thumb .preview-progress { position: absolute; left: 0; right: 0; bottom: 0; z-index: 2; height: 2px; background: rgba(255,255,255,.28); opacity: 0; transition: opacity .18s ease; pointer-events: none; }
       .is-previewing .thumb .preview-progress { opacity: 1; }
@@ -4455,30 +4457,144 @@ def _home_script() -> str:
         return String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
       }
 
-      /* Hover previews: dwelling on a card thumb swaps in a muted inline player backed
-         by /api/preview, the same way the platform previews on hover. Shorts keep their
-         own feed, touch devices have no hover, and reduced-motion users never opted in,
-         so all three sit out. One preview at a time; anything unplayable fails silent
-         and the card keeps its thumbnail. */
+      /* Hover previews: dwelling on a card thumb previews the video, platform-style.
+         Motion first: /api/preview serves the light progressive rendition where one
+         exists. Most of the library has no progressive rendition at all (split
+         audio/video delivery), so a video that errors — or still hasn't started
+         after a few seconds — falls back to a storyboard timelapse on canvas,
+         driven by the proxied VTT spec; the motion path takes over again if it
+         ever starts playing. Nothing is shown until the first motion or frame is
+         ready, so a slow or missing preview never flashes over the thumbnail.
+         Shorts keep their own feed, touch devices have no hover, and
+         reduced-motion users opted out, so all three sit out. One preview at a
+         time; every failure is silent and the card keeps its thumbnail. */
       (function initHoverPreviews() {
         if (!window.matchMedia || !matchMedia('(hover: hover) and (pointer: fine)').matches) return;
         if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
         const INTENT_MS = 450;
+        const VIDEO_GRACE_MS = 6000;
+        const SB_FRAME_MS = 450;
         let armed = null;
         let active = null;
 
         function killPreview() {
           if (armed) { window.clearTimeout(armed.timer); armed = null; }
           if (!active) return;
-          const { card, video } = active;
+          const session = active;
           active = null;
-          try { video.pause(); } catch (_) { /* already gone */ }
-          video.removeAttribute('src');
-          video.load();
-          video.remove();
-          const bar = card.querySelector('a.thumb > .preview-progress');
-          if (bar) bar.remove();
-          card.classList.remove('is-previewing');
+          if (session.videoTimer) window.clearTimeout(session.videoTimer);
+          if (session.sbTimer) window.clearTimeout(session.sbTimer);
+          if (session.sbAbort) { try { session.sbAbort.abort(); } catch (_) {} }
+          if (session.video) {
+            try { session.video.pause(); } catch (_) {}
+            session.video.removeAttribute('src');
+            session.video.load();
+            session.video.remove();
+          }
+          if (session.canvas) session.canvas.remove();
+          if (session.bar) session.bar.remove();
+          session.card.classList.remove('is-previewing');
+        }
+
+        function showSession(session) {
+          if (active !== session || session.shown) return;
+          session.shown = true;
+          session.card.classList.add('is-previewing');
+        }
+
+        function parseStoryboardVtt(text) {
+          const frames = [];
+          const lines = String(text || '').split(/\\r?\\n/);
+          for (let i = 0; i < lines.length; i++) {
+            if (lines[i].indexOf('-->') === -1) continue;
+            const match = /^(https?:\\/\\/[^#\\s]+)#xywh=(\\d+),(\\d+),(\\d+),(\\d+)\\s*$/.exec((lines[i + 1] || '').trim());
+            if (!match) continue;
+            frames.push({
+              src: match[1].replace(/^https?:\\/\\/[^/]+\\/sb\\//, '/sb/'),
+              x: +match[2], y: +match[3], w: +match[4], h: +match[5],
+            });
+          }
+          return frames;
+        }
+
+        function pickStoryboard(spec) {
+          const boards = ((spec && spec.storyboards) || []).filter((board) => board && board.url && board.width > 0);
+          if (!boards.length) return null;
+          const bigEnough = boards.filter((board) => board.width >= 80).sort((a, b) => a.width - b.width);
+          if (bigEnough.length) return bigEnough[0];
+          return boards.sort((a, b) => b.width - a.width)[0];
+        }
+
+        function stopStoryboard(session) {
+          if (session.sbTimer) { window.clearTimeout(session.sbTimer); session.sbTimer = 0; }
+          if (session.sbAbort) { try { session.sbAbort.abort(); } catch (_) {} session.sbAbort = null; }
+          if (session.canvas) { session.canvas.remove(); session.canvas = null; }
+          session.sbFrames = null;
+          session.sbSheets = {};
+        }
+
+        function storyboardTick(session) {
+          if (active !== session || !session.sbFrames || !session.sbFrames.length) return;
+          const frame = session.sbFrames[session.sbIndex % session.sbFrames.length];
+          const img = frame && session.sbSheets[frame.src];
+          if (img && img.complete && img.naturalWidth && session.canvas) {
+            try {
+              session.canvas.getContext('2d').drawImage(img, frame.x, frame.y, frame.w, frame.h, 0, 0, session.canvas.width, session.canvas.height);
+              if (!session.videoShown) {
+                showSession(session);
+                if (session.fill) {
+                  const position = (session.sbIndex % session.sbFrames.length) + 1;
+                  session.fill.style.width = `${(100 * position / session.sbFrames.length).toFixed(1)}%`;
+                }
+              }
+            } catch (_) {}
+          }
+          session.sbIndex += 1;
+          session.sbTimer = window.setTimeout(() => storyboardTick(session), SB_FRAME_MS);
+        }
+
+        function startStoryboard(session, videoId) {
+          if (session.sbStarted || active !== session) return;
+          session.sbStarted = true;
+          const canvas = document.createElement('canvas');
+          canvas.className = 'card-preview';
+          canvas.width = 320;
+          canvas.height = 180;
+          canvas.setAttribute('aria-hidden', 'true');
+          session.canvas = canvas;
+          session.thumb.appendChild(canvas);
+          const abort = new AbortController();
+          session.sbAbort = abort;
+          fetch(`/api/v1/storyboards/${videoId}`, { signal: abort.signal, headers: { accept: 'application/json' } })
+            .then((res) => { if (!res.ok) throw new Error('no spec'); return res.json(); })
+            .then((spec) => {
+              const board = pickStoryboard(spec);
+              if (!board) throw new Error('no board');
+              return fetch(board.url, { signal: abort.signal });
+            })
+            .then((res) => { if (!res.ok) throw new Error('no vtt'); return res.text(); })
+            .then((text) => {
+              if (active !== session) return;
+              const frames = parseStoryboardVtt(text);
+              if (!frames.length) throw new Error('no frames');
+              session.sbFrames = frames;
+              const seen = {};
+              frames.forEach((frame) => {
+                if (seen[frame.src]) return;
+                seen[frame.src] = true;
+                const img = new Image();
+                img.decoding = 'async';
+                img.src = frame.src;
+                session.sbSheets[frame.src] = img;
+              });
+              session.sbIndex = 0;
+              storyboardTick(session);
+            })
+            .catch(() => {
+              if (active !== session) return;
+              // The motion path may still come through; only give up when both are dead.
+              if (!session.video) killPreview();
+            });
         }
 
         function startPreview(card) {
@@ -4487,6 +4603,21 @@ def _home_script() -> str:
           const videoId = card.getAttribute('data-video-id') || '';
           if (!thumb || !/^[A-Za-z0-9_-]{11}$/.test(videoId)) return;
           if ((thumb.getAttribute('href') || '').indexOf('/shorts') === 0) return;
+          const session = {
+            card, thumb, video: null, videoTimer: 0, videoShown: false,
+            bar: null, fill: null, canvas: null,
+            sbStarted: false, sbFrames: null, sbSheets: {}, sbIndex: 0, sbTimer: 0, sbAbort: null,
+            shown: false,
+          };
+          const bar = document.createElement('span');
+          bar.className = 'preview-progress';
+          bar.setAttribute('aria-hidden', 'true');
+          const fill = document.createElement('i');
+          bar.appendChild(fill);
+          session.bar = bar;
+          session.fill = fill;
+          thumb.appendChild(bar);
+          active = session;
           const video = document.createElement('video');
           video.className = 'card-preview';
           video.muted = true;
@@ -4494,26 +4625,44 @@ def _home_script() -> str:
           video.preload = 'auto';
           video.setAttribute('aria-hidden', 'true');
           video.setAttribute('tabindex', '-1');
-          const bar = document.createElement('span');
-          bar.className = 'preview-progress';
-          bar.setAttribute('aria-hidden', 'true');
-          const fill = document.createElement('i');
-          bar.appendChild(fill);
+          session.video = video;
           video.addEventListener('canplay', () => { video.play().catch(() => {}); });
-          video.addEventListener('error', () => { if (active && active.video === video) killPreview(); }, true);
+          video.addEventListener('playing', () => {
+            if (active !== session) return;
+            session.videoShown = true;
+            if (session.videoTimer) { window.clearTimeout(session.videoTimer); session.videoTimer = 0; }
+            stopStoryboard(session);
+            showSession(session);
+          });
+          video.addEventListener('error', () => {
+            if (active !== session || !session.video) return;
+            session.video.remove();
+            session.video = null;
+            if (session.videoTimer) { window.clearTimeout(session.videoTimer); session.videoTimer = 0; }
+            startStoryboard(session, videoId);
+          }, true);
           video.addEventListener('timeupdate', () => {
-            if (video.duration) fill.style.width = `${(100 * video.currentTime / video.duration).toFixed(1)}%`;
+            if (video.duration && session.videoShown && session.fill) {
+              session.fill.style.width = `${(100 * video.currentTime / video.duration).toFixed(1)}%`;
+            }
           });
           thumb.appendChild(video);
-          thumb.appendChild(bar);
-          card.classList.add('is-previewing');
-          active = { card, video };
           video.src = `/api/preview/${videoId}`;
+          session.videoTimer = window.setTimeout(() => {
+            session.videoTimer = 0;
+            if (active !== session || !session.video || session.videoShown) return;
+            // Still no motion (cold fetch, slow host): storyboard now, and the
+            // video upgrades us if it ever starts playing.
+            startStoryboard(session, videoId);
+          }, VIDEO_GRACE_MS);
         }
 
         document.addEventListener('mouseover', (event) => {
           const card = event.target && event.target.closest ? event.target.closest('article[data-video-card]') : null;
           if (active && active.card === card) return;
+          // Moving inside one card must not restart the countdown, or the
+          // preview never fires while the pointer is in motion.
+          if (armed && armed.card === card) return;
           killPreview();
           if (!card) return;
           armed = { card, timer: window.setTimeout(() => { armed = null; startPreview(card); }, INTENT_MS) };
@@ -9838,6 +9987,19 @@ def proxy_invidious_vi(path: str, request: Request):
 @app.api_route("/api/v1/storyboards/{path:path}", methods=["GET", "HEAD"])
 def proxy_invidious_storyboards(path: str, request: Request):
     return proxy_invidious(request, f"api/v1/storyboards/{path}")
+
+
+@app.api_route("/sb/{path:path}", methods=["GET", "HEAD"])
+def proxy_storyboard_sheet(path: str, request: Request):
+    """Storyboard sprite sheets, proxied so the browser never calls Invidious directly.
+
+    Hover previews animate these sheets on a canvas when a video has no
+    progressive stream, which is most of the library since the move to split
+    audio/video delivery. Invidious serves the sheets itself (the VTT cues
+    point at its own /sb/i/ paths), so this is a plain same-origin
+    passthrough like /vi/, query string included.
+    """
+    return proxy_invidious(request, f"sb/{path}")
 
 
 @app.api_route("/api/v1/annotations/{path:path}", methods=["GET", "HEAD"])
