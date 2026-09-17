@@ -2547,7 +2547,9 @@ def _shelf_html(
     '''
 
 
-def _dedupe_section_videos(videos: list[dict[str, Any]], seen: set[str], limit: int) -> list[dict[str, Any]]:
+def _dedupe_section_videos(
+    videos: list[dict[str, Any]], seen: set[str], limit: int, spread_channels: bool = True
+) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     for video in videos:
         video_id = str(video.get("youtube_video_id") or "")
@@ -2557,7 +2559,56 @@ def _dedupe_section_videos(videos: list[dict[str, Any]], seen: set[str], limit: 
         selected.append(video)
         if len(selected) >= limit:
             break
+    if spread_channels:
+        return _spread_channels(selected)
     return selected
+
+
+# How far apart two videos from the same channel must sit in a shelf. The grid
+# is three columns, so 5 means repeats never share a row; when the pool is
+# mostly one channel the rule relaxes rather than starving the shelf.
+_CHANNEL_SPREAD_GAP = 5
+
+
+def _video_channel_key(video: dict[str, Any]) -> str:
+    return str(video.get("youtube_channel_id") or video.get("channel_title") or video.get("author") or "")
+
+
+def _spread_channels(videos: list[dict[str, Any]], min_gap: int = _CHANNEL_SPREAD_GAP) -> list[dict[str, Any]]:
+    """Reorder a shelf so one channel can't clog neighboring slots.
+
+    Greedy lookahead in score order: each position takes the highest-ranked
+    remaining video whose channel is absent from the previous ``min_gap - 1``
+    picks. When every remaining video violates the gap (a pool dominated by
+    one channel), the constraint relaxes to the video whose channel was seen
+    longest ago, so repeats stay as far apart as the pool allows and the
+    shelf still fills in merit order instead of starving. Videos with no
+    channel identity are never constrained.
+    """
+    remaining = list(videos)
+    ordered: list[dict[str, Any]] = []
+    last_seen: dict[str, int] = {}
+    while remaining:
+        threshold = len(ordered) - min_gap
+        pick = None
+        for index, video in enumerate(remaining):
+            key = _video_channel_key(video)
+            if not key or last_seen.get(key, -10**9) <= threshold:
+                pick = index
+                break
+        if pick is None:
+            oldest = 10**18
+            for index, video in enumerate(remaining):
+                last = last_seen.get(_video_channel_key(video), -10**9)
+                if last < oldest:
+                    oldest = last
+                    pick = index
+        chosen = remaining.pop(pick if pick is not None else 0)
+        key = _video_channel_key(chosen)
+        if key:
+            last_seen[key] = len(ordered)
+        ordered.append(chosen)
+    return ordered
 
 
 def _feed_title_for_filter(feed_filter: str) -> str:
@@ -2685,7 +2736,7 @@ def _catch_up_section(pool: list[dict[str, Any]], seen: set[str], user_key: str,
     start = (seed + page * 2) % count
     for step in range(count):
         shelf = _CATCH_UP_SHELVES[(start + step) % count]
-        videos = _dedupe_section_videos(_catch_up_videos(shelf["key"], pool, user_key), seen, 8)
+        videos = _dedupe_section_videos(_catch_up_videos(shelf["key"], pool, user_key), seen, 8, spread_channels=False)
         if len(videos) >= 3:
             return {
                 "id": f'{shelf["id"]}-{page}',
@@ -2853,10 +2904,10 @@ def _home_feed_sections(page: int, feed_filter: str, settings: Any, user_key: st
         # starved of videos, then placed further down the page below.
         catch_up = _catch_up_section(subscription_pool, seen, user_key, seed, page)
 
-        continue_videos = _dedupe_section_videos(_without_shorts(db.list_recommended_videos(8, 0, "continue", user_key)), seen, 8)
+        continue_videos = _dedupe_section_videos(_without_shorts(db.list_recommended_videos(8, 0, "continue", user_key)), seen, 8, spread_channels=False)
         if continue_videos:
             sections.append({"id": "continue-watching", "eyebrow": "Resume", "title": "Continue watching", "videos": continue_videos, "layout": "grid", "kind": "continue"})
-        sub_videos = _dedupe_section_videos(subscription_pool, seen, 12)
+        sub_videos = _dedupe_section_videos(subscription_pool, seen, 12, spread_channels=False)
         if sub_videos:
             sections.append({"id": "new-subscriptions", "eyebrow": "Subscriptions", "title": "New from your subscriptions", "videos": sub_videos, "layout": "grid", "kind": "subscription"})
         if shorts:
