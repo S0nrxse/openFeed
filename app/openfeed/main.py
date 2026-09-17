@@ -40,9 +40,9 @@ from .enrichment import (
     enrich_video,
 )
 from . import discovery, downloads, ryd, takeout, tokens, ytdlp
-from .playback import PlaybackError, download_options, playback_for_video, select_preview_stream
+from .playback import PlaybackError, download_options, playback_for_video
 from .rss import fetch_channel_feed, parse_channel_feed, sync_rss_once
-from .youtube_ids import CHANNEL_ID_STRICT_RE, VIDEO_ID_RE, youtube_channel_id_from_text
+from .youtube_ids import CHANNEL_ID_STRICT_RE, youtube_channel_id_from_text
 
 
 @asynccontextmanager
@@ -3073,6 +3073,10 @@ def _home_styles() -> str:
       .nav-more { border: 0; background: none; width: 100%; cursor: pointer; color: var(--text); }
       .nav-more .icon { transition: transform .18s ease; }
       .nav-more[aria-expanded="true"] .icon { transform: rotate(180deg); }
+      /* The collapsed rows toggle the hidden attribute, but .nav-item's flex
+         display beats the UA stylesheet's [hidden] rule, so without this the
+         extra channels never hide and "Show more" looks dead. */
+      .nav-channel[hidden] { display: none; }
       .nav-heading { margin: 2px 0 6px; padding: 0 12px; color: var(--text); font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
       .nav-item { position: relative; min-height: 38px; border-radius: 10px; display: flex; align-items: center; gap: 16px; padding: 0 12px; color: var(--text); font-size: 13.5px; transition: background .12s ease, color .12s ease; }
       .nav-item:hover { background: var(--surface-2); }
@@ -3169,17 +3173,6 @@ def _home_styles() -> str:
       .video-card { min-width: 0; color: var(--text); }
       .thumb { position: relative; display: grid; place-items: center; aspect-ratio: 16 / 9; overflow: hidden; border-radius: var(--r-thumb); background: #000; border: 1px solid var(--border-soft); color: #fff; }
       .thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-      /* Hover preview player: covers the thumbnail once it can play, never intercepts
-         clicks (they fall through to the watch link), and fades in so a slow first
-         paint does not flash. The backdrop stays transparent until the session is
-         shown, so a loading or failed preview never flashes black over the art.
-         The duration badge hides underneath while it plays. */
-      .thumb .card-preview { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; object-fit: cover; background: transparent; pointer-events: none; opacity: 0; transition: opacity .18s ease; }
-      .is-previewing .thumb .card-preview { opacity: 1; background: #000; }
-      .is-previewing .thumb .duration { opacity: 0; }
-      .thumb .preview-progress { position: absolute; left: 0; right: 0; bottom: 0; z-index: 2; height: 2px; background: rgba(255,255,255,.28); opacity: 0; transition: opacity .18s ease; pointer-events: none; }
-      .is-previewing .thumb .preview-progress { opacity: 1; }
-      .thumb .preview-progress i { display: block; height: 100%; width: 0; background: #f03; }
       .thumb-fallback { display: grid; place-items: center; width: 42px; height: 26px; border-radius: 6px; background: var(--surface-3); color: var(--muted); font-weight: 600; font-size: 10px; }
       .duration { position: absolute; right: 6px; bottom: 6px; z-index: 2; border-radius: 4px; background: rgba(0,0,0,.82); color: #fff; font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums; line-height: 1; padding: 3px 5px; }
       .progress-rail { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255,255,255,.18); z-index: 2; }
@@ -4456,225 +4449,6 @@ def _home_script() -> str:
         if (window.CSS && typeof CSS.escape === 'function') return CSS.escape(value);
         return String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
       }
-
-      /* Hover previews: dwelling on a card thumb previews the video, platform-style.
-         Motion first: /api/preview serves the light progressive rendition where one
-         exists. Most of the library has no progressive rendition at all (split
-         audio/video delivery), so a video that errors — or still hasn't started
-         after a few seconds — falls back to a storyboard timelapse on canvas,
-         driven by the proxied VTT spec; the motion path takes over again if it
-         ever starts playing. Nothing is shown until the first motion or frame is
-         ready, so a slow or missing preview never flashes over the thumbnail.
-         Shorts keep their own feed, touch devices have no hover, and
-         reduced-motion users opted out, so all three sit out. One preview at a
-         time; every failure is silent and the card keeps its thumbnail. */
-      (function initHoverPreviews() {
-        if (!window.matchMedia || !matchMedia('(hover: hover) and (pointer: fine)').matches) return;
-        if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-        const INTENT_MS = 450;
-        const VIDEO_GRACE_MS = 6000;
-        const SB_FRAME_MS = 450;
-        let armed = null;
-        let active = null;
-
-        function killPreview() {
-          if (armed) { window.clearTimeout(armed.timer); armed = null; }
-          if (!active) return;
-          const session = active;
-          active = null;
-          if (session.videoTimer) window.clearTimeout(session.videoTimer);
-          if (session.sbTimer) window.clearTimeout(session.sbTimer);
-          if (session.sbAbort) { try { session.sbAbort.abort(); } catch (_) {} }
-          if (session.video) {
-            try { session.video.pause(); } catch (_) {}
-            session.video.removeAttribute('src');
-            session.video.load();
-            session.video.remove();
-          }
-          if (session.canvas) session.canvas.remove();
-          if (session.bar) session.bar.remove();
-          session.card.classList.remove('is-previewing');
-        }
-
-        function showSession(session) {
-          if (active !== session || session.shown) return;
-          session.shown = true;
-          session.card.classList.add('is-previewing');
-        }
-
-        function parseStoryboardVtt(text) {
-          const frames = [];
-          const lines = String(text || '').split(/\\r?\\n/);
-          for (let i = 0; i < lines.length; i++) {
-            if (lines[i].indexOf('-->') === -1) continue;
-            const match = /^(https?:\\/\\/[^#\\s]+)#xywh=(\\d+),(\\d+),(\\d+),(\\d+)\\s*$/.exec((lines[i + 1] || '').trim());
-            if (!match) continue;
-            frames.push({
-              src: match[1].replace(/^https?:\\/\\/[^/]+\\/sb\\//, '/sb/'),
-              x: +match[2], y: +match[3], w: +match[4], h: +match[5],
-            });
-          }
-          return frames;
-        }
-
-        function pickStoryboard(spec) {
-          const boards = ((spec && spec.storyboards) || []).filter((board) => board && board.url && board.width > 0);
-          if (!boards.length) return null;
-          const bigEnough = boards.filter((board) => board.width >= 80).sort((a, b) => a.width - b.width);
-          if (bigEnough.length) return bigEnough[0];
-          return boards.sort((a, b) => b.width - a.width)[0];
-        }
-
-        function stopStoryboard(session) {
-          if (session.sbTimer) { window.clearTimeout(session.sbTimer); session.sbTimer = 0; }
-          if (session.sbAbort) { try { session.sbAbort.abort(); } catch (_) {} session.sbAbort = null; }
-          if (session.canvas) { session.canvas.remove(); session.canvas = null; }
-          session.sbFrames = null;
-          session.sbSheets = {};
-        }
-
-        function storyboardTick(session) {
-          if (active !== session || !session.sbFrames || !session.sbFrames.length) return;
-          const frame = session.sbFrames[session.sbIndex % session.sbFrames.length];
-          const img = frame && session.sbSheets[frame.src];
-          if (img && img.complete && img.naturalWidth && session.canvas) {
-            try {
-              session.canvas.getContext('2d').drawImage(img, frame.x, frame.y, frame.w, frame.h, 0, 0, session.canvas.width, session.canvas.height);
-              if (!session.videoShown) {
-                showSession(session);
-                if (session.fill) {
-                  const position = (session.sbIndex % session.sbFrames.length) + 1;
-                  session.fill.style.width = `${(100 * position / session.sbFrames.length).toFixed(1)}%`;
-                }
-              }
-            } catch (_) {}
-          }
-          session.sbIndex += 1;
-          session.sbTimer = window.setTimeout(() => storyboardTick(session), SB_FRAME_MS);
-        }
-
-        function startStoryboard(session, videoId) {
-          if (session.sbStarted || active !== session) return;
-          session.sbStarted = true;
-          const canvas = document.createElement('canvas');
-          canvas.className = 'card-preview';
-          canvas.width = 320;
-          canvas.height = 180;
-          canvas.setAttribute('aria-hidden', 'true');
-          session.canvas = canvas;
-          session.thumb.appendChild(canvas);
-          const abort = new AbortController();
-          session.sbAbort = abort;
-          fetch(`/api/v1/storyboards/${videoId}`, { signal: abort.signal, headers: { accept: 'application/json' } })
-            .then((res) => { if (!res.ok) throw new Error('no spec'); return res.json(); })
-            .then((spec) => {
-              const board = pickStoryboard(spec);
-              if (!board) throw new Error('no board');
-              return fetch(board.url, { signal: abort.signal });
-            })
-            .then((res) => { if (!res.ok) throw new Error('no vtt'); return res.text(); })
-            .then((text) => {
-              if (active !== session) return;
-              const frames = parseStoryboardVtt(text);
-              if (!frames.length) throw new Error('no frames');
-              session.sbFrames = frames;
-              const seen = {};
-              frames.forEach((frame) => {
-                if (seen[frame.src]) return;
-                seen[frame.src] = true;
-                const img = new Image();
-                img.decoding = 'async';
-                img.src = frame.src;
-                session.sbSheets[frame.src] = img;
-              });
-              session.sbIndex = 0;
-              storyboardTick(session);
-            })
-            .catch(() => {
-              if (active !== session) return;
-              // The motion path may still come through; only give up when both are dead.
-              if (!session.video) killPreview();
-            });
-        }
-
-        function startPreview(card) {
-          killPreview();
-          const thumb = card.querySelector('a.thumb');
-          const videoId = card.getAttribute('data-video-id') || '';
-          if (!thumb || !/^[A-Za-z0-9_-]{11}$/.test(videoId)) return;
-          if ((thumb.getAttribute('href') || '').indexOf('/shorts') === 0) return;
-          const session = {
-            card, thumb, video: null, videoTimer: 0, videoShown: false,
-            bar: null, fill: null, canvas: null,
-            sbStarted: false, sbFrames: null, sbSheets: {}, sbIndex: 0, sbTimer: 0, sbAbort: null,
-            shown: false,
-          };
-          const bar = document.createElement('span');
-          bar.className = 'preview-progress';
-          bar.setAttribute('aria-hidden', 'true');
-          const fill = document.createElement('i');
-          bar.appendChild(fill);
-          session.bar = bar;
-          session.fill = fill;
-          thumb.appendChild(bar);
-          active = session;
-          const video = document.createElement('video');
-          video.className = 'card-preview';
-          video.muted = true;
-          video.playsInline = true;
-          video.preload = 'auto';
-          video.setAttribute('aria-hidden', 'true');
-          video.setAttribute('tabindex', '-1');
-          session.video = video;
-          video.addEventListener('canplay', () => { video.play().catch(() => {}); });
-          video.addEventListener('playing', () => {
-            if (active !== session) return;
-            session.videoShown = true;
-            if (session.videoTimer) { window.clearTimeout(session.videoTimer); session.videoTimer = 0; }
-            stopStoryboard(session);
-            showSession(session);
-          });
-          video.addEventListener('error', () => {
-            if (active !== session || !session.video) return;
-            session.video.remove();
-            session.video = null;
-            if (session.videoTimer) { window.clearTimeout(session.videoTimer); session.videoTimer = 0; }
-            startStoryboard(session, videoId);
-          }, true);
-          video.addEventListener('timeupdate', () => {
-            if (video.duration && session.videoShown && session.fill) {
-              session.fill.style.width = `${(100 * video.currentTime / video.duration).toFixed(1)}%`;
-            }
-          });
-          thumb.appendChild(video);
-          video.src = `/api/preview/${videoId}`;
-          session.videoTimer = window.setTimeout(() => {
-            session.videoTimer = 0;
-            if (active !== session || !session.video || session.videoShown) return;
-            // Still no motion (cold fetch, slow host): storyboard now, and the
-            // video upgrades us if it ever starts playing.
-            startStoryboard(session, videoId);
-          }, VIDEO_GRACE_MS);
-        }
-
-        document.addEventListener('mouseover', (event) => {
-          const card = event.target && event.target.closest ? event.target.closest('article[data-video-card]') : null;
-          if (active && active.card === card) return;
-          // Moving inside one card must not restart the countdown, or the
-          // preview never fires while the pointer is in motion.
-          if (armed && armed.card === card) return;
-          killPreview();
-          if (!card) return;
-          armed = { card, timer: window.setTimeout(() => { armed = null; startPreview(card); }, INTENT_MS) };
-        });
-        document.addEventListener('mouseout', (event) => {
-          const card = event.target && event.target.closest ? event.target.closest('article[data-video-card]') : null;
-          if (!card) return;
-          const to = event.relatedTarget && event.relatedTarget.closest ? event.relatedTarget.closest('article[data-video-card]') : null;
-          if (card !== to) killPreview();
-        });
-        window.addEventListener('pagehide', killPreview);
-      })();
 
       function showToast(message, action) {
         if (!toast) return;
@@ -8224,11 +7998,11 @@ def _source_offer() -> str:
     return f'<p class="source-offer"><a href="{escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">Source code &middot; AGPL-3.0</a></p>'
 
 
-def _app_sidebar(active: str, meta_html: str) -> str:
+def _app_sidebar(active: str) -> str:
     return f'''
         <aside class="desktop-sidebar" aria-label="Primary navigation">
           {_home_nav(active)}
-          <div class="sidebar-meta">{meta_html}{_source_offer()}</div>
+          <div class="sidebar-meta">{_source_offer()}</div>
         </aside>
     '''
 
@@ -8258,7 +8032,6 @@ def _asset_preconnect() -> str:
 def _app_shell(title: str, active: str, content: str, search_value: str = "", main_class: str = "app-page", scripts: str = "", request: Request | None = None, immersive: bool = False) -> str:
     user = _current_user(request)
     user_key = _user_key(request)
-    meta_html = f'<p>Private video library<br>Invidious-backed playback</p>'
     return f'''
     <!doctype html>
     <html lang="en">
@@ -8273,7 +8046,7 @@ def _app_shell(title: str, active: str, content: str, search_value: str = "", ma
       <body{' class="immersive-nav"' if immersive else ''}>
         <a class="skip-link" href="#main">Skip to content</a>
         {_app_header(search_value, user, user_key)}
-        {_app_sidebar(active, meta_html)}
+        {_app_sidebar(active)}
         <div class="nav-scrim" data-nav-scrim aria-hidden="true"></div>
         <main class="home-main {escape(main_class)}" id="main" tabindex="-1">{content}</main>
         <nav class="mobile-bottom-nav" aria-label="Mobile navigation">{_mobile_nav(active)}</nav>
@@ -8889,7 +8662,7 @@ def index(request: Request):
       </head>
       <body>
         {_app_header("", user, user_key)}
-        {_app_sidebar("home", "")}
+        {_app_sidebar("home")}
         <main class="home-main">
           <div class="topic-wrap" aria-label="Recommendation filters"><div class="topic-row">{_topic_chips(all_for_channels)}</div></div>
           <section class="creator-strip" aria-label="Channels">{creator_strip}</section>
@@ -9987,19 +9760,6 @@ def proxy_invidious_vi(path: str, request: Request):
 @app.api_route("/api/v1/storyboards/{path:path}", methods=["GET", "HEAD"])
 def proxy_invidious_storyboards(path: str, request: Request):
     return proxy_invidious(request, f"api/v1/storyboards/{path}")
-
-
-@app.api_route("/sb/{path:path}", methods=["GET", "HEAD"])
-def proxy_storyboard_sheet(path: str, request: Request):
-    """Storyboard sprite sheets, proxied so the browser never calls Invidious directly.
-
-    Hover previews animate these sheets on a canvas when a video has no
-    progressive stream, which is most of the library since the move to split
-    audio/video delivery. Invidious serves the sheets itself (the VTT cues
-    point at its own /sb/i/ paths), so this is a plain same-origin
-    passthrough like /vi/, query string included.
-    """
-    return proxy_invidious(request, f"sb/{path}")
 
 
 @app.api_route("/api/v1/annotations/{path:path}", methods=["GET", "HEAD"])
@@ -12450,118 +12210,6 @@ def api_download_video(request: Request, youtube_video_id: str, itag: str = ""):
     )
 
 
-@app.get("/api/preview/{youtube_video_id}")
-def api_preview_video(request: Request, youtube_video_id: str):
-    """Proxied bytes for hover previews: the lightest muxed rendition.
-
-    The browser cannot use Invidious's signed stream URLs directly (they are
-    bound to this server's address), so the bytes are proxied same-origin,
-    exactly like the yt-dlp fallback player. Resolution prefers the cached
-    enrichment metadata so a hover rarely costs an Invidious round trip; when
-    the cached signature has expired the metadata is refreshed once and the
-    upstream retried before giving up. Anything unplayable is a 404 and the
-    card simply keeps its thumbnail.
-    """
-    auth_redirect = _login_required_redirect(request)
-    if auth_redirect:
-        return auth_redirect
-    if not VIDEO_ID_RE.match(youtube_video_id or ""):
-        raise HTTPException(status_code=404, detail="Unknown video")
-
-    raw = _cached_preview_raw(youtube_video_id)
-    if raw is None:
-        raw = _refresh_preview_metadata(youtube_video_id)
-    stream = select_preview_stream(raw or {})
-    if stream is None:
-        raise HTTPException(status_code=404, detail="No preview is available for this video")
-
-    upstream = _fetch_preview_upstream(str(stream.get("url") or ""), request.headers.get("range"))
-    if upstream is not None and upstream.status_code >= 400:
-        upstream.close()
-        upstream = None
-        refreshed = _refresh_preview_metadata(youtube_video_id)
-        stream = select_preview_stream(refreshed or {})
-        if stream is None:
-            raise HTTPException(status_code=404, detail="No preview is available for this video")
-        upstream = _fetch_preview_upstream(str(stream.get("url") or ""), request.headers.get("range"))
-    if upstream is None:
-        raise HTTPException(status_code=502, detail="Could not reach the playback backend")
-    if upstream.status_code >= 400:
-        upstream.close()
-        raise HTTPException(status_code=404, detail="No preview is available for this video")
-    return _preview_response(upstream, stream)
-
-
-def _cached_preview_raw(youtube_video_id: str) -> dict[str, Any] | None:
-    """Full Invidious payload from a past enrichment, if one was stored.
-
-    Enrichment unwraps the payload one level when it stores it, so most rows
-    carry the Invidious response directly while a few keep it under `raw`;
-    both shapes are accepted, mirroring _tags_from_metadata.
-    """
-    try:
-        video = db.get_video_by_youtube_id(youtube_video_id) or {}
-    except Exception as exc:  # noqa: BLE001 - a preview never breaks on a DB hiccup
-        logger.info("preview cache lookup failed for %s: %s", youtube_video_id, exc)
-        return None
-    metadata = video.get("metadata")
-    if not isinstance(metadata, dict):
-        return None
-    raw = metadata.get("raw")
-    if not isinstance(raw, dict):
-        raw = metadata
-    return raw
-
-
-def _refresh_preview_metadata(youtube_video_id: str) -> dict[str, Any] | None:
-    """Fetch and store fresh Invidious metadata; doubles as enrichment backfill."""
-    try:
-        result = enrich_video(youtube_video_id)
-    except Exception as exc:  # noqa: BLE001 - unplayable is a 404, not a 500
-        logger.info("preview metadata refresh failed for %s: %s", youtube_video_id, exc)
-        return None
-    if not result.get("ok"):
-        return None
-    return _cached_preview_raw(youtube_video_id)
-
-
-def _fetch_preview_upstream(stream_url: str, byte_range: str | None):
-    if not stream_url:
-        return None
-    upstream_headers = {"user-agent": "Mozilla/5.0"}
-    if byte_range:
-        upstream_headers["range"] = byte_range
-    client = _invidious_client()
-    try:
-        # A 302 handed back would quietly turn a proxied preview into a direct
-        # one, leaking the viewer address this proxy exists to keep private.
-        return client.send(
-            client.build_request("GET", stream_url, headers=upstream_headers),
-            stream=True,
-            follow_redirects=True,
-        )
-    except Exception as exc:  # noqa: BLE001 - unplayable is a 404, not a 500
-        logger.info("preview upstream fetch failed: %s", exc)
-        return None
-
-
-def _preview_response(upstream, stream: dict[str, Any]):
-    headers = {"accept-ranges": "bytes"}
-    for name in ("content-length", "content-range", "content-type"):
-        if upstream.headers.get(name):
-            headers[name] = upstream.headers[name]
-    headers.setdefault("content-type", str(stream.get("type") or "video/mp4").split(";")[0])
-    # Full responses are addressable per video id, so a re-hover replays from the
-    # browser cache instead of proxying the opening bytes again.
-    headers["cache-control"] = "private, max-age=300" if upstream.status_code == 200 else "no-store"
-    return StreamingResponse(
-        upstream.iter_bytes(),
-        status_code=upstream.status_code,
-        headers=headers,
-        background=BackgroundTask(upstream.close),
-    )
-
-
 @app.get("/api/download/{youtube_video_id}/info")
 def api_download_info(request: Request, youtube_video_id: str) -> dict[str, Any]:
     """What the download button would give you, so the UI can say so before starting."""
@@ -13231,8 +12879,10 @@ def api_sidebar_subscriptions(request: Request) -> str:
     """The sidebar subscription list as HTML, so it can refresh in place after a
     subscribe or unsubscribe without a full page reload.
 
-    This is the full list (limit=250), not the shell's VISIBLE + 1 probe: expanding
-    "Show more" swaps this markup in, so the shell never has to fetch it upfront."""
+    This is the full list (limit=250), not the shell's VISIBLE + 1 probe: the
+    subscribe/unsubscribe actions swap this markup in so the list refreshes in
+    place without a full page reload. ("Show more" just unhides rows that are
+    already in the shell.)"""
     auth_redirect = _login_required_redirect(request)
     if auth_redirect:
         return ""
