@@ -7386,15 +7386,38 @@ def _home_script() -> str:
       })();
 
       /* ---- sidebar: show more subscriptions ---- */
+      function setSubscriptionNavExpanded(nav, expand) {
+        nav.querySelectorAll('.nav-channel-extra').forEach((row) => { row.hidden = !expand; });
+        const toggle = nav.querySelector('[data-subscription-more]');
+        if (!toggle) return;
+        toggle.setAttribute('aria-expanded', expand ? 'true' : 'false');
+        const label = toggle.querySelector('span');
+        if (label) label.textContent = expand ? toggle.dataset.lessLabel : toggle.dataset.moreLabel;
+      }
       document.addEventListener('click', (event) => {
         const button = event.target.closest('[data-subscription-more]');
-        if (!button) return;
+        if (!button || button.disabled) return;
         const nav = button.closest('[data-subscription-nav]');
+        if (!nav) return;
         const expanded = button.getAttribute('aria-expanded') === 'true';
-        nav?.querySelectorAll('.nav-channel-extra').forEach((row) => { row.hidden = expanded; });
-        button.setAttribute('aria-expanded', expanded ? 'false' : 'true');
-        const label = button.querySelector('span');
-        if (label) label.textContent = expanded ? button.dataset.moreLabel : button.dataset.lessLabel;
+        if (!expanded && nav.dataset.subscriptionsLoaded !== 'true') {
+          /* The shell renders a VISIBLE + 1 probe so page renders stay cheap;
+             the full list (up to 250) arrives on first expand. */
+          button.disabled = true;
+          fetch('/api/sidebar/subscriptions', { headers: { 'Accept': 'text/html' } })
+            .then((response) => { if (!response.ok) throw new Error('no list'); return response.text(); })
+            .then((markup) => {
+              const parsed = document.createRange().createContextualFragment(markup.trim()).firstElementChild;
+              if (!parsed) throw new Error('no list');
+              nav.replaceWith(parsed);
+              parsed.dataset.subscriptionsLoaded = 'true';
+              setSubscriptionNavExpanded(parsed, true);
+            })
+            .catch(() => { setSubscriptionNavExpanded(nav, true); })
+            .finally(() => { button.disabled = false; });
+          return;
+        }
+        setSubscriptionNavExpanded(nav, !expanded);
       });
 
       /* ---- sponsorblock settings ---- */
