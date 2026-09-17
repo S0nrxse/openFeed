@@ -50,6 +50,35 @@ def select_stream(video: dict[str, Any], itag: str = "") -> dict[str, Any] | Non
     return sorted(streams, key=_stream_score, reverse=True)[0]
 
 
+# Hover previews should start fast and sip bandwidth: a 360p muxed rendition is
+# plenty on a card-sized player, and it is usually the first byte range the
+# stream host can serve.
+PREVIEW_MAX_HEIGHT = 360
+
+
+def select_preview_stream(video: dict[str, Any]) -> dict[str, Any] | None:
+    """The lightest muxed rendition worth previewing with.
+
+    Prefers the best mp4 at or under 360p (usually itag 18) over the
+    top-quality rendition select_stream() hands to downloads. Falls back to
+    the lowest rendition on offer when nothing that small exists, and to
+    non-mp4 containers only when no mp4 is published at all.
+    """
+    streams = [item for item in video.get("formatStreams") or [] if item.get("url")]
+    if not streams:
+        return None
+    mp4s = [
+        stream
+        for stream in streams
+        if "mp4" in str(stream.get("type") or stream.get("container") or "").lower()
+    ]
+    pool = mp4s or streams
+    light = [stream for stream in pool if 0 < stream_height(stream) <= PREVIEW_MAX_HEIGHT]
+    if light:
+        return sorted(light, key=_stream_score, reverse=True)[0]
+    return sorted(pool, key=lambda stream: stream_height(stream) or 10**9)[0]
+
+
 def download_options(youtube_video_id: str) -> dict[str, Any]:
     """Every rendition the download button can actually deliver, best first.
 

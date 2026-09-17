@@ -40,9 +40,9 @@ from .enrichment import (
     enrich_video,
 )
 from . import discovery, downloads, ryd, takeout, tokens, ytdlp
-from .playback import PlaybackError, download_options, playback_for_video
+from .playback import PlaybackError, download_options, playback_for_video, select_preview_stream
 from .rss import fetch_channel_feed, parse_channel_feed, sync_rss_once
-from .youtube_ids import CHANNEL_ID_STRICT_RE, youtube_channel_id_from_text
+from .youtube_ids import CHANNEL_ID_STRICT_RE, VIDEO_ID_RE, youtube_channel_id_from_text
 
 
 @asynccontextmanager
@@ -3169,6 +3169,15 @@ def _home_styles() -> str:
       .video-card { min-width: 0; color: var(--text); }
       .thumb { position: relative; display: grid; place-items: center; aspect-ratio: 16 / 9; overflow: hidden; border-radius: var(--r-thumb); background: #000; border: 1px solid var(--border-soft); color: #fff; }
       .thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+      /* Hover preview player: covers the thumbnail once it can play, never intercepts
+         clicks (they fall through to the watch link), and fades in so a slow first
+         paint does not flash. The duration badge hides underneath while it plays. */
+      .thumb .card-preview { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; object-fit: cover; background: #000; pointer-events: none; opacity: 0; transition: opacity .18s ease; }
+      .is-previewing .thumb .card-preview { opacity: 1; }
+      .is-previewing .thumb .duration { opacity: 0; }
+      .thumb .preview-progress { position: absolute; left: 0; right: 0; bottom: 0; z-index: 2; height: 2px; background: rgba(255,255,255,.28); opacity: 0; transition: opacity .18s ease; pointer-events: none; }
+      .is-previewing .thumb .preview-progress { opacity: 1; }
+      .thumb .preview-progress i { display: block; height: 100%; width: 0; background: #f03; }
       .thumb-fallback { display: grid; place-items: center; width: 42px; height: 26px; border-radius: 6px; background: var(--surface-3); color: var(--muted); font-weight: 600; font-size: 10px; }
       .duration { position: absolute; right: 6px; bottom: 6px; z-index: 2; border-radius: 4px; background: rgba(0,0,0,.82); color: #fff; font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums; line-height: 1; padding: 3px 5px; }
       .progress-rail { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255,255,255,.18); z-index: 2; }
@@ -4445,6 +4454,78 @@ def _home_script() -> str:
         if (window.CSS && typeof CSS.escape === 'function') return CSS.escape(value);
         return String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
       }
+
+      /* Hover previews: dwelling on a card thumb swaps in a muted inline player backed
+         by /api/preview, the same way the platform previews on hover. Shorts keep their
+         own feed, touch devices have no hover, and reduced-motion users never opted in,
+         so all three sit out. One preview at a time; anything unplayable fails silent
+         and the card keeps its thumbnail. */
+      (function initHoverPreviews() {
+        if (!window.matchMedia || !matchMedia('(hover: hover) and (pointer: fine)').matches) return;
+        if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+        const INTENT_MS = 450;
+        let armed = null;
+        let active = null;
+
+        function killPreview() {
+          if (armed) { window.clearTimeout(armed.timer); armed = null; }
+          if (!active) return;
+          const { card, video } = active;
+          active = null;
+          try { video.pause(); } catch (_) { /* already gone */ }
+          video.removeAttribute('src');
+          video.load();
+          video.remove();
+          const bar = card.querySelector('a.thumb > .preview-progress');
+          if (bar) bar.remove();
+          card.classList.remove('is-previewing');
+        }
+
+        function startPreview(card) {
+          killPreview();
+          const thumb = card.querySelector('a.thumb');
+          const videoId = card.getAttribute('data-video-id') || '';
+          if (!thumb || !/^[A-Za-z0-9_-]{11}$/.test(videoId)) return;
+          if ((thumb.getAttribute('href') || '').indexOf('/shorts') === 0) return;
+          const video = document.createElement('video');
+          video.className = 'card-preview';
+          video.muted = true;
+          video.playsInline = true;
+          video.preload = 'auto';
+          video.setAttribute('aria-hidden', 'true');
+          video.setAttribute('tabindex', '-1');
+          const bar = document.createElement('span');
+          bar.className = 'preview-progress';
+          bar.setAttribute('aria-hidden', 'true');
+          const fill = document.createElement('i');
+          bar.appendChild(fill);
+          video.addEventListener('canplay', () => { video.play().catch(() => {}); });
+          video.addEventListener('error', () => { if (active && active.video === video) killPreview(); }, true);
+          video.addEventListener('timeupdate', () => {
+            if (video.duration) fill.style.width = `${(100 * video.currentTime / video.duration).toFixed(1)}%`;
+          });
+          thumb.appendChild(video);
+          thumb.appendChild(bar);
+          card.classList.add('is-previewing');
+          active = { card, video };
+          video.src = `/api/preview/${videoId}`;
+        }
+
+        document.addEventListener('mouseover', (event) => {
+          const card = event.target && event.target.closest ? event.target.closest('article[data-video-card]') : null;
+          if (active && active.card === card) return;
+          killPreview();
+          if (!card) return;
+          armed = { card, timer: window.setTimeout(() => { armed = null; startPreview(card); }, INTENT_MS) };
+        });
+        document.addEventListener('mouseout', (event) => {
+          const card = event.target && event.target.closest ? event.target.closest('article[data-video-card]') : null;
+          if (!card) return;
+          const to = event.relatedTarget && event.relatedTarget.closest ? event.relatedTarget.closest('article[data-video-card]') : null;
+          if (card !== to) killPreview();
+        });
+        window.addEventListener('pagehide', killPreview);
+      })();
 
       function showToast(message, action) {
         if (!toast) return;
@@ -12202,6 +12283,118 @@ def api_download_video(request: Request, youtube_video_id: str, itag: str = ""):
     return StreamingResponse(
         upstream.iter_bytes(),
         status_code=200,
+        headers=headers,
+        background=BackgroundTask(upstream.close),
+    )
+
+
+@app.get("/api/preview/{youtube_video_id}")
+def api_preview_video(request: Request, youtube_video_id: str):
+    """Proxied bytes for hover previews: the lightest muxed rendition.
+
+    The browser cannot use Invidious's signed stream URLs directly (they are
+    bound to this server's address), so the bytes are proxied same-origin,
+    exactly like the yt-dlp fallback player. Resolution prefers the cached
+    enrichment metadata so a hover rarely costs an Invidious round trip; when
+    the cached signature has expired the metadata is refreshed once and the
+    upstream retried before giving up. Anything unplayable is a 404 and the
+    card simply keeps its thumbnail.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        return auth_redirect
+    if not VIDEO_ID_RE.match(youtube_video_id or ""):
+        raise HTTPException(status_code=404, detail="Unknown video")
+
+    raw = _cached_preview_raw(youtube_video_id)
+    if raw is None:
+        raw = _refresh_preview_metadata(youtube_video_id)
+    stream = select_preview_stream(raw or {})
+    if stream is None:
+        raise HTTPException(status_code=404, detail="No preview is available for this video")
+
+    upstream = _fetch_preview_upstream(str(stream.get("url") or ""), request.headers.get("range"))
+    if upstream is not None and upstream.status_code >= 400:
+        upstream.close()
+        upstream = None
+        refreshed = _refresh_preview_metadata(youtube_video_id)
+        stream = select_preview_stream(refreshed or {})
+        if stream is None:
+            raise HTTPException(status_code=404, detail="No preview is available for this video")
+        upstream = _fetch_preview_upstream(str(stream.get("url") or ""), request.headers.get("range"))
+    if upstream is None:
+        raise HTTPException(status_code=502, detail="Could not reach the playback backend")
+    if upstream.status_code >= 400:
+        upstream.close()
+        raise HTTPException(status_code=404, detail="No preview is available for this video")
+    return _preview_response(upstream, stream)
+
+
+def _cached_preview_raw(youtube_video_id: str) -> dict[str, Any] | None:
+    """Full Invidious payload from a past enrichment, if one was stored.
+
+    Enrichment unwraps the payload one level when it stores it, so most rows
+    carry the Invidious response directly while a few keep it under `raw`;
+    both shapes are accepted, mirroring _tags_from_metadata.
+    """
+    try:
+        video = db.get_video_by_youtube_id(youtube_video_id) or {}
+    except Exception as exc:  # noqa: BLE001 - a preview never breaks on a DB hiccup
+        logger.info("preview cache lookup failed for %s: %s", youtube_video_id, exc)
+        return None
+    metadata = video.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    raw = metadata.get("raw")
+    if not isinstance(raw, dict):
+        raw = metadata
+    return raw
+
+
+def _refresh_preview_metadata(youtube_video_id: str) -> dict[str, Any] | None:
+    """Fetch and store fresh Invidious metadata; doubles as enrichment backfill."""
+    try:
+        result = enrich_video(youtube_video_id)
+    except Exception as exc:  # noqa: BLE001 - unplayable is a 404, not a 500
+        logger.info("preview metadata refresh failed for %s: %s", youtube_video_id, exc)
+        return None
+    if not result.get("ok"):
+        return None
+    return _cached_preview_raw(youtube_video_id)
+
+
+def _fetch_preview_upstream(stream_url: str, byte_range: str | None):
+    if not stream_url:
+        return None
+    upstream_headers = {"user-agent": "Mozilla/5.0"}
+    if byte_range:
+        upstream_headers["range"] = byte_range
+    client = _invidious_client()
+    try:
+        # A 302 handed back would quietly turn a proxied preview into a direct
+        # one, leaking the viewer address this proxy exists to keep private.
+        return client.send(
+            client.build_request("GET", stream_url, headers=upstream_headers),
+            stream=True,
+            follow_redirects=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - unplayable is a 404, not a 500
+        logger.info("preview upstream fetch failed: %s", exc)
+        return None
+
+
+def _preview_response(upstream, stream: dict[str, Any]):
+    headers = {"accept-ranges": "bytes"}
+    for name in ("content-length", "content-range", "content-type"):
+        if upstream.headers.get(name):
+            headers[name] = upstream.headers[name]
+    headers.setdefault("content-type", str(stream.get("type") or "video/mp4").split(";")[0])
+    # Full responses are addressable per video id, so a re-hover replays from the
+    # browser cache instead of proxying the opening bytes again.
+    headers["cache-control"] = "private, max-age=300" if upstream.status_code == 200 else "no-store"
+    return StreamingResponse(
+        upstream.iter_bytes(),
+        status_code=upstream.status_code,
         headers=headers,
         background=BackgroundTask(upstream.close),
     )
