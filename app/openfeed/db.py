@@ -71,6 +71,22 @@ def connect() -> Iterator[psycopg.Connection[Any]]:
         yield conn
 
 
+def _tune_ranking_cursor(cur: Any) -> None:
+    """Join strategy for full-library ranking queries.
+
+    The ranking WHERE clauses (CASE over several left joins) defeat the row
+    estimator (~1 row predicted for ~20k), so the planner nest-loops every
+    helper relation once per video row: tens of millions of join-filter
+    comparisons and a multi-second page render. The tables are small enough
+    that hashing is unambiguously right, and the scored sort spills to disk
+    at the default work_mem, so pin both for the transaction. SET LOCAL dies
+    with the connection, and ranking queries open their own, so nothing else
+    is affected.
+    """
+    cur.execute("SET LOCAL enable_nestloop = off")
+    cur.execute("SET LOCAL work_mem = '32MB'")
+
+
 def init_db() -> None:
     schema = SCHEMA_PATH.read_text(encoding="utf-8")
     with connect() as conn:
@@ -151,6 +167,23 @@ _FRESHRSS_LATEST_JOIN = """LEFT JOIN (
                     FROM freshrss_entries fe_dedup
                     ORDER BY fe_dedup.video_id, fe_dedup.updated_at DESC
                 ) fe ON fe.video_id = v.id"""
+
+# Full-library ranking queries must not use the join above: the planner
+# mis-estimates the filtered row count (~1 row instead of ~20k) and turns the
+# derived table into a nested loop, re-running the DISTINCT ON sort once per
+# video row. As a MATERIALIZED CTE the dedup scans the small entries table
+# once and hash-joins, which is what the comment on _FRESHRSS_LATEST_JOIN
+# always intended. Only the ranking queries use this; single-row and
+# channel-filtered lookups keep the plain join, where the nested loop is the
+# right plan. Every query that uses this aliases the videos table `v`.
+_FRESHRSS_LATEST_CTE = """fe_latest AS MATERIALIZED (
+                    SELECT DISTINCT ON (fe_dedup.video_id) fe_dedup.video_id,
+                           fe_dedup.is_read, fe_dedup.is_starred, fe_dedup.subscription_id,
+                           fe_dedup.published_at, fe_dedup.created_at
+                    FROM freshrss_entries fe_dedup
+                    ORDER BY fe_dedup.video_id, fe_dedup.updated_at DESC
+                )"""
+_FRESHRSS_LATEST_JOIN_CTE = "LEFT JOIN fe_latest fe ON fe.video_id = v.id"
 
 
 def is_short_video(row: dict[str, Any]) -> bool:
@@ -2699,9 +2732,10 @@ def list_recommended_videos(limit: int = 50, offset: int = 0, feed_filter: str =
         watched_predicate = """CASE WHEN pp.id IS NULL THEN COALESCE(er.watched_count, 0) = 0 ELSE COALESCE(pp.completed, false) = false AND COALESCE(pp.manually_marked_watched, false) = false END"""
     with connect() as conn:
         with conn.cursor() as cur:
+            _tune_ranking_cursor(cur)
             cur.execute(
                 f"""
-                WITH event_rollup AS (
+                WITH event_rollup AS MATERIALIZED (
                   SELECT video_id,
                          COUNT(*) FILTER (WHERE event_type = 'hide') AS hide_count,
                          COUNT(*) FILTER (WHERE event_type = 'mark_watched') AS watched_count,
@@ -2718,7 +2752,8 @@ def list_recommended_videos(limit: int = 50, offset: int = 0, feed_filter: str =
                   FROM user_video_events
                   WHERE user_key = %s
                   GROUP BY video_id
-                )
+                ),
+                {_FRESHRSS_LATEST_CTE}
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                        v.published_at, v.created_at, v.duration_seconds, v.view_count, v.tags, v.topic_vector, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
                        fe.is_read, fe.is_starred,
@@ -2743,7 +2778,7 @@ def list_recommended_videos(limit: int = 50, offset: int = 0, feed_filter: str =
                          - CASE WHEN COALESCE(pp.percent_completed, 0) > 0 AND COALESCE(pp.percent_completed, 0) < 0.4 THEN 1.5 ELSE 0.0 END AS recommendation_score
                 FROM videos v
                 LEFT JOIN channels c ON c.id = v.channel_id
-                {_FRESHRSS_LATEST_JOIN}
+                {_FRESHRSS_LATEST_JOIN_CTE}
                 LEFT JOIN event_rollup er ON er.video_id = v.id
                 LEFT JOIN user_video_feedback uvf ON uvf.video_id = v.id AND uvf.user_key = %s
                 LEFT JOIN playback_progress pp ON pp.video_id = v.id AND pp.user_key = %s
@@ -2763,9 +2798,10 @@ def list_recommended_videos(limit: int = 50, offset: int = 0, feed_filter: str =
 def list_subscription_recommendations(limit: int = 50, user_key: str = "local") -> list[dict[str, Any]]:
     with connect() as conn:
         with conn.cursor() as cur:
+            _tune_ranking_cursor(cur)
             cur.execute(
                 f"""
-                WITH event_rollup AS (
+                WITH event_rollup AS MATERIALIZED (
                   SELECT video_id,
                          COUNT(*) FILTER (WHERE event_type = 'hide') AS hide_count,
                          COUNT(*) FILTER (WHERE event_type = 'mark_watched') AS watched_count,
@@ -2782,7 +2818,8 @@ def list_subscription_recommendations(limit: int = 50, user_key: str = "local") 
                   FROM user_video_events
                   WHERE user_key = %s
                   GROUP BY video_id
-                )
+                ),
+                {_FRESHRSS_LATEST_CTE}
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                        v.published_at, v.duration_seconds, v.view_count, v.tags, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
                        fe.is_read, fe.is_starred,
@@ -2803,7 +2840,7 @@ def list_subscription_recommendations(limit: int = 50, user_key: str = "local") 
                          - CASE WHEN COALESCE(pp.percent_completed, 0) > 0 AND COALESCE(pp.percent_completed, 0) < 0.4 THEN 1.5 ELSE 0.0 END AS recommendation_score
                 FROM videos v
                 LEFT JOIN channels c ON c.id = v.channel_id
-                {_FRESHRSS_LATEST_JOIN}
+                {_FRESHRSS_LATEST_JOIN_CTE}
                 LEFT JOIN event_rollup er ON er.video_id = v.id
                 LEFT JOIN user_video_feedback uvf ON uvf.video_id = v.id AND uvf.user_key = %s
                 LEFT JOIN playback_progress pp ON pp.video_id = v.id AND pp.user_key = %s
@@ -3050,9 +3087,10 @@ def list_discovery_videos(limit: int = 50, user_key: str = "local") -> list[dict
     candidate_limit = max(limit * 6, 120)
     with connect() as conn:
         with conn.cursor() as cur:
+            _tune_ranking_cursor(cur)
             cur.execute(
                 f"""
-                WITH event_rollup AS (
+                WITH event_rollup AS MATERIALIZED (
                   SELECT video_id,
                          COUNT(*) FILTER (WHERE event_type = 'hide') AS hide_count,
                          COUNT(*) FILTER (WHERE event_type = 'mark_watched') AS watched_count,
@@ -3069,7 +3107,8 @@ def list_discovery_videos(limit: int = 50, user_key: str = "local") -> list[dict
                   FROM user_video_events
                   WHERE user_key = %s
                   GROUP BY video_id
-                )
+                ),
+                {_FRESHRSS_LATEST_CTE}
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                        v.published_at, v.duration_seconds, v.view_count, v.tags, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
                        fe.is_read, fe.is_starred, v.source_kind, v.discovery_source,
@@ -3084,7 +3123,7 @@ def list_discovery_videos(limit: int = 50, user_key: str = "local") -> list[dict
                          - CASE WHEN COALESCE(pp.percent_completed, 0) > 0 AND COALESCE(pp.percent_completed, 0) < 0.4 THEN 1.5 ELSE 0.0 END AS recommendation_score
                 FROM videos v
                 LEFT JOIN channels c ON c.id = v.channel_id
-                {_FRESHRSS_LATEST_JOIN}
+                {_FRESHRSS_LATEST_JOIN_CTE}
                 LEFT JOIN event_rollup er ON er.video_id = v.id
                 LEFT JOIN user_video_feedback uvf ON uvf.video_id = v.id AND uvf.user_key = %s
                 LEFT JOIN playback_progress pp ON pp.video_id = v.id AND pp.user_key = %s

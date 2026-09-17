@@ -5,7 +5,10 @@ query used to `LEFT JOIN freshrss_entries fe ON fe.video_id = v.id`, which
 multiplied one video into N rows and made LIMITs count duplicates. All such
 queries must reuse the shared ``db._FRESHRSS_LATEST_JOIN`` fragment
 (``DISTINCT ON (video_id) ... ORDER BY video_id, updated_at DESC``): one row per
-video, newest row wins for is_read/is_starred.
+video, newest row wins for is_read/is_starred. Full-library ranking queries use
+its materialized-CTE twin (``db._FRESHRSS_LATEST_CTE`` +
+``db._FRESHRSS_LATEST_JOIN_CTE``), which dedupes identically but evaluates once
+instead of once per video row.
 
 DB/network-free: a fake cursor emulates Postgres join semantics against an
 in-memory table -- a plain join fans out, the dedup fragment keeps one row per
@@ -156,12 +159,13 @@ def _capture_all_sql(callback: Any) -> list[tuple[str, Any]]:
 
 class FreshrssLatestJoinTests(unittest.TestCase):
     def test_fragment_contract(self) -> None:
-        fragment = db._FRESHRSS_LATEST_JOIN
-        self.assertIn("DISTINCT ON", fragment)
-        self.assertIn("ORDER BY fe_dedup.video_id, fe_dedup.updated_at DESC", fragment)
-        self.assertIn("fe.video_id = v.id", fragment)
-        for column in ("is_read", "is_starred", "subscription_id", "published_at", "created_at"):
-            self.assertIn(column, fragment)
+        for fragment in (db._FRESHRSS_LATEST_JOIN, db._FRESHRSS_LATEST_CTE):
+            self.assertIn("DISTINCT ON", fragment)
+            self.assertIn("ORDER BY fe_dedup.video_id, fe_dedup.updated_at DESC", fragment)
+            for column in ("is_read", "is_starred", "subscription_id", "published_at", "created_at"):
+                self.assertIn(column, fragment)
+        self.assertIn("fe.video_id = v.id", db._FRESHRSS_LATEST_JOIN)
+        self.assertIn("fe.video_id = v.id", db._FRESHRSS_LATEST_JOIN_CTE)
 
     def test_list_recent_videos_returns_one_row_per_video(self) -> None:
         rows, _ = _run_emulated(lambda: db.list_recent_videos(50))
@@ -226,7 +230,12 @@ class FreshrssLatestJoinTests(unittest.TestCase):
         video_queries = [q for q, _ in calls if "freshrss_entries" in q or "DISTINCT ON" in q]
         self.assertTrue(video_queries, "expected at least one video query")
         for query in video_queries:
-            self.assertIn(db._FRESHRSS_LATEST_JOIN, query)
+            # Full-library ranking queries use the materialized-CTE twin of the
+            # shared fragment (same dedup, evaluated once instead of once per
+            # row); everything else inlines the fragment directly.
+            uses_inline = db._FRESHRSS_LATEST_JOIN in query
+            uses_cte = db._FRESHRSS_LATEST_CTE in query and db._FRESHRSS_LATEST_JOIN_CTE in query
+            self.assertTrue(uses_inline or uses_cte, "video query must reuse a shared dedup fragment")
             self.assertNotIn(_PLAIN_JOIN, query)
         for query, _ in calls:
             self.assertNotIn(_PLAIN_JOIN, query)
