@@ -13,6 +13,7 @@ import time
 import urllib.parse
 import zlib
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from html import escape, unescape
@@ -30,7 +31,6 @@ import redis
 from . import __version__, db
 from .config import get_settings
 from .discovery import discover_related_videos
-from .freshrss import FreshRSSClient
 from .enrichment import (
     backfill_subscription_art,
     enrich_channel,
@@ -41,7 +41,8 @@ from .enrichment import (
 )
 from . import discovery, downloads, ryd, takeout, tokens, ytdlp
 from .playback import PlaybackError, download_options, playback_for_video
-from .sync import sync_freshrss_once
+from .rss import fetch_channel_feed, parse_channel_feed, sync_rss_once
+from .youtube_ids import CHANNEL_ID_STRICT_RE, youtube_channel_id_from_text
 
 
 @asynccontextmanager
@@ -442,7 +443,7 @@ def _auth_error_page(title: str, detail: str, missing: list[str] | None = None, 
     missing_html = ""
     if missing:
         missing_html = "<ul>" + "".join(f"<li><code>{escape(item)}</code></li>" for item in missing) + "</ul>"
-    content = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{escape(title)} - OpenFeed</title>{_head_icons()}<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f0f10;color:#f1f1f1;font-family:Inter,system-ui,sans-serif}}main{{width:min(560px,calc(100vw - 32px));border:1px solid rgba(255,255,255,.09);border-radius:18px;background:#181818;padding:24px}}h1{{margin:0 0 10px;font-size:24px}}p{{color:#a8a8a8;line-height:1.5}}code{{background:#242424;border-radius:6px;padding:2px 6px}}a{{color:#ff4d67}}</style></head><body><main><h1>{escape(title)}</h1><p>{escape(detail)}</p>{missing_html}<p><a href="/">Return to OpenFeed</a></p></main></body></html>'''
+    content = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{escape(title)} - OpenFeed</title>{_head_icons()}<style>:root{{--bg:#0a0a0b;--surface:#121214;--surface-2:#1a1a1d;--border:rgba(255,255,255,.09);--text:#ededef;--muted:#8b8b93;--accent:#e5484d;--r-panel:14px}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif}}main{{width:min(560px,calc(100vw - 32px));border:1px solid var(--border);border-radius:18px;background:var(--surface);padding:24px}}h1{{margin:0 0 10px;font-size:22px;font-weight:650;letter-spacing:-.022em}}p{{color:var(--muted);line-height:1.5}}code{{background:var(--surface-2);border-radius:6px;padding:2px 6px;color:var(--text)}}a{{color:var(--accent)}}</style></head><body><main><h1>{escape(title)}</h1><p>{escape(detail)}</p>{missing_html}<p><a href="/">Return to OpenFeed</a></p></main></body></html>'''
     return Response(content, status_code=status_code, media_type="text/html; charset=utf-8")
 
 
@@ -558,6 +559,10 @@ class CommentReactionRequest(BaseModel):
     youtube_video_id: str
     comment_id: str
     reaction: str = ""
+
+
+class CommentAvatarsRequest(BaseModel):
+    author_ids: list[str] = Field(default_factory=list)
 
 
 class FeedbackRequest(BaseModel):
@@ -707,9 +712,17 @@ def _redis_status() -> dict[str, Any]:
     settings = get_settings()
     try:
         client = redis.Redis.from_url(settings.redis_url, socket_timeout=2, socket_connect_timeout=2)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
         return {"ok": bool(client.ping())}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def _json_ready_value(value: Any) -> Any:
@@ -747,14 +760,40 @@ def _check_redis() -> dict[str, Any]:
     return _redis_status()
 
 
-def _check_freshrss() -> dict[str, Any]:
-    settings = get_settings()
-    if not settings.freshrss_configured:
-        return {"ok": False, "configured": False, "base_url": settings.freshrss_base_url}
-    client = FreshRSSClient(settings)
-    with httpx.Client(timeout=8.0, follow_redirects=True) as http_client:
-        client.authenticate(http_client)
-    return {"ok": True, "configured": True, "base_url": settings.freshrss_base_url}
+def _rss_poller_status() -> dict[str, Any]:
+    """Last direct-RSS sync result, for the health check and settings surfaces.
+
+    Built from the newest ``rss`` sync run: ok only when that run succeeded,
+    with its finish time and entry count so the settings page can say when the
+    poller last ran and what it pulled in. Never raises — a status read must
+    not take the page down with it.
+    """
+    try:
+        run = db.latest_sync_run("rss")
+    except Exception as exc:  # noqa: BLE001 - status reads degrade, they never fail
+        return {"ok": False, "error": f"could not read sync history: {exc}"[:200]}
+    if run is None:
+        return {"ok": False, "error": "RSS poller has not run yet"}
+    finished = run.get("finished_at") or run.get("started_at")
+    # "ok" is the pre-cutover vocabulary; "success" is current. Both mean ran fine.
+    if run.get("status") in ("success", "ok"):
+        return {
+            "ok": True,
+            "last_run_at": _json_ready_value(finished),
+            "subscriptions_count": run.get("subscriptions_count") or 0,
+            "entries_count": run.get("entries_count") or 0,
+        }
+    return {
+        "ok": False,
+        "status": run.get("status"),
+        "last_run_at": _json_ready_value(finished),
+        "entries_count": run.get("entries_count") or 0,
+        "error": str(run.get("message") or "last RSS sync did not succeed")[:300],
+    }
+
+
+def _check_rss_poller() -> dict[str, Any]:
+    return _rss_poller_status()
 
 
 def _check_invidious_api() -> dict[str, Any]:
@@ -822,12 +861,12 @@ def full_status_payload() -> dict[str, Any]:
     checks = {
         "database": _timed_check("database", _check_database),
         "redis": _timed_check("redis", _check_redis),
-        "freshrss": _timed_check("freshrss", _check_freshrss),
+        "rss_poller": _timed_check("rss_poller", _check_rss_poller),
         "invidious_api": _timed_check("invidious_api", _check_invidious_api),
         "invidious_player": _timed_check("invidious_player", _check_invidious_player),
         "recommended_feed": _timed_check("recommended_feed", _feed_status),
     }
-    critical = ["database", "redis", "freshrss", "invidious_api", "invidious_player", "recommended_feed"]
+    critical = ["database", "redis", "rss_poller", "invidious_api", "invidious_player", "recommended_feed"]
     counts = _json_ready_value(db.system_counts())
     return {
         "ok": all(bool(checks[name].get("ok")) for name in critical),
@@ -878,7 +917,7 @@ def _invidious_client() -> httpx.Client:
         with _PROXY_CLIENT_LOCK:
             if _PROXY_CLIENT is None:
                 _PROXY_CLIENT = httpx.Client(
-                    timeout=httpx.Timeout(None, connect=8.0),
+                    timeout=httpx.Timeout(60.0, connect=8.0),
                     follow_redirects=False,
                     limits=httpx.Limits(max_connections=96, max_keepalive_connections=48, keepalive_expiry=90.0),
                 )
@@ -908,7 +947,10 @@ def proxy_invidious(request: Request, upstream_path: str):
         url = f"{url}?{query}"
     client = _invidious_client()
     upstream_request = client.build_request(request.method, url, headers=_invidious_proxy_headers(request))
-    upstream_response = client.send(upstream_request, stream=True)
+    try:
+        upstream_response = client.send(upstream_request, stream=True)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Invidious request failed: {exc}") from exc
     headers = _response_headers(upstream_response.headers)
     location = headers.get("location")
     if location and location.startswith(settings.invidious_base_url):
@@ -927,6 +969,7 @@ def proxy_invidious(request: Request, upstream_path: str):
 _STATIC_ASSETS: dict[str, str] = {
     "favicon-32.png": "image/png",
     "apple-touch-icon.png": "image/png",
+    "openfeed-logo.png": "image/png",
 }
 _ASSET_DIR = Path(__file__).parent / "assets"
 
@@ -941,8 +984,9 @@ def static_asset(name: str) -> Response:
         body = (_ASSET_DIR / name).read_bytes()
     except OSError:
         raise HTTPException(status_code=404, detail="Not found")
-    # Immutable in practice — the filenames change if the artwork does.
-    return Response(body, media_type=media_type, headers={"cache-control": "public, max-age=604800, immutable"})
+    # Fixed filenames with no content hash, so no `immutable`: a replaced file under
+    # the same name must revalidate within the hour rather than sticking forever.
+    return Response(body, media_type=media_type, headers={"cache-control": "public, max-age=3600"})
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -955,16 +999,15 @@ def favicon() -> Response:
 
 @app.get("/healthz")
 def healthz() -> dict[str, Any]:
-    settings = get_settings()
     database = db.db_status()
     cache = _redis_status()
     return {
-        "ok": database.get("ok") and cache.get("ok"),
+        "ok": bool(database.get("ok") and cache.get("ok")),
         "service": "OpenFeed",
         "version": __version__,
         "database": database,
         "redis": cache,
-        "freshrss_configured": settings.freshrss_configured,
+        "rss_poller": _rss_poller_status(),
     }
 
 
@@ -996,7 +1039,7 @@ def _status_page_html(user_key: str = "local") -> str:
     storage = backends.get("downloads") or {}
 
     labels = {
-        "database": "Postgres", "redis": "Redis", "freshrss": "FreshRSS",
+        "database": "Postgres", "redis": "Redis", "rss_poller": "RSS poller",
         "invidious_api": "Invidious API", "invidious_player": "Invidious player",
         "recommended_feed": "Recommended feed",
     }
@@ -1170,6 +1213,14 @@ _THUMB_PATH = (
     'a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/> <path d="M7 10v12"/>'
 )
 
+# Shared geometry for aliases: "later" is the clock, "collections" is the grid view.
+# One variable each so the copies can never drift out of sync again.
+_CLOCK_PATH = '<circle cx="12" cy="12" r="10"/> <path d="M12 6v6l4 2"/>'
+_GRID_PATH = (
+    '<rect width="7" height="7" x="3" y="3" rx="1"/> <rect width="7" height="7" x="14" y="3" rx="1"/>'
+    ' <rect width="7" height="7" x="14" y="14" rx="1"/> <rect width="7" height="7" x="3" y="14" rx="1"/>'
+)
+
 ICON_PATHS = {
     "home": '<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/> <path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
     "discover": '<circle cx="12" cy="12" r="10"/> <path d="m16.24 7.76-1.804 5.411a2 2 0 0 1-1.265 1.265L7.76 16.24l1.804-5.411a2 2 0 0 1 1.265-1.265z"/>',
@@ -1185,7 +1236,7 @@ ICON_PATHS = {
     "bell-ring": '<path d="M10.268 21a2 2 0 0 0 3.464 0"/> <path d="M22 8c0-2.3-.8-4.3-2-6"/> <path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/> <path d="M4 2C2.8 3.7 2 5.7 2 8"/>',
     "bell-off": '<path d="M10.268 21a2 2 0 0 0 3.464 0"/> <path d="M17 17H4a1 1 0 0 1-.74-1.673C4.59 13.956 6 12.499 6 8a6 6 0 0 1 .258-1.742"/> <path d="m2 2 20 20"/> <path d="M8.668 3.01A6 6 0 0 1 18 8c0 2.687.77 4.653 1.707 6.05"/>',
     "user": '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/> <circle cx="12" cy="7" r="4"/>',
-    "clock": '<circle cx="12" cy="12" r="10"/> <path d="M12 6v6l4 2"/>',
+    "clock": _CLOCK_PATH,
     "like": _THUMB_PATH,
     "dislike": f'<g transform="rotate(180 12 12)">{_THUMB_PATH}</g>',
     "hide": '<path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/> <path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/> <path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/> <path d="m2 2 20 20"/>',
@@ -1196,15 +1247,15 @@ ICON_PATHS = {
     "theater": '<rect x="2" y="5" width="20" height="14" rx="2"/> <path d="M2 9h20"/>',
     "shorts": '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>',
     "playlist": '<path d="M21 5H3"/> <path d="M10 12H3"/> <path d="M10 19H3"/> <path d="M15 12.003a1 1 0 0 1 1.517-.859l4.997 2.997a1 1 0 0 1 0 1.718l-4.997 2.997a1 1 0 0 1-1.517-.86z"/>',
-    "later": '<circle cx="12" cy="12" r="10"/> <path d="M12 6v6l4 2"/>',
+    "later": _CLOCK_PATH,
     "settings": '<path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"/> <circle cx="12" cy="12" r="3"/>',
     "caption": '<rect width="18" height="14" x="3" y="5" rx="2" ry="2"/> <path d="M7 15h4M15 15h2M7 11h2M13 11h4"/>',
     "spark": '<path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"/> <path d="M20 2v4"/> <path d="M22 4h-4"/> <circle cx="4" cy="20" r="2"/>',
     "x": '<path d="M18 6 6 18"/> <path d="m6 6 12 12"/>',
     "subs": '<path d="M15.033 9.44a.647.647 0 0 1 0 1.12l-4.065 2.352a.645.645 0 0 1-.968-.56V7.648a.645.645 0 0 1 .967-.56z"/> <path d="M7 21h10"/> <rect width="20" height="14" x="2" y="3" rx="2"/>',
     "history": '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/> <path d="M3 3v5h5"/> <path d="M12 7v5l4 2"/>',
-    "collections": '<rect width="7" height="7" x="3" y="3" rx="1"/> <rect width="7" height="7" x="14" y="3" rx="1"/> <rect width="7" height="7" x="14" y="14" rx="1"/> <rect width="7" height="7" x="3" y="14" rx="1"/>',
-    "grid-view": '<rect width="7" height="7" x="3" y="3" rx="1"/> <rect width="7" height="7" x="14" y="3" rx="1"/> <rect width="7" height="7" x="14" y="14" rx="1"/> <rect width="7" height="7" x="3" y="14" rx="1"/>',
+    "collections": _GRID_PATH,
+    "grid-view": _GRID_PATH,
     "list-view": '<rect width="18" height="18" x="3" y="3" rx="2"/> <path d="M21 9H3"/> <path d="M21 15H3"/>',
     "verified": '<path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z"/> <path d="m9 12 2 2 4-4"/>',
     "chevron-right": '<path d="m9 18 6-6-6-6"/>',
@@ -1226,20 +1277,16 @@ ICON_PATHS = {
 def _brand_mark() -> str:
     """The OpenFeed logo.
 
-    The previous mark set the word "Open" in 9px type inside a 22px tile, which at that
-    size is a grey smear rather than a word. This is a shape instead: a play triangle with
-    two broadcast arcs behind it — play for video, arcs for a feed — which survives being
-    22px because it has no small detail to lose.
+    The real artwork, the same file the README uses, served at /assets/openfeed-logo.png.
+    It survives 26px for the same reason the drawn mark it replaced did: one bold
+    silhouette with a single counter and no small detail to lose. It carries its own
+    gradient and its own transparency, so the tile behind it stays empty — a red plate
+    under a red-to-pink mark would only muddy it.
     """
     return (
         '<span class="brand-mark" aria-hidden="true">'
-        '<svg viewBox="0 0 24 24" focusable="false">'
-        '<path d="M6.6 9.1a5.2 5.2 0 0 1 0 5.8" fill="none" stroke="currentColor" '
-        'stroke-width="1.9" stroke-linecap="round" opacity=".55"/>'
-        '<path d="M9.7 10.6a2 2 0 0 1 0 2.8" fill="none" stroke="currentColor" '
-        'stroke-width="1.9" stroke-linecap="round" opacity=".8"/>'
-        '<path d="M13.1 7.7 19 12l-5.9 4.3a.7.7 0 0 1-1.1-.6V8.3a.7.7 0 0 1 1.1-.6Z" fill="currentColor"/>'
-        '</svg></span>'
+        '<img src="/assets/openfeed-logo.png" alt="" width="26" height="26" decoding="async">'
+        '</span>'
     )
 
 
@@ -1307,6 +1354,22 @@ def _is_recent(value: Any) -> bool:
     return (datetime.now(timezone.utc) - date.astimezone(timezone.utc)).total_seconds() <= 14 * 86400
 
 
+def _published_date_is_decoded(value: Any) -> bool:
+    """Whether a publish date was decoded from relative text rather than reported.
+
+    Same signature the repair queue selects on: list endpoints yield "2 days ago"
+    turned absolute at fetch time, so the timestamp carries the wall-clock of the
+    fetch; the single-video endpoint reports a real calendar date, which lands at
+    midnight UTC. A video showing a decoded date reads as freshly published and
+    sorts wrong until something re-reads it.
+    """
+    if not isinstance(value, datetime):
+        return False
+    date = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    wall = date.astimezone(timezone.utc)
+    return bool(wall.hour or wall.minute or wall.second or wall.microsecond)
+
+
 def _avatar_initials(name: str) -> str:
     words = [part for part in re.split(r"\s+", name.strip()) if part]
     if not words:
@@ -1363,7 +1426,7 @@ SIDEBAR_VISIBLE_CHANNELS = 7
 
 def _sidebar_channels(limit: int = 250) -> list[dict[str, Any]]:
     try:
-        rows = db.list_subscriptions(limit * 3)
+        rows = db.list_subscriptions(limit)
     except Exception:
         return []
     channels: list[dict[str, Any]] = []
@@ -1377,21 +1440,31 @@ def _sidebar_channels(limit: int = 250) -> list[dict[str, Any]]:
     return channels
 
 
-def _sidebar_subscription_group() -> str:
+def _sidebar_subscription_group(limit: int = SIDEBAR_VISIBLE_CHANNELS + 1) -> str:
     """Rendered on its own so /api/sidebar/subscriptions can swap it in after a
-    subscription change without reloading the page."""
-    channels = _sidebar_channels()
+    subscription change without reloading the page.
+
+    The shell renders only a SIDEBAR_VISIBLE_CHANNELS + 1 probe: enough to show the
+    first screenful and to know whether more exist. The full list loads through
+    /api/sidebar/subscriptions (limit=250) when it is actually expanded, so every
+    page render does not pay for up to 750 subscription rows to draw seven links.
+    """
+    channels = _sidebar_channels(limit)
     if not channels:
         return ""
     rows = []
     for index, channel in enumerate(channels):
         name = str(channel.get("title") or "Channel")
         channel_id = escape(str(channel.get("youtube_channel_id") or ""))
-        dot = '<span class="nav-dot" aria-hidden="true"></span>' if _is_recent(channel.get("latest_video_at")) else ""
+        # The dot is not color-only: it carries sr-only "New" text so screen
+        # readers announce fresh channels (aria-hidden would silence it).
+        dot = '<span class="nav-dot"><span class="sr-only">New</span></span>' if _is_recent(channel.get("latest_video_at")) else ""
         avatar = _avatar_html(name, channel.get("channel_avatar_url") or channel.get("avatar_url"))
         # Everything past the first few is rendered but hidden, so "Show more" is instant
-        # and needs no request. The list used to stop at seven with no way to reach the
-        # rest, which made a 73-channel subscription list look like it had seven in it.
+        # and needs no request. The shell only fetches a VISIBLE + 1 probe, so a capped
+        # fetch means more may exist beyond what is rendered here — the count is exact
+        # only when the fetch was not capped, and the full list arrives through
+        # /api/sidebar/subscriptions when the group is expanded or refreshed.
         extra = " nav-channel-extra" if index >= SIDEBAR_VISIBLE_CHANNELS else ""
         hidden = " hidden" if index >= SIDEBAR_VISIBLE_CHANNELS else ""
         rows.append(
@@ -1400,11 +1473,15 @@ def _sidebar_subscription_group() -> str:
         )
     toggle = ""
     if len(channels) > SIDEBAR_VISIBLE_CHANNELS:
-        remaining = len(channels) - SIDEBAR_VISIBLE_CHANNELS
+        if len(channels) >= limit:
+            more_label = "Show more"
+        else:
+            remaining = len(channels) - SIDEBAR_VISIBLE_CHANNELS
+            more_label = f"Show {remaining} more"
         toggle = (
             f'<button class="nav-item nav-more" type="button" data-subscription-more '
-            f'data-more-label="Show {remaining} more" data-less-label="Show less" aria-expanded="false">'
-            f'{_icon("chevron-down")}<span>Show {remaining} more</span></button>'
+            f'data-more-label="{more_label}" data-less-label="Show less" aria-expanded="false">'
+            f'{_icon("chevron-down")}<span>{more_label}</span></button>'
         )
     return (
         '<nav class="nav-group" data-subscription-nav>'
@@ -1457,14 +1534,22 @@ def _home_nav(active: str = "home") -> str:
     return "".join(blocks)
 
 
-def _mobile_nav() -> str:
+def _mobile_nav(active: str = "home") -> str:
+    # Labels match the sidebar verbatim and every entry goes to the page it names:
+    # Subscriptions is /subscriptions (not /channels) and the library slot is
+    # Playlists at /playlists. History keeps the history icon, not the library one.
     links = [
-        ("Home", "/", "home"),
-        ("Subs", "/channels", "subs"),
-        ("Library", "/history", "library"),
-        ("Library", "/history", "library"),
+        ("home", "Home", "/", "home"),
+        ("shorts", "Shorts", "/shorts", "shorts"),
+        ("subscriptions", "Subscriptions", "/subscriptions", "subs"),
+        ("history", "History", "/history", "history"),
+        ("playlists", "Playlists", "/playlists", "playlist"),
     ]
-    return "".join(f'<a class="mobile-nav-item" href="{href}">{_icon(icon)}<span>{escape(label)}</span></a>' for label, href, icon in links)
+    items = []
+    for key, label, href, icon in links:
+        current = ' aria-current="page"' if key == active else ""
+        items.append(f'<a class="mobile-nav-item" href="{href}"{current}>{_icon(icon)}<span>{escape(label)}</span></a>')
+    return "".join(items)
 
 
 def _topic_tokens_from_videos(videos: list[dict[str, Any]], limit: int = 7) -> list[str]:
@@ -1589,8 +1674,8 @@ def _subscription_feed_for_video(video: dict[str, Any]) -> str:
     Subscription belongs to the channel, not to the route a particular video took to get
     here. A video pulled in by recommendations or search has no freshrss_entries row, so
     reading only the entry-level join reported "Subscribe" for channels that were already
-    subscribed — and pressing that button asked FreshRSS to add a feed it already had,
-    which fails. The channel-level column is therefore the authority, with the entry-level
+    subscribed — and pressing that button re-added a feed that was already there.
+    The channel-level column is therefore the authority, with the entry-level
     one kept as a fallback for rows fetched by queries that do not select it.
     """
     return str(
@@ -2223,7 +2308,12 @@ def _settings_dialog(user: dict[str, Any] | None = None, user_key: str = "local"
     require_login = "Required" if settings.require_login else "Optional"
     required_group = escape(settings.required_group or "None")
     authorized = "Allowed" if _user_has_required_access(user) else "Missing group"
-    freshrss = "Connected" if settings.freshrss_configured else "Not configured"
+    rss_status = _rss_poller_status()
+    if rss_status.get("ok"):
+        last_run = rss_status.get("last_run_at") or "recently"
+        rss_poller = f"OK — last sync {last_run} ({rss_status.get('entries_count') or 0} entries)"
+    else:
+        rss_poller = f"Not synced ({rss_status.get('error') or 'no sync runs recorded'})"
     panes = [
         ("playback", "Playback", "play"),
         ("content", "Content", "home"),
@@ -2327,7 +2417,7 @@ def _settings_dialog(user: dict[str, Any] | None = None, user_key: str = "local"
                 <h3>Services</h3>
                 <p>The backends OpenFeed depends on.</p>
               </header>
-              <dl class="settings-list"><dt>FreshRSS</dt><dd>{freshrss}</dd><dt>Invidious</dt><dd>{escape(settings.invidious_public_url or "Not configured")}</dd></dl>
+              <dl class="settings-list"><dt>RSS poller</dt><dd>{escape(rss_poller)}</dd><dt>Invidious</dt><dd>{escape(settings.invidious_public_url or "Not configured")}</dd></dl>
               
             </section>
           </div>
@@ -2494,7 +2584,7 @@ def _feed_title_for_filter(feed_filter: str) -> str:
 def _missed_subscription_videos(limit: int = 8, user_key: str = "local", pool: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Subscription videos worth catching up on.
 
-    Prefers entries FreshRSS still marks unread. FreshRSS installs that mark
+    Prefers entries still marked unread. New entries arrive unread, and marking
     everything read on import would otherwise leave this shelf permanently
     empty, so fall back to videos with no OpenFeed watch progress.
     """
@@ -2874,9 +2964,17 @@ def _home_styles() -> str:
       a { color: inherit; text-decoration: none; }
       button, input, select { font: inherit; letter-spacing: inherit; }
       button { color: inherit; }
-      h1, h2, h3 { letter-spacing: -.018em; font-weight: 600; }
+      /* Scoped to page content: the app shell, dialogs and menus style their own
+         headings explicitly, so a global rule only leaked letter-spacing into them. */
+      main h1, main h2, main h3 { letter-spacing: -.018em; font-weight: 600; }
       .icon { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; flex: 0 0 auto; }
       :focus-visible { outline: none; box-shadow: var(--focus); }
+      /* Keyboard-only way past the header/sidebar/nav. Hidden until focused. */
+      .skip-link { position: fixed; top: -48px; left: 12px; z-index: 200; border-radius: 999px; background: var(--surface-2); color: var(--text); border: 1px solid var(--border); padding: 8px 14px; font-size: 13px; transition: top .12s ease; }
+      .skip-link:focus-visible { top: 8px; box-shadow: var(--focus); }
+      /* The skip-link target itself takes programmatic focus; a ring around the whole
+         page would be noise, so only the link shows one. */
+      #main:focus { box-shadow: none; }
       ::-webkit-scrollbar { width: 10px; height: 10px; }
       ::-webkit-scrollbar-thumb { background: #2a2a2e; border: 3px solid var(--bg); border-radius: 999px; }
       ::-webkit-scrollbar-thumb:hover { background: #35353a; }
@@ -2885,9 +2983,8 @@ def _home_styles() -> str:
       .app-header { position: fixed; top: 0; left: 0; right: 0; z-index: 60; height: var(--header); background: rgba(10,10,11,.86); backdrop-filter: saturate(160%) blur(14px); border-bottom: 1px solid var(--border-soft); display: grid; grid-template-columns: minmax(150px, 1fr) minmax(0, 560px) minmax(150px, 1fr); align-items: center; gap: 16px; padding: 0 16px; }
       .header-left { display: flex; align-items: center; gap: 6px; min-width: 0; }
       .brand { display: inline-flex; align-items: center; gap: 9px; padding: 0 6px; font-size: 16px; letter-spacing: -.025em; color: var(--text); }
-      .brand-mark { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 8px;
-        background: var(--accent); color: #fff; }
-      .brand-mark svg { width: 24px; height: 24px; display: block; }
+      .brand-mark { display: grid; place-items: center; width: 26px; height: 26px; }
+      .brand-mark img { width: 26px; height: 26px; display: block; object-fit: contain; }
       /* "Open" light, "Feed" solid: the weight break carries the wordmark, so the tile
          does not have to hold a word at 9px to say what this is. */
       .brand-word { font-weight: 400; color: var(--muted); }
@@ -2899,9 +2996,11 @@ def _home_styles() -> str:
       .search-form:focus-within { border-color: rgba(255,255,255,.22); background: var(--surface-2); }
       .search-form input { flex: 1; min-width: 0; height: 100%; border: 0; background: transparent; color: var(--text); padding: 0 16px; outline: none; font-size: 13.5px; }
       .search-form input::placeholder { color: var(--muted-2); }
+      /* Outset ring would clip under the form's overflow:hidden, so the input gets an
+         inset one; the form border still lights up via :focus-within above. */
+      .search-form input:focus-visible { box-shadow: inset 0 0 0 2px rgba(255,255,255,.3); border-radius: 999px; }
       .search-form button { width: 52px; height: 100%; border: 0; border-left: 1px solid var(--border-soft); background: var(--surface-2); display: grid; place-items: center; cursor: pointer; color: var(--muted); }
       .search-form button:hover { color: var(--text); background: var(--surface-3); }
-      .header-mic { display: none; }
       .header-actions { display: flex; justify-content: flex-end; align-items: center; gap: 6px; }
       /* The bell is a 34px hit area around a 20px glyph; the avatar is a bare 28px circle
          with no padding of its own. Matching gaps therefore look uneven, and the avatar
@@ -2933,10 +3032,10 @@ def _home_styles() -> str:
       .nav-channel span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .nav-channel .avatar { width: 24px; height: 24px; font-size: 9.5px; }
       .nav-dot { width: 5px; height: 5px; margin-left: auto; border-radius: 999px; background: var(--accent); flex: 0 0 auto; }
-      .sidebar-meta { color: var(--muted-2); font-size: 11.5px; line-height: 1.6; padding: 14px 10px 0; }
+      .sidebar-meta { color: var(--muted); font-size: 11.5px; line-height: 1.6; padding: 14px 10px 0; }
       .sidebar-meta p { margin: 0 0 4px; }
       .sidebar-meta .source-offer { margin-top: 10px; }
-      .sidebar-meta .source-offer a { color: var(--muted-2); text-decoration: none; border-bottom: 1px solid transparent; }
+      .sidebar-meta .source-offer a { color: var(--muted); text-decoration: none; border-bottom: 1px solid transparent; }
       .sidebar-meta .source-offer a:hover { color: var(--text); border-bottom-color: currentColor; }
 
       /* ---------- page frame ---------- */
@@ -2961,10 +3060,10 @@ def _home_styles() -> str:
       .topic-wrap { position: sticky; top: var(--header); z-index: 40; margin: -20px -32px 20px; padding: 12px 32px; background: rgba(10,10,11,.9); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border-soft); overflow-x: auto; scrollbar-width: none; }
       .topic-wrap::-webkit-scrollbar, .creator-strip::-webkit-scrollbar, .shelf-track::-webkit-scrollbar, .page-tabs::-webkit-scrollbar { display: none; }
       .topic-row { display: flex; align-items: center; gap: 8px; width: max-content; min-width: 100%; }
-      .topic-chip { height: 32px; border: 1px solid transparent; border-radius: 8px; background: var(--surface-2); color: var(--text); padding: 0 12px; white-space: nowrap; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; font-size: 13.5px; line-height: 1; transition: background .12s ease, color .12s ease; }
+      .topic-chip { height: 34px; border: 1px solid transparent; border-radius: 999px; background: var(--surface-2); color: var(--text); padding: 0 14px; white-space: nowrap; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; font-size: 13.5px; line-height: 1; transition: background .12s ease, color .12s ease; }
       .topic-chip:hover { background: var(--surface-3); }
       .topic-chip.active { background: #f1f1f3; color: #0a0a0b; font-weight: 500; }
-      .topic-action { flex: 0 0 auto; width: 32px; padding: 0; color: var(--text); }
+      .topic-action { flex: 0 0 auto; width: 34px; padding: 0; color: var(--text); }
       .topic-action .icon { width: 16px; height: 16px; }
       .topic-divider { width: 1px; height: 18px; background: var(--border); flex: 0 0 auto; margin: 0 4px; }
       .creator-strip { display: none; overflow-x: auto; gap: 14px; padding: 4px 0 14px; }
@@ -3031,7 +3130,7 @@ def _home_styles() -> str:
       .channel-line { display: flex; align-items: center; gap: 4px; }
       .channel-line a:hover { color: var(--text); }
       .verified { width: 12px; height: 12px; flex: 0 0 auto; color: var(--muted-2); }
-      .metadata { margin-top: 2px; color: var(--muted-2); font-variant-numeric: tabular-nums; }
+      .metadata { margin-top: 2px; color: var(--muted); font-variant-numeric: tabular-nums; }
       .card-badges { display: none; }
       .video-card-featured h3 { font-size: 14px; }
       .video-card-mini { display: grid; grid-template-columns: minmax(110px, 160px) minmax(0, 1fr) 22px; gap: 10px; align-items: start; }
@@ -3043,8 +3142,12 @@ def _home_styles() -> str:
       .yt-menu { position: relative; min-width: 0; }
       .yt-menu > summary { list-style: none; cursor: pointer; }
       .yt-menu > summary::-webkit-details-marker { display: none; }
+      .yt-menu > summary:focus-visible { box-shadow: var(--focus); }
       .card-menu { justify-self: end; }
-      .menu-trigger { width: 22px; height: 26px; border-radius: 6px; display: grid; place-items: center; color: var(--muted); }
+      /* The layout box stays 22x26 so card grids keep their column: min-width/height
+         (this stylesheet is border-box, so padding alone cannot grow the box) reach
+         32x32, and the negative margin pulls the footprint back to 22x26. */
+      .menu-trigger { width: 22px; height: 26px; min-width: 32px; min-height: 32px; margin: -3px -5px; border-radius: 6px; display: grid; place-items: center; color: var(--muted); }
       .menu-trigger .icon { width: 16px; height: 16px; }
       .menu-trigger:hover, .yt-menu[open] > .menu-trigger, .header-menu[open] > summary, .watch-menu[open] > summary { background: var(--surface-3); color: var(--text); }
       .header-menu { display: grid; place-items: center; }
@@ -3081,7 +3184,7 @@ def _home_styles() -> str:
 
       /* ---------- feed loading ---------- */
       .empty-panel, .empty-copy { color: var(--muted); }
-      .feed-loading, .feed-retry { min-height: 48px; margin: 32px auto 0; color: var(--muted-2); display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 12.5px; }
+      .feed-loading, .feed-retry { min-height: 48px; margin: 32px auto 0; color: var(--muted); display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 12.5px; }
       .feed-loading[hidden], .feed-retry[hidden] { display: none; }
       .feed-loading span:first-child { width: 14px; height: 14px; border-radius: 999px; border: 1.5px solid rgba(255,255,255,.14); border-top-color: var(--muted); animation: spin .8s linear infinite; }
       .feed-retry button { height: 30px; border: 1px solid var(--border); border-radius: var(--r-control); background: transparent; color: var(--text); padding: 0 12px; cursor: pointer; }
@@ -3254,7 +3357,7 @@ def _home_styles() -> str:
       .picker-list { display: grid; gap: 2px; max-height: 320px; overflow: auto; }
       .picker-row { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 46px; padding: 0 12px; border: 0; border-radius: 10px; background: transparent; color: var(--text); text-align: left; cursor: pointer; font-size: 13px; }
       .picker-row:hover { background: var(--surface-3); }
-      .picker-row small { display: block; color: var(--muted-2); font-size: 11.5px; }
+      .picker-row small { display: block; color: var(--muted); font-size: 11.5px; }
       .picker-row .icon { width: 16px; height: 16px; color: var(--muted); }
       .picker-empty { color: var(--muted); font-size: 12.5px; padding: 12px 10px; }
       .picker-create { display: flex; gap: 8px; align-items: center; padding-top: 12px; margin-top: 8px; border-top: 1px solid var(--border-soft); }
@@ -3273,7 +3376,7 @@ def _home_styles() -> str:
       .page-tab.active::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; border-radius: 2px 2px 0 0; background: var(--accent); }
       .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 24px; }
       .toolbar-divider { width: 1px; height: 20px; background: var(--border); }
-      .toolbar-note { color: var(--muted-2); font-size: 12.5px; display: inline-flex; align-items: center; gap: 7px; }
+      .toolbar-note { color: var(--muted); font-size: 12.5px; display: inline-flex; align-items: center; gap: 7px; }
       .toolbar-note .icon { width: 15px; height: 15px; }
       .toolbar-search { margin-left: auto; display: flex; align-items: center; gap: 8px; height: 32px; min-width: 224px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); padding: 0 14px; color: var(--muted-2); }
       .toolbar-search input { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--text); outline: none; font-size: 12.5px; }
@@ -3298,8 +3401,7 @@ def _home_styles() -> str:
       .media-row .thumb { border-radius: var(--r-thumb); }
       .media-row-copy { min-width: 0; }
       .media-row h2 { margin: 0; font-size: 14.5px; font-weight: 550; line-height: 1.4; letter-spacing: -.01em; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-      .media-row p { margin: 6px 0 0; color: var(--muted-2); font-size: 12.5px; line-height: 1.4; }
-      .row-label { display: none; }
+      .media-row p { margin: 6px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.4; }
       .row-index { display: grid; justify-items: center; color: var(--muted-2); font-size: 12px; font-variant-numeric: tabular-nums; padding-top: 10px; }
 
       /* ---------- timeline ---------- */
@@ -3313,13 +3415,19 @@ def _home_styles() -> str:
 
       /* ---------- channels / collections ---------- */
       .channel-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(156px, 1fr)); gap: 24px 12px; }
+      /* Playlists are media tiles, not channel avatars. They used to borrow .channel-grid,
+         whose 156px floor is sized for a circular avatar and a name, and a 16:9 cover with
+         a title and a metadata line came out 185px wide with the meta wrapping onto two
+         lines. This is the timeline grid's rhythm, so playlists sit on the same 3-up beat
+         as every other media surface in the app. */
+      .playlist-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(272px, 1fr)); gap: 30px 20px; }
       .channel-card { display: grid; justify-items: center; text-align: center; gap: 8px; padding: 14px 8px; border: 1px solid transparent; border-radius: var(--r-panel); min-width: 0; transition: background .12s ease, border-color .12s ease; }
       .channel-card:hover { background: var(--surface); border-color: var(--border-soft); }
       .channel-card-top { display: grid; justify-items: center; gap: 10px; min-width: 0; width: 100%; }
       .channel-card-top > div { min-width: 0; width: 100%; }
       .channel-card .avatar { width: 56px; height: 56px; font-size: 15px; }
       .channel-card h2 { margin: 0; font-size: 13px; font-weight: 550; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .channel-card p { margin: 4px 0 0; color: var(--muted-2); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .channel-card p { margin: 4px 0 0; color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .subscribe-pill { height: 30px; border: 0; border-radius: 999px; background: var(--surface-2); color: var(--text); display: inline-flex; align-items: center; gap: 7px; padding: 0 13px; font-size: 12.5px; font-weight: 500; cursor: pointer; }
       .subscribe-pill:hover { background: var(--surface-3); }
       .subscribe-pill .icon { width: 14px; height: 14px; }
@@ -3334,10 +3442,10 @@ def _home_styles() -> str:
       .collection-form { border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); padding: 14px; display: grid; grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) auto; gap: 12px; align-items: end; }
       .collection-form label { display: grid; gap: 7px; color: var(--muted-2); font-size: 11.5px; }
       .collection-form input, .collection-form select { min-height: 32px; border: 1px solid var(--border); border-radius: var(--r-control); background: var(--bg); color: var(--text); padding: 0 10px; min-width: 0; font-size: 13px; }
-      .stat-row { display: flex; align-items: center; gap: 18px; margin: 0 0 24px; color: var(--muted-2); font-size: 12.5px; }
+      .stat-row { display: flex; align-items: center; gap: 18px; margin: 0 0 24px; color: var(--muted); font-size: 12.5px; }
       .stat { display: inline-flex; align-items: baseline; gap: 6px; }
       .stat strong { font-size: 13px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
-      .stat span { color: var(--muted-2); }
+      .stat span { color: var(--muted); }
 
       /* ---------- collections ---------- */
       .collection-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 26px 20px; align-items: start; }
@@ -3354,17 +3462,17 @@ def _home_styles() -> str:
       .collection-cover.empty .icon { width: 26px; height: 26px; }
       .collection-card-body { display: grid; grid-template-columns: minmax(0, 1fr) 22px; gap: 8px; align-items: start; padding-top: 11px; }
       .collection-card-body h3 { margin: 0; font-size: 14px; font-weight: 550; line-height: 1.4; letter-spacing: -.008em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .collection-card-body p { margin: 5px 0 0; color: var(--muted-2); font-size: 12px; line-height: 1.4; }
+      .collection-card-body p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.4; }
       .collection-hero { display: flex; align-items: center; gap: 24px; padding: 4px 0 26px; border-bottom: 1px solid var(--border-soft); margin-bottom: 8px; }
       .collection-hero-cover { flex: 0 0 auto; width: 172px; aspect-ratio: 16 / 10; border: 1px solid var(--border-soft); border-radius: var(--r-panel); overflow: hidden; background: var(--surface); }
       .collection-hero-copy { min-width: 0; }
       .collection-hero-kicker { margin: 0 0 6px; color: var(--muted-2); font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
-      .collection-hero h1 { margin: 0; font-size: clamp(20px, 2vw, 26px); font-weight: 650; letter-spacing: -.022em; }
-      .collection-hero-meta { margin: 8px 0 0; color: var(--muted-2); font-size: 12.5px; }
+      .collection-hero h1 { margin: 0; font-size: clamp(20px, 2vw, 22px); font-weight: 650; letter-spacing: -.022em; }
+      .collection-hero-meta { margin: 8px 0 0; color: var(--muted); font-size: 12.5px; }
       .collection-hero-description { margin: 10px 0 0; color: var(--muted); font-size: 13px; line-height: 1.55; max-width: 60ch; }
       .collection-hero-actions { margin-top: 16px; display: flex; gap: 8px; flex-wrap: wrap; }
       .collection-members .channel-card { position: relative; }
-      .collection-remove { position: absolute; top: 6px; right: 6px; width: 24px; height: 24px; border: 0; border-radius: 999px; background: rgba(10,10,11,.8); color: var(--muted); display: grid; place-items: center; cursor: pointer; opacity: 0; transition: opacity .12s ease, color .12s ease; }
+      .collection-remove { position: absolute; top: 6px; right: 6px; width: 32px; height: 32px; border: 0; border-radius: 999px; background: rgba(10,10,11,.8); color: var(--muted); display: grid; place-items: center; cursor: pointer; opacity: 0; transition: opacity .12s ease, color .12s ease; }
       .collection-members .channel-card:hover .collection-remove, .collection-remove:focus-visible { opacity: 1; }
       .collection-remove:hover { color: #f2686c; }
       .collection-remove .icon { width: 14px; height: 14px; }
@@ -3373,7 +3481,6 @@ def _home_styles() -> str:
       .picker-check .icon { width: 16px; height: 16px; }
 
       /* ---------- playlists ---------- */
-      .playlist-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr)); gap: 28px 20px; align-items: start; }
       .playlist-card { position: relative; min-width: 0; }
       .playlist-cover { position: relative; display: block; aspect-ratio: 16 / 9; border-radius: var(--r-thumb); overflow: hidden; background: var(--surface-2); border: 1px solid var(--border-soft); }
       .playlist-cover::before, .playlist-cover::after { content: ""; position: absolute; left: 8px; right: 8px; border-radius: var(--r-thumb) var(--r-thumb) 0 0; background: var(--surface-3); border: 1px solid var(--border-soft); border-bottom: 0; }
@@ -3382,22 +3489,25 @@ def _home_styles() -> str:
       .playlist-cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
       .playlist-cover-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted-2); }
       .playlist-cover-empty .icon { width: 22px; height: 22px; }
-      .playlist-count { position: absolute; right: 0; bottom: 0; top: 0; width: 42%; display: grid; place-items: center; align-content: center; gap: 6px; background: rgba(0,0,0,.74); backdrop-filter: blur(1px); color: #fff; font-size: 13px; font-weight: 500; font-variant-numeric: tabular-nums; }
-      .playlist-count .icon { width: 18px; height: 18px; opacity: .9; }
+      /* Was a slab covering the right 42% of the cover, which at the old 185px card hid
+         most of the artwork and only got heavier as the card grew. Same badge language as
+         .duration instead: bottom-right, dark, small, out of the way of the picture. */
+      .playlist-count { position: absolute; right: 6px; bottom: 6px; z-index: 2; display: inline-flex; align-items: center; gap: 5px; border-radius: 4px; background: rgba(0,0,0,.82); color: #fff; font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums; line-height: 1; padding: 3px 6px; }
+      .playlist-count .icon { width: 13px; height: 13px; opacity: .9; }
       .playlist-body { display: grid; grid-template-columns: minmax(0, 1fr) 22px; gap: 8px; align-items: start; padding-top: 11px; }
       .playlist-body h3 { margin: 0; font-size: 13.5px; font-weight: 550; line-height: 1.4; letter-spacing: -.008em; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-      .playlist-body p { margin: 5px 0 0; color: var(--muted-2); font-size: 12px; line-height: 1.4; }
+      .playlist-body p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.4; }
       .playlist-detail { display: grid; grid-template-columns: minmax(280px, 340px) minmax(0, 1fr); gap: 32px; align-items: start; }
       .playlist-panel { position: sticky; top: calc(var(--header) + 28px); border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); padding: 18px; display: grid; gap: 14px; }
       .playlist-panel .playlist-cover { margin-top: 8px; }
       .playlist-panel h1 { margin: 0; font-size: 19px; font-weight: 650; letter-spacing: -.02em; line-height: 1.3; }
-      .playlist-panel .playlist-meta { margin: 0; color: var(--muted-2); font-size: 12.5px; }
+      .playlist-panel .playlist-meta { margin: 0; color: var(--muted); font-size: 12.5px; }
       .playlist-panel .playlist-description { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
       .playlist-panel-actions { display: flex; gap: 8px; flex-wrap: wrap; }
       .playlist-items { display: grid; gap: 2px; }
       .playlist-items .media-row { grid-template-columns: 24px 168px minmax(0, 1fr) 22px 26px; gap: 14px; align-items: start; }
       .playlist-items .media-row h2 { font-size: 13.5px; }
-      .playlist-remove { width: 26px; height: 26px; margin-top: 4px; border: 0; border-radius: 999px; background: transparent; color: var(--muted-2); display: grid; place-items: center; cursor: pointer; }
+      .playlist-remove { width: 32px; height: 32px; margin: 1px -3px -3px; border: 0; border-radius: 999px; background: transparent; color: var(--muted-2); display: grid; place-items: center; cursor: pointer; }
       .playlist-remove:hover { background: var(--surface-3); color: #f2686c; }
 
       /* ---------- channel page ---------- */
@@ -3420,8 +3530,8 @@ def _home_styles() -> str:
       .channel-hero { display: flex; align-items: center; gap: 22px; padding: 22px 0 10px; }
       .channel-hero > div { min-width: 0; }
       .channel-hero-avatar { width: 88px; height: 88px; font-size: 26px; }
-      .channel-hero h1 { margin: 0; font-size: clamp(20px, 2vw, 26px); font-weight: 650; letter-spacing: -.022em; display: flex; align-items: center; gap: 8px; }
-      .channel-hero-meta { margin: 7px 0 0; color: var(--muted-2); font-size: 12.5px; }
+      .channel-hero h1 { margin: 0; font-size: clamp(20px, 2vw, 22px); font-weight: 650; letter-spacing: -.022em; display: flex; align-items: center; gap: 8px; }
+      .channel-hero-meta { margin: 7px 0 0; color: var(--muted); font-size: 12.5px; }
       .channel-hero-actions { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
 
       /* ---------- shorts ---------- */
@@ -3436,7 +3546,7 @@ def _home_styles() -> str:
       .short-badge .icon { width: 14px; height: 14px; }
       .short-copy { padding-top: 9px; }
       .short-copy h3 { margin: 0; font-size: 13px; font-weight: 550; line-height: 1.35; letter-spacing: -.006em; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-      .short-copy p { margin: 4px 0 0; color: var(--muted-2); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .short-copy p { margin: 4px 0 0; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       /* A Short is vertical; cap the player width so it is not pillarboxed inside a 16:9 frame. */
       .watch-player-shell.is-short { max-width: min(430px, 100%); margin-inline: auto; }
       .watch-player-shell.is-short .player-frame { aspect-ratio: 9 / 16; }
@@ -3504,7 +3614,7 @@ def _home_styles() -> str:
 
       /* ---------- notifications ---------- */
       .bell-wrap { position: relative; display: grid; place-items: center; }
-      .bell-badge { position: absolute; top: 1px; right: 1px; min-width: 15px; height: 15px; padding: 0 4px; border-radius: 999px; background: var(--accent); color: #fff; font-size: 9.5px; font-weight: 700; line-height: 15px; text-align: center; pointer-events: none; }
+      .bell-badge { position: absolute; top: 0; right: 0; min-width: 18px; height: 18px; padding: 0 4px; border-radius: 999px; background: var(--accent); color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; pointer-events: none; }
       .bell-badge[hidden] { display: none; }
       .notification-row { display: grid; grid-template-columns: 34px minmax(0, 1fr) 62px; gap: 11px; align-items: start; padding: 9px 10px; border-radius: 8px; color: var(--text); }
       .notification-row:hover { background: var(--surface-3); }
@@ -3513,17 +3623,17 @@ def _home_styles() -> str:
       .notification-copy { min-width: 0; }
       .notification-copy strong { display: block; font-size: 12.5px; font-weight: 600; line-height: 1.35; }
       .notification-copy span { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; color: var(--text); font-size: 12.5px; line-height: 1.4; margin-top: 2px; }
-      .notification-copy small { display: block; color: var(--muted-2); font-size: 11px; margin-top: 4px; }
+      .notification-copy small { display: block; color: var(--muted); font-size: 11px; margin-top: 4px; }
       .notification-thumb { position: relative; aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden; background: #000; }
       .notification-thumb img { width: 100%; height: 100%; object-fit: cover; }
-      .notification-empty { color: var(--muted-2); font-size: 12.5px; padding: 16px 10px; text-align: center; }
+      .notification-empty { color: var(--muted); font-size: 12.5px; padding: 16px 10px; text-align: center; }
 
       /* ---------- comments ---------- */
       .comments { margin-top: 24px; }
       .comments-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 18px; }
       .comments-head h2 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.012em; }
-      .comments-count { color: var(--muted-2); font-size: 13px; font-variant-numeric: tabular-nums; }
-      .comments-state { color: var(--muted-2); font-size: 13px; margin: 0; padding: 12px 0; }
+      .comments-count { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+      .comments-state { color: var(--muted); font-size: 13px; margin: 0; padding: 12px 0; }
       .comment { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 14px; padding: 12px 0; }
       .comment .avatar { width: 36px; height: 36px; }
       .comment-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-bottom: 5px; }
@@ -3538,8 +3648,8 @@ def _home_styles() -> str:
       .comment-heart img { width: 18px; height: 18px; border-radius: 999px; object-fit: cover; }
       .comment-heart i { position: absolute; right: -3px; bottom: -3px; font-size: 10px; font-style: normal;
         color: #f2686c; text-shadow: 0 0 3px rgba(0,0,0,.9); }
-      .comment-time { color: var(--muted-2); font-size: 12px; }
-      .comment-flag { color: var(--muted-2); font-size: 11px; display: inline-flex; align-items: center; gap: 4px; }
+      .comment-time { color: var(--muted); font-size: 12px; }
+      .comment-flag { color: var(--muted); font-size: 11px; display: inline-flex; align-items: center; gap: 4px; }
       .comment-flag .icon { width: 13px; height: 13px; }
       .comment-body { margin: 0; color: var(--text); font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
       /* A clickable timestamp, in a description or a comment. Styled as a link but built
@@ -3565,18 +3675,15 @@ def _home_styles() -> str:
       .comment-vote.is-bumped .icon { animation: thumb-pop .38s cubic-bezier(.2,1.55,.35,1); }
       .comment-vote.is-bumped[data-comment-vote="dislike"] .icon { animation-name: thumb-pop-down; }
       @media (prefers-reduced-motion: reduce) { .comment-vote .icon { transition: none; } }
-      .comment-meta { display: flex; align-items: center; gap: 14px; margin-top: 8px; color: var(--muted-2); font-size: 12px; }
+      .comment-meta { display: flex; align-items: center; gap: 14px; margin-top: 8px; color: var(--muted); font-size: 12px; }
       .comment-meta span { display: inline-flex; align-items: center; gap: 5px; }
       .comment-meta .icon { width: 14px; height: 14px; }
 
       /* ---------- watch ---------- */
       /* The player is a grid child rather than the first thing inside the article, which
          is what lets theater mode span it across both columns without moving any markup. */
-      /* --theater-reserve is the vertical room theater mode keeps below the player for the
-         title, channel row and action buttons. Raise it to see more of the page under the
-         video, lower it to let the video grow. */
       .watch-main { max-width: 1760px; padding-top: calc(var(--header) + 20px); padding-right: 32px;
-        --watch-gutter: 32px; --theater-reserve: 196px; }
+        --watch-gutter: 32px; }
       .watch-layout { display: grid; grid-template-columns: minmax(0, 1fr) clamp(320px, 27vw, 392px);
         grid-template-areas: "stage panel" "content panel"; gap: 0 28px; align-items: start; min-width: 0; }
       .watch-layout > * { min-width: 0; }
@@ -4044,45 +4151,47 @@ def _home_styles() -> str:
       }
 
       /* ---------- theater mode ---------- */
-      /* Same shape YouTube uses: the player goes edge to edge, and everything below it
-         keeps the two-column split so up-next sits beside the description, not under it. */
+      /* Same shape YouTube uses: the player widens to span both columns at its
+         natural 16:9, and everything below it keeps the two-column split so up-next
+         sits beside the description, not under it. The width is fitted to the
+         viewport height, so on short windows the player shrinks (centered on the
+         page background) instead of running off-screen; on tall windows it takes
+         the full width. Either way the shell itself stays 16:9, so the video never
+         letterboxes inside it. Unlike the full-bleed attempt, the player stays
+         inside the page gutter with its radius and border, so it reads as a bigger
+         player rather than a takeover. */
       body.theater .watch-layout { grid-template-areas: "stage stage" "content panel"; }
-      /* The player widens across both columns but stops at the same gutter the title and
-         up-next rail use, so every left edge on the page lines up. Going fully edge to
-         edge would overshoot that line by the width of the gutter. */
-      /* Turning the stage into a size container is what makes the rule below work: it
-         exposes the stage's own width as 100cqw, so the player's height can be written as
-         a real number instead of being derived from `aspect-ratio`. That matters because
-         `aspect-ratio` plus `max-height` makes the browser recompute the *width* from the
-         clamped height, which shrinks the box and breaks the edge alignment. */
       /* The page normally holds a 20px gap below the header; in theater the player has to
          meet it, so that breathing room is dropped for the duration. */
       body.theater .watch-main { padding-top: var(--header); }
-      body.theater .watch-stage { container-type: inline-size; background: #000;
-        margin: 0 calc(var(--watch-gutter) * -1) 14px; }
+      body.theater .watch-stage { background: transparent;
+        margin: 0 0 14px; }
       /* The stage already spaces the player from what follows, so the title's own top
          margin would stack on top of it — and because the up-next rail has no such margin,
          that extra 16px also knocked the two columns out of line. Dropping it fixes the
          gap and the alignment together: both columns now start on the same row. */
       body.theater .watch-title { margin-top: 0; }
-      /* The box runs edge to edge and only its height gives way, so the title, channel row
-         and buttons stay on screen. Once the cap bites, the box is wider than 16:9 and the
-         video letterboxes inside it against the black backdrop — the same trade YouTube
-         makes. Nothing is cropped or stretched: only the side bars grow, and on a window
-         tall enough for the natural height there are no bars at all.
-         margin-inline is pinned to 0 because the narrow breakpoint pulls the shell out by
-         its own negative margin, which the stage is already doing here. */
-      body.theater .watch-player-shell { width: 100%; max-width: 100%; margin-inline: 0;
-        border-radius: 0; border-left: 0; border-right: 0;
-        height: min(calc(100cqw * 9 / 16), max(280px, calc(100vh - var(--header) - var(--theater-reserve, 196px)))); }
-      /* The iframe fills the capped box; the letterboxing itself is done by the video
-         element inside the player, which always preserves its own aspect ratio. */
-      body.theater .player-frame { height: 100%; aspect-ratio: auto; }
-      /* A 9:16 short letterboxed into a wide box would be almost entirely black, so spend
-         the same height budget on capping its width and keep it in its own ratio. */
+      /* Natural 16:9 spanning both columns, but fitted to the viewport with just the
+         title block peeking below: width is the smaller of full width and what leaves
+         ~120px under the player, so the title, channel row and actions sit at the
+         bottom edge — the way YouTube's theater does — with the description and the
+         rest of up-next one scroll away. The shell itself stays 16:9 either
+         way, so the video never letterboxes inside it; on short windows the player just
+         shrinks and centers on the page background. The player is square-cornered like
+         YouTube's theater — any round here visibly eats into the video edges. */
+      body.theater .watch-player-shell { width: min(100%, calc((100vh - var(--header) - 120px) * 16 / 9)); max-width: 100%; margin-inline: auto;
+        height: auto; aspect-ratio: 16 / 9; border-radius: 0; }
+      /* The iframe follows the shell exactly. Height comes from the shell (which has
+         the ratio), not from a second ratio computation on the frame itself — two
+         competing aspect-ratios is what made resizing stutter. */
+      body.theater .player-frame { width: 100%; height: 100%; }
+      /* A 9:16 short letterboxed into a wide box would be almost entirely black, so cap
+         its width and keep it in its own ratio. */
       body.theater .watch-player-shell.is-short { height: auto; aspect-ratio: 9 / 16; margin-inline: auto;
-        max-width: min(430px, calc(max(280px, 100vh - var(--header) - var(--theater-reserve, 196px)) * 9 / 16)); }
-      body.nav-ready .watch-player-shell { transition: max-width .2s cubic-bezier(.2,.8,.3,1), border-radius .2s ease; }
+        max-width: min(430px, calc((100vh - var(--header) - 120px) * 9 / 16)); }
+      /* Sidebar open/close animates the player width elsewhere on the site; in theater
+         the shell tracks the window live, so transitioning it there only rubber-bands. */
+      body.nav-ready:not(.theater) .watch-player-shell { transition: max-width .2s cubic-bezier(.2,.8,.3,1), border-radius .2s ease; }
       .theater-toggle .icon { transition: transform .18s ease; }
       .theater-toggle.is-selected { background: var(--surface-3); border-color: var(--border-soft); }
       .theater-toggle.is-selected .icon { transform: scaleX(1.15); }
@@ -4102,6 +4211,9 @@ def _home_styles() -> str:
       .comment-replies { display: grid; gap: 14px; margin: 10px 0 0 4px; padding-left: 14px; border-left: 1px solid var(--border-soft); }
       .comment-replies[hidden] { display: none; }
       .comment-replies .comment { gap: 10px; }
+      .comment-replies .comment.reply-depth-1 { margin-left: 20px; }
+      .comment-replies .comment.reply-depth-2 { margin-left: 40px; }
+      .comment-replies .comment.reply-depth-3 { margin-left: 60px; }
       .comment-replies .avatar { width: 26px; height: 26px; font-size: 9.5px; }
       @media (prefers-reduced-motion: reduce) { .reply-toggle .icon { transition: none; } }
       .watch-description { border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); padding: 14px 16px; color: var(--text); line-height: 1.6; font-size: 13px; }
@@ -4132,7 +4244,7 @@ def _home_styles() -> str:
       .watch-panel .menu-trigger { width: 22px; height: 22px; }
       .tabbar { display: flex; align-items: center; gap: 6px; margin-bottom: 14px; overflow-x: auto; scrollbar-width: none; }
       .tabbar::-webkit-scrollbar { display: none; }
-      .tab { flex: 0 0 auto; min-height: 30px; border: 0; border-radius: 8px; background: var(--surface-2); color: var(--text); cursor: pointer; padding: 0 12px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+      .tab { flex: 0 0 auto; min-height: 34px; border: 0; border-radius: 999px; background: var(--surface-2); color: var(--text); cursor: pointer; padding: 0 14px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
       .tab:hover { background: var(--surface-3); }
       .tab.active { background: #f1f1f3; color: #0a0a0b; font-weight: 500; }
       .tab-panel { display: none; }
@@ -4140,8 +4252,10 @@ def _home_styles() -> str:
       .details-list { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; color: var(--text); font-size: 12.5px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface); padding: 14px; }
       .details-list dt { color: var(--muted-2); }
       .details-list dd { margin: 0; overflow-wrap: anywhere; }
-      .chat-placeholder { color: var(--muted-2); line-height: 1.6; padding: 8px; font-size: 12.5px; }
-      .empty-copy { padding: 18px; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); color: var(--muted); font-size: 13px; }
+      .chat-placeholder { color: var(--muted); line-height: 1.6; padding: 8px; font-size: 12.5px; }
+      .empty-copy { padding: 18px; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); color: var(--muted); font-size: 13px; line-height: 1.55; }
+      .empty-copy a, .empty-copy .link-action { color: #6ea8ff; }
+      .empty-copy a:hover, .empty-copy .link-action:hover { color: #9cc4ff; }
       .channel-grid > .empty-copy, .video-grid > .empty-copy, .timeline > .empty-copy, .playlist-grid > .empty-copy { grid-column: 1 / -1; }
       .mobile-bottom-nav { display: none; }
       .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
@@ -4203,6 +4317,7 @@ def _home_styles() -> str:
         .media-row { grid-template-columns: minmax(132px, 42%) minmax(0, 1fr) 22px; gap: 10px; padding: 6px 0; }
         .playlist-items .media-row { grid-template-columns: 18px minmax(112px, 34%) minmax(0, 1fr) 20px 24px; gap: 8px; }
         .channel-grid { grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); }
+        .playlist-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 22px 14px; }
         .channel-card .avatar { width: 48px; height: 48px; font-size: 13px; }
         .channel-banner { border-radius: 10px; }
         .channel-hero { flex-direction: column; align-items: flex-start; gap: 14px; }
@@ -4217,9 +4332,11 @@ def _home_styles() -> str:
         .watch-actions { margin: 0; width: 100%; }
         .watch-actions { overflow-x: auto; flex-wrap: nowrap; padding-bottom: 4px; }
         .watch-panel .media-row { grid-template-columns: minmax(132px, 42%) minmax(0, 1fr) 22px; }
-        .mobile-bottom-nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 80; height: calc(56px + env(safe-area-inset-bottom)); padding-bottom: env(safe-area-inset-bottom); background: rgba(10,10,11,.94); backdrop-filter: blur(12px); border-top: 1px solid var(--border-soft); display: grid; grid-template-columns: repeat(4, 1fr); }
-        .mobile-nav-item { display: grid; place-items: center; align-content: center; gap: 4px; color: var(--muted); font-size: 9.5px; min-width: 0; }
+        .mobile-bottom-nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 80; height: calc(56px + env(safe-area-inset-bottom)); padding-bottom: env(safe-area-inset-bottom); background: rgba(10,10,11,.94); backdrop-filter: blur(12px); border-top: 1px solid var(--border-soft); display: grid; grid-template-columns: repeat(5, 1fr); }
+        .mobile-nav-item { display: grid; place-items: center; align-content: center; gap: 4px; color: var(--muted); font-size: 9.5px; min-width: 0; padding: 6px 2px; }
         .mobile-nav-item .icon { width: 19px; height: 19px; }
+        .mobile-nav-item span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .mobile-nav-item[aria-current="page"] { color: var(--text); }
         .feedback-toast { bottom: calc(72px + env(safe-area-inset-bottom)); left: 16px; right: 16px; transform: none; justify-content: space-between; }
         .feedback-toast.show { transform: none; }
       }
@@ -4411,7 +4528,7 @@ def _home_script() -> str:
           const data = await response.json();
           let html = options.reset ? data.html : dedupeIncomingHtml(data.html || '');
           if (options.reset) {
-            feedContainer.innerHTML = html || '<p class="empty-copy">No videos match this filter yet.</p>';
+            feedContainer.innerHTML = html || '<p class="empty-copy">No videos match this filter yet. <button class="link-action" type="button" data-clear-filter>Clear filter</button></p>';
           } else if (html) {
             feedContainer.insertAdjacentHTML('beforeend', html);
           }
@@ -4421,7 +4538,7 @@ def _home_script() -> str:
         } catch (error) {
           if (retryBox) retryBox.hidden = false;
           if (options.reset && feedContainer && !feedContainer.children.length) {
-            feedContainer.innerHTML = '<p class="empty-copy">Could not load recommendations.</p>';
+            feedContainer.innerHTML = '<p class="empty-copy">Could not load recommendations. <button class="link-action" type="button" data-retry-feed>Retry</button></p>';
           }
         } finally {
           feedLoading = false;
@@ -4439,7 +4556,7 @@ def _home_script() -> str:
         window.setTimeout(() => node.remove(), 220);
       }
 
-      /* Unsubscribing only deletes the FreshRSS feed row: the channel's videos are
+      /* Unsubscribing only deletes the local subscription row: the channel's videos are
          still cached locally, so every subscription-backed surface on this page has
          to drop them itself. */
       function dropUnsubscribedChannel(channelId, title) {
@@ -4481,12 +4598,26 @@ def _home_script() -> str:
           }
           const timeline = document.querySelector('.timeline[data-section-kind="subscription"]');
           if (timeline && !timeline.querySelector('[data-video-card]')) {
-            timeline.outerHTML = '<p class="empty-copy">No videos from your subscriptions yet. Run a FreshRSS sync to pull them in.</p>';
+            timeline.outerHTML = '<p class="empty-copy">No videos from your subscriptions yet. <button class="link-action" type="button" data-feed-refresh>Sync now</button></p>';
           }
           /* Backfill the home feed so removed cards do not leave a short page. */
           if (removed && feedContainer && feedHasMore) loadFeedPage();
         }, 260);
       }
+
+      /* details/summary menus: keep aria-expanded in step with the open state.
+         The toggle event fires for native toggles and for programmatic closes
+         (Escape, outside clicks), so one capture listener covers every path.
+         Close-on-Escape itself already lives in the keydown handler below. */
+      document.addEventListener('toggle', (event) => {
+        const menu = event.target && event.target.closest ? event.target.closest('.yt-menu') : null;
+        if (!menu) return;
+        const menuSummary = menu.querySelector('summary');
+        if (menuSummary) menuSummary.setAttribute('aria-expanded', menu.open ? 'true' : 'false');
+      }, true);
+      document.querySelectorAll('.yt-menu > summary:not([aria-expanded])').forEach((item) => {
+        item.setAttribute('aria-expanded', item.closest('.yt-menu').open ? 'true' : 'false');
+      });
 
       document.addEventListener('click', async (event) => {
         const summary = event.target.closest('summary');
@@ -4495,6 +4626,17 @@ def _home_script() -> str:
           closeMenus(current);
           window.requestAnimationFrame(() => positionMenu(current));
           event.stopPropagation();
+          return;
+        }
+
+        /* The empty-feed "Clear filter" action: back to All without a page load. */
+        const clearFilter = event.target.closest('[data-clear-filter]');
+        if (clearFilter) {
+          event.preventDefault();
+          setActiveFilter('all');
+          if (feedContainer) feedContainer.dataset.nextPage = '0';
+          feedHasMore = true;
+          await loadFeedPage({ reset: true, filter: 'all' });
           return;
         }
 
@@ -4769,7 +4911,7 @@ def _home_script() -> str:
               subscribeButton.removeAttribute('data-subscribe-feed');
               subscribeButton.setAttribute('data-unsubscribe-feed', '');
               subscribeButton.setAttribute('aria-label', `Unsubscribe from ${title || 'channel'}`);
-              showToast('Subscribed in FreshRSS');
+              showToast('Subscribed');
             }
             refreshSubscriptionNav();
           } catch (error) {
@@ -5251,7 +5393,7 @@ def _home_script() -> str:
         if (!subscriptions.length) {
           const empty = document.createElement('p');
           empty.className = 'picker-empty';
-          empty.textContent = 'No FreshRSS subscriptions imported yet.';
+          empty.textContent = 'No subscriptions yet.';
           list.appendChild(empty);
           return;
         }
@@ -5494,6 +5636,7 @@ def _home_script() -> str:
         let activeSlide = null;
         let loading = false;
         let exhausted = false;
+        let watchTimer = null;
 
         const slides = () => [...stage.querySelectorAll('[data-shorts-slide]')];
 
@@ -5567,9 +5710,26 @@ def _home_script() -> str:
           activeSlide = slide;
           mountPlayer(slide, true);
           syncWindow(slides().indexOf(slide));
+          recordShortView(slide.dataset.videoId);
           if (panel && !panel.hidden) loadShortComments(slide.dataset.videoId);
           const url = `/shorts?start=${encodeURIComponent(slide.dataset.videoId)}`;
           history.replaceState(null, '', url);
+        }
+
+        /* Watching happens in the viewer, never on a watch page, so without this
+           nothing is ever recorded and the same shorts keep resurfacing in
+           recommendations. A few seconds active means it was watched; anything
+           flicked past is cleared before the timer fires. */
+        function recordShortView(videoId) {
+          window.clearTimeout(watchTimer);
+          if (!videoId) return;
+          watchTimer = window.setTimeout(() => {
+            fetch('/api/feedback', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ youtube_video_id: videoId, event_type: 'watch_page_open', payload: { source: 'shorts_viewer' } })
+            }).catch(() => {});
+          }, 3000);
         }
 
         // The active slide is derived from scroll position rather than an
@@ -5765,6 +5925,13 @@ def _home_script() -> str:
         copy.className = 'notification-copy';
         const who = document.createElement('strong');
         who.textContent = `${item.channel_title} uploaded`;
+        /* Unread is not color-only: a screen-reader "New" prefix backs the tint. */
+        if (item.unread) {
+          const flag = document.createElement('span');
+          flag.className = 'sr-only';
+          flag.textContent = 'New: ';
+          who.prepend(flag);
+        }
         const what = document.createElement('span');
         what.textContent = item.title;
         const when = document.createElement('small');
@@ -6278,6 +6445,7 @@ def _home_script() -> str:
         });
 
         if (item.is_owner) row.classList.add('is-creator');
+        if (item.reply_depth) row.classList.add(`reply-depth-${Math.min(item.reply_depth, 3)}`);
 
         const meta = document.createElement('div');
         meta.className = 'comment-meta';
@@ -6371,6 +6539,7 @@ def _home_script() -> str:
               const data = await response.json();
               thread.replaceChildren();
               const replies = data.items || [];
+              assignReplyDepth(replies);
               if (!replies.length) {
                 const empty = document.createElement('p');
                 empty.className = 'comments-state';
@@ -6379,6 +6548,7 @@ def _home_script() -> str:
                 return;
               }
               replies.forEach((reply) => thread.appendChild(renderComment(reply)));
+              resolveCommentAvatars(thread);
             } catch (error) {
               loaded = false;
               thread.replaceChildren();
@@ -6397,7 +6567,67 @@ def _home_script() -> str:
         }
 
         row.append(avatar, main);
+        row.dataset.authorId = item.author_id || '';
         return row;
+      }
+
+      /* Invidious's comments endpoint stopped returning authorThumbnails (empty for
+         every comment), so rows render as initials first. Resolve the authors on
+         screen against the batch endpoint and swap the pictures in; misses stay as
+         initials. Fires once per rendered batch, not per row. */
+      async function resolveCommentAvatars(root) {
+        const rows = [...root.querySelectorAll('.comment[data-author-id]')].filter(
+          (row) => row.dataset.authorId && !row.querySelector('.avatar img'));
+        if (!rows.length) return;
+        const ids = [...new Set(rows.map((row) => row.dataset.authorId))].slice(0, 25);
+        let data = null;
+        try {
+          const response = await fetch('/api/comments/avatars', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ author_ids: ids }),
+          });
+          if (!response.ok) return;
+          data = await response.json();
+        } catch (error) {
+          return;
+        }
+        const avatars = (data && data.avatars) || {};
+        rows.forEach((row) => {
+          const url = avatars[row.dataset.authorId];
+          if (!url) return;
+          const avatar = row.querySelector('.avatar');
+          if (!avatar || avatar.querySelector('img')) return;
+          const img = document.createElement('img');
+          img.src = url;
+          img.loading = 'lazy';
+          img.alt = '';
+          img.addEventListener('error', () => { avatar.classList.remove('has-image'); img.remove(); });
+          avatar.classList.add('has-image');
+          avatar.appendChild(img);
+        });
+      }
+
+      /* Reply threads arrive flat: every reply sits at the same level even when it
+         answers another reply (visible as a leading @mention, the way YouTube shows
+         it). Rebuild the visual chain from mentions: a reply opening with @someone
+         who wrote earlier in the thread hangs one level deeper, capped so a long
+         back-and-forth cannot march off the page. Top-level comments never go
+         through this, so only replies can nest. */
+      const REPLY_DEPTH_CAP = 3;
+      function assignReplyDepth(items) {
+        const depthByAuthor = new Map();
+        items.forEach((item) => {
+          const handle = String(item.author || '').replace(/^@/, '').toLowerCase();
+          const target = String(item.content || '').match(/^@([A-Za-z0-9._-]{2,30})\b/);
+          let depth = 0;
+          if (target) {
+            const parent = depthByAuthor.get(target[1].toLowerCase());
+            if (parent !== undefined) depth = Math.min(parent + 1, REPLY_DEPTH_CAP);
+          }
+          item.reply_depth = depth;
+          depthByAuthor.set(handle, depth);
+        });
       }
 
       function formatCount(value) {
@@ -6439,6 +6669,7 @@ def _home_script() -> str:
             return;
           }
           items.forEach((item) => body.appendChild(renderComment(item)));
+          resolveCommentAvatars(body);
         } catch (error) {
           if (more) { commentsDone = true; return; }
           body.replaceChildren();
@@ -6861,13 +7092,22 @@ def _home_script() -> str:
           if (spinner) spinner.hidden = false;
           try {
             const url = `/api/channels/${encodeURIComponent(grid.dataset.channelId)}/videos/html`
-              + `?offset=${offset}&sort=${encodeURIComponent(grid.dataset.sort || 'latest')}`;
+              + `?offset=${offset}&sort=${encodeURIComponent(grid.dataset.sort || 'latest')}`
+              + `&kind=${encodeURIComponent(grid.dataset.kind || 'videos')}`
+              + `&q=${encodeURIComponent(grid.dataset.q || '')}`;
             const data = await fetch(url).then((r) => r.json());
-            if (data.html) grid.insertAdjacentHTML('beforeend', data.html);
-            offset = data.next_offset ?? offset;
-            /* Stop for good when a page comes back empty, otherwise the observer would
-               keep firing against the bottom of the page forever. */
-            if (!data.has_more || !data.count) done = true;
+            if (data.html) {
+              grid.insertAdjacentHTML('beforeend', data.html);
+              grid.dataset.nextOffset = String(data.next_offset ?? offset);
+            } else {
+              /* An empty page with more behind it (a sparse Shorts window) still
+                 advances: the offset moves but nothing renders. */
+              grid.dataset.nextOffset = String(data.next_offset ?? offset);
+            }
+            offset = Number(grid.dataset.nextOffset || 0);
+            /* Stop only when the server says the well is dry. An empty page alone
+               is not the end (Shorts windows can scan past long-form videos). */
+            if (!data.has_more) done = true;
           } catch (error) {
             done = true;
           } finally {
@@ -6878,6 +7118,59 @@ def _home_script() -> str:
 
         /* rootMargin starts the fetch before the sentinel is actually visible, so the
            next batch is usually already in place by the time the user reaches it. */
+        new IntersectionObserver((entries) => {
+          if (entries.some((entry) => entry.isIntersecting)) loadMore();
+        }, { rootMargin: '800px 0px' }).observe(sentinel);
+      })();
+
+      /* ---- search results: keep loading YouTube pages as you scroll ---- */
+      (() => {
+        const list = document.querySelector('[data-search-list]');
+        const sentinel = document.querySelector('[data-search-sentinel]');
+        if (!list || !sentinel || !('IntersectionObserver' in window)) return;
+        /* Page 1 already shows every library match, so with no YouTube results
+           there is nothing further to load. */
+        if (list.dataset.searchOk === '0') return;
+        const spinner = document.querySelector('[data-search-loading]');
+        let page = Number(list.dataset.nextPage || 2);
+        let loading = false;
+        let done = false;
+        const seen = new Set(
+          Array.from(list.querySelectorAll('[data-video-id]')).map((el) => el.dataset.videoId)
+        );
+
+        async function loadMore() {
+          if (loading || done) return;
+          loading = true;
+          if (spinner) spinner.hidden = false;
+          /* A sparse page (everything on it already shown) still advances, and
+             chains straight into the next one so the scroll never stalls. */
+          let added = 0;
+          try {
+            const data = await fetch(`/api/search/html?q=${encodeURIComponent(list.dataset.q || '')}&page=${page}`).then((r) => r.json());
+            if (data.html) {
+              const doc = new DOMParser().parseFromString(data.html, 'text/html');
+              Array.from(doc.querySelectorAll('[data-video-id]'))
+                .filter((el) => {
+                  const id = el.dataset.videoId;
+                  if (!id || seen.has(id)) return false;
+                  seen.add(id);
+                  return true;
+                })
+                .forEach((el) => { list.appendChild(el); added += 1; });
+            }
+            page = Number(data.next_page ?? (page + 1));
+            list.dataset.nextPage = String(page);
+            if (!data.has_more) done = true;
+          } catch (error) {
+            done = true;
+          } finally {
+            loading = false;
+            if (spinner) spinner.hidden = true;
+            if (!done && added === 0) loadMore();
+          }
+        }
+
         new IntersectionObserver((entries) => {
           if (entries.some((entry) => entry.isIntersecting)) loadMore();
         }, { rootMargin: '800px 0px' }).observe(sentinel);
@@ -7342,7 +7635,7 @@ def _home_script() -> str:
         let total = 0;
         try {
           /* Batched server-side, so this loops until nothing is pending rather than
-             asking FreshRSS to create several hundred feeds in one request. */
+             creating several hundred subscriptions in one request. */
           for (let pass = 0; pass < 40; pass += 1) {
             const data = await fetch('/api/takeout/subscriptions/apply', { method: 'POST' }).then((r) => r.json());
             total += data.subscribed || 0;
@@ -7390,6 +7683,37 @@ def _home_script() -> str:
         if (window.ResizeObserver) new ResizeObserver(() => {
           if (box.classList.contains('is-collapsed') || toggle.hidden) sync();
         }).observe(body);
+        /* ---- pending details arriving ---- */
+        /* The server renders the page from whatever the library holds, then fills
+           gaps (description, views, publish date) in the background. When it said so
+           via data-details-pending, poll our own details endpoint and swap the block
+           once it lands -- same pattern as the dislike estimate, and it never reaches
+           past our own database. */
+        const watchLayout = document.querySelector('[data-watch-layout]');
+        if (watchLayout && watchLayout.dataset.detailsPending) {
+          const detailsVideoId = watchLayout.dataset.videoId || '';
+          const meta = box.querySelector('.watch-description-meta');
+          let attempts = 0;
+          const timer = window.setInterval(async () => {
+            attempts += 1;
+            if (attempts > 10 || !detailsVideoId) { window.clearInterval(timer); return; }
+            try {
+              const data = await fetch(`/api/videos/${encodeURIComponent(detailsVideoId)}/details`).then((r) => r.json());
+              if (!data.complete && !data.has_description) return;
+              if (data.meta_html && meta) meta.innerHTML = data.meta_html;
+              if (data.has_description && data.body_html) {
+                body.innerHTML = data.body_html;
+                sync();
+              }
+              if (data.complete) {
+                delete watchLayout.dataset.detailsPending;
+                window.clearInterval(timer);
+              }
+            } catch (error) {
+              window.clearInterval(timer);
+            }
+          }, 3000);
+        }
       })();
 
       /* ---- watch progress ---- */
@@ -7601,11 +7925,10 @@ def _app_header(search_value: str = "", user: dict[str, Any] | None = None, user
             <a class="brand" href="/" aria-label="OpenFeed home">{_brand_mark()}<span class="brand-word">Open<b>Feed</b></span></a>
           </div>
           <div class="header-center">
-            <form class="search-form" action="/search" method="get">
-              <input name="q" type="search" value="{escape(search_value, quote=True)}" placeholder="Search" aria-label="Search imported videos">
+            <form class="search-form" action="/search" method="get" role="search">
+              <input name="q" type="search" value="{escape(search_value, quote=True)}" placeholder="Search" aria-label="Search">
               <button type="submit" aria-label="Search">{_icon("search")}</button>
             </form>
-            <a class="header-mic" href="/search" aria-label="Search by voice is unavailable; open search">{_icon("mic")}</a>
           </div>
           {_header_actions(user, user_key)}
         </header>
@@ -7652,11 +7975,9 @@ def _asset_preconnect() -> str:
 
 
 def _app_shell(title: str, active: str, content: str, search_value: str = "", main_class: str = "app-page", scripts: str = "", request: Request | None = None, immersive: bool = False) -> str:
-    settings = get_settings()
     user = _current_user(request)
     user_key = _user_key(request)
-    configured_text = "FreshRSS connected" if settings.freshrss_configured else "FreshRSS not configured"
-    meta_html = f'<p>{escape(configured_text)}</p><p>Private video library<br>Invidious-backed playback</p>'
+    meta_html = f'<p>Private video library<br>Invidious-backed playback</p>'
     return f'''
     <!doctype html>
     <html lang="en">
@@ -7669,11 +7990,12 @@ def _app_shell(title: str, active: str, content: str, search_value: str = "", ma
         <style>{_home_styles()}</style>
       </head>
       <body{' class="immersive-nav"' if immersive else ''}>
+        <a class="skip-link" href="#main">Skip to content</a>
         {_app_header(search_value, user, user_key)}
         {_app_sidebar(active, meta_html)}
         <div class="nav-scrim" data-nav-scrim aria-hidden="true"></div>
-        <main class="home-main {escape(main_class)}">{content}</main>
-        <nav class="mobile-bottom-nav" aria-label="Mobile navigation">{_mobile_nav()}</nav>
+        <main class="home-main {escape(main_class)}" id="main" tabindex="-1">{content}</main>
+        <nav class="mobile-bottom-nav" aria-label="Mobile navigation">{_mobile_nav(active)}</nav>
         {_settings_dialog(user, user_key)}
         {_playlist_dialogs()}
         {_collection_dialogs()}
@@ -7685,7 +8007,29 @@ def _app_shell(title: str, active: str, content: str, search_value: str = "", ma
     '''
 
 
-def _media_row(video: dict[str, Any], settings: Any, label: str = "") -> str:
+def _media_row(
+    video: dict[str, Any],
+    settings: Any,
+    label: str = "",
+    index: int | None = None,
+    playlist_row_id: str | None = None,
+    trailing: str = "",
+) -> str:
+    """One video as a horizontal row.
+
+    `index`, `playlist_row_id`, and `trailing` exist so callers can extend the row
+    without running str.replace over the markup this function returns. The playlist
+    page used to do exactly that, matching the literal '<article class="media-row">' —
+    which stopped matching the moment the data-* attributes were added here, silently
+    dropping both the index cell and the row's identifying attribute. The CSS still
+    reserved a column for the missing cell, so every remaining child shifted one column
+    left and the thumbnail rendered 24px wide. Extension points beat string surgery on
+    generated HTML.
+
+    `playlist_row_id` is escaped inside this function; pass the raw id. `trailing` is
+    the one raw-HTML slot and must only ever receive server-generated, pre-sanitized
+    markup (the playlist remove control) — never anything derived from user input.
+    """
     title_text = str(video.get("title") or "Untitled")
     title = escape(title_text)
     channel_text = str(video.get("channel_title") or video.get("author") or "Unknown channel")
@@ -7697,6 +8041,7 @@ def _media_row(video: dict[str, Any], settings: Any, label: str = "") -> str:
     channel_href = f"/channel/{channel_id}" if channel_id else "/channels"
     thumbnail = escape(_thumbnail_for(video))
     thumb_img = f'<img src="{thumbnail}" alt="" loading="lazy" onerror="this.remove()">' if thumbnail else ""
+    thumb_fallback = escape(_avatar_initials(title_text))
     duration = escape(_duration_text(video.get("duration_seconds")))
     duration_html = f'<span class="duration">{duration}</span>' if duration else ""
     source_label = escape(label or _source_label(video))
@@ -7708,16 +8053,20 @@ def _media_row(video: dict[str, Any], settings: Any, label: str = "") -> str:
     original_url = escape(video.get("url") or f"https://www.youtube.com/watch?v={video_id_raw}")
     invidious_url = escape(f"{settings.invidious_public_url}/watch?v={video_id_raw}") if video_id_raw and settings.invidious_public_url else ""
     menu = _video_action_menu(video_id_raw, title_text, watch_href, original_url, invidious_url)
+    index_html = f'<span class="row-index">{int(index)}</span>' if index is not None else ""
+    playlist_attr = (
+        f' data-playlist-row="{escape(str(playlist_row_id), quote=True)}"'
+        if playlist_row_id else ""
+    )
     return f'''
-    <article class="media-row" data-video-card data-video-id="{video_id}" data-channel-id="{channel_id}">
-      <a class="thumb" href="{watch_href}" aria-label="Watch {title}"><span class="thumb-fallback">OpenFeed</span>{thumb_img}{duration_html}</a>
+    <article class="media-row"{playlist_attr} data-video-card data-video-id="{video_id}" data-channel-id="{channel_id}">
+      {index_html}<a class="thumb" href="{watch_href}" aria-label="Watch {title}"><span class="thumb-fallback">{thumb_fallback}</span>{thumb_img}{duration_html}</a>
       <div class="media-row-copy">
         <h2><a href="{watch_href}">{title}</a></h2>
         <p><a href="{channel_href}">{channel}</a></p>
         <p>{meta}</p>
-        <span class="row-label">{source_label}</span>
       </div>
-      {menu}
+      {menu}{trailing}
     </article>
     '''
 
@@ -7877,7 +8226,20 @@ def _is_playlist_subscription(subscription: dict[str, Any]) -> bool:
     return "playlist" in haystack.lower() or "playlist_id=" in haystack.lower()
 
 
-def _subscription_card(subscription: dict[str, Any]) -> str:
+def _subscription_card(
+    subscription: dict[str, Any],
+    member_id: str | None = None,
+    trailing: str = "",
+) -> str:
+    """One subscription as a channel card.
+
+    `member_id` and `trailing` exist so collection_page can extend the card without
+    running str.replace over the markup this function returns — the same string
+    surgery _media_row grew out of. `member_id` is escaped inside this function;
+    pass the raw id. `trailing` is the one raw-HTML slot and must only ever receive
+    server-generated, pre-sanitized markup (the collection remove control) — never
+    anything derived from user input.
+    """
     title_text = str(subscription.get("title") or "Untitled subscription")
     title = escape(title_text)
     channel_id_raw = str(subscription.get("youtube_channel_id") or "")
@@ -7888,7 +8250,7 @@ def _subscription_card(subscription: dict[str, Any]) -> str:
     video_count = int(subscription.get("video_count") or 0)
     latest = _relative_time(subscription.get("latest_video_at"))
     latest_html = f"Latest {escape(latest)}" if latest else "No dated videos yet"
-    feed_label = "Playlist" if _is_playlist_subscription(subscription) else "FreshRSS feed"
+    feed_label = "Playlist" if _is_playlist_subscription(subscription) else "RSS feed"
     hue = _avatar_hue(title_text)
     initials = escape(_avatar_initials(title_text))
     feed_url_raw = str(subscription.get("feed_url") or "")
@@ -7900,8 +8262,12 @@ def _subscription_card(subscription: dict[str, Any]) -> str:
             f'data-title="{escape(title_text, quote=True)}">{_icon("check")}<span>Subscribed</span></button>'
         )
     subscription_id = escape(str(subscription.get("id") or ""), quote=True)
+    member_attr = (
+        f' data-member-card="{escape(str(member_id), quote=True)}"'
+        if member_id else ""
+    )
     return f'''
-    <article class="channel-card" data-subscription-card="{subscription_id}" data-channel-id="{channel_id}" data-filter-item="{escape(title_text, quote=True)}">
+    <article class="channel-card"{member_attr} data-subscription-card="{subscription_id}" data-channel-id="{channel_id}" data-filter-item="{escape(title_text, quote=True)}">
       <a class="channel-card-top" href="{href}"{rel}>
         {_avatar_html(title_text, subscription.get("channel_avatar_url"))}
         <div>
@@ -7911,7 +8277,7 @@ def _subscription_card(subscription: dict[str, Any]) -> str:
         </div>
       </a>
       <div class="card-actions-inline">{subscribe_pill}</div>
-    </article>
+    {trailing}</article>
     '''
 
 
@@ -8046,18 +8412,15 @@ def collection_page(request: Request, collection_id: str, limit: int = 36):
 
     member_cards = []
     for member in members:
-        subscription_id = escape(str(member.get("id") or ""), quote=True)
+        member_id_raw = str(member.get("id") or "")
         title_text = str(member.get("title") or "Untitled subscription")
-        card = _subscription_card(member)
         remove = (
-            f'<button class="collection-remove" type="button" data-remove-collection-member="{subscription_id}" '
+            f'<button class="collection-remove" type="button" data-remove-collection-member="{escape(member_id_raw, quote=True)}" '
             f'data-collection-id="{collection_id_attr}" aria-label="Remove {escape(title_text)} from {name}">{_icon("x")}</button>'
         )
-        card = card.replace('<article class="channel-card"', f'<article class="channel-card" data-member-card="{subscription_id}"', 1)
-        card = card.replace("</article>", f"{remove}</article>", 1)
-        member_cards.append(card)
+        member_cards.append(_subscription_card(member, member_id=member_id_raw or None, trailing=remove))
     members_html = "".join(member_cards) or '<p class="empty-copy">No channels in this collection yet.</p>'
-    videos_html = "".join(_home_video_card(video, index, settings) for index, video in enumerate(videos, start=1)) or '<p class="empty-copy">No videos from these channels yet. Run a FreshRSS sync to pull them in.</p>'
+    videos_html = "".join(_home_video_card(video, index, settings) for index, video in enumerate(videos, start=1)) or '<p class="empty-copy">No videos from these channels yet. Run a sync to pull them in.</p>'
     description_html = f'<p class="collection-hero-description">{escape(description_text)}</p>' if description_text else ""
 
     content = f'''
@@ -8068,7 +8431,6 @@ def collection_page(request: Request, collection_id: str, limit: int = 36):
           <h1>{name}</h1>
           <p class="collection-hero-meta">{escape(" · ".join(meta_parts))}</p>
           {description_html}
-          {links_html}
           <div class="collection-hero-actions">
             <button class="primary-action" type="button" data-add-channels="{collection_id_attr}" data-collection-name="{escape(name_text, quote=True)}">{_icon("plus")}<span>Add channels</span></button>
             <button class="text-action" type="button" data-edit-collection="{collection_id_attr}" data-collection-name="{escape(name_text, quote=True)}" data-collection-description="{escape(description_text, quote=True)}">{_icon("pencil")}<span>Rename</span></button>
@@ -8230,11 +8592,8 @@ def index(request: Request):
     all_for_channels = recommendations_preview + library_videos
     initial_sections = _home_feed_sections_html(0, "all", settings, user_key)
     if not initial_sections.strip():
-        initial_sections = '<p class="empty-copy">No recommendations yet. Run a FreshRSS sync, then refresh this page.</p>'
+        initial_sections = '<p class="empty-copy">No recommendations yet. Run a sync, then refresh this page.</p>'
     creator_strip = _creator_strip(all_for_channels)
-    result_count = len(recommendations_preview)
-    library_count = len(library_videos)
-    configured_text = "FreshRSS connected" if settings.freshrss_configured else "FreshRSS not configured"
 
     return f'''
     <!doctype html>
@@ -8249,7 +8608,7 @@ def index(request: Request):
       </head>
       <body>
         {_app_header("", user, user_key)}
-        {_app_sidebar("home", f'<p>{escape(configured_text)}</p><p>{result_count} recommendations<br>{library_count} library videos</p>')}
+        {_app_sidebar("home", "")}
         <main class="home-main">
           <div class="topic-wrap" aria-label="Recommendation filters"><div class="topic-row">{_topic_chips(all_for_channels)}</div></div>
           <section class="creator-strip" aria-label="Channels">{creator_strip}</section>
@@ -8294,10 +8653,16 @@ def watch_video(request: Request, youtube_video_id: str):
     # Views alone was too narrow a trigger: a video acquired by channel backfill or topic
     # search arrives with a view count but no description and no like count, so the page
     # rendered "No description has been imported" forever and never tried again.
+    # Dates get the same treatment: a decoded "2 days ago" timestamp reads as freshly
+    # published and sorts wrong, and nothing re-read it on open either. A missing date
+    # only triggers before first enrichment -- without that guard, a video whose source
+    # genuinely has no date would refetch on every single open.
     needs_detail = (
         video.get("view_count") is None
         or not str(video.get("summary") or video.get("description") or "").strip()
         or video.get("like_count") is None
+        or _published_date_is_decoded(video.get("published_at"))
+        or (video.get("published_at") is None and video.get("metadata_fetched_at") is None)
     )
     if needs_detail and not video.get("metadata_error"):
         if video.get("view_count") is None:
@@ -8314,6 +8679,19 @@ def watch_video(request: Request, youtube_video_id: str):
             ).start()
 
     settings = get_settings()
+    # The page below renders whatever the library has right now; when enrichment
+    # was just (re)triggered -- blocking or background -- the description, view
+    # count or publish date can still arrive seconds later. The flag lets the
+    # watch script poll our own database for the filled-in details and swap them
+    # in, instead of showing "No description" until a manual reload. Likes keep
+    # the old reload behavior: their slot may not exist in the markup yet.
+    details_pending = (
+        video.get("view_count") is None
+        or not str(video.get("summary") or video.get("description") or "").strip()
+        or _published_date_is_decoded(video.get("published_at"))
+        or video.get("published_at") is None
+    )
+    details_pending_attr = ' data-details-pending="1"' if details_pending else ""
     title_text = str(video.get("title") or youtube_video_id)
     title = escape(title_text)
     channel_text = str(video.get("channel_title") or video.get("author") or "Unknown channel")
@@ -8447,7 +8825,7 @@ def watch_video(request: Request, youtube_video_id: str):
     ) if show_comments else ""
 
     content = f'''
-      <div class="watch-layout" data-watch-layout data-video-id="{escape(youtube_video_id)}" data-duration="{int(video.get("duration_seconds") or 0)}" data-resume="{resume_at}">
+      <div class="watch-layout" data-watch-layout data-video-id="{escape(youtube_video_id)}"{details_pending_attr} data-duration="{int(video.get("duration_seconds") or 0)}" data-resume="{resume_at}">
         <div class="watch-stage">
           <div class="watch-player-shell{short_class}">
             <iframe class="player-frame" src="/watch/{escape(youtube_video_id)}/player{resume_query}" title="Invidious player" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>
@@ -8610,6 +8988,8 @@ def _embed_playable(youtube_video_id: str, use_cache: bool = True) -> tuple[bool
         for key, value in list(_probe_cache.items()):
             if value[0] <= now:
                 _probe_cache.pop(key, None)
+        while len(_probe_cache) > 512:
+            _probe_cache.pop(next(iter(_probe_cache)), None)
     return ok, reason
 
 
@@ -9045,9 +9425,25 @@ def _player_script() -> str:
            embed, which does not load the app stylesheet — so the rules for them have to
            travel here too. Without this the marks are in the DOM with correct positions
            and no height, colour or positioning, which is exactly as visible as nothing.
-           The embed is same-origin, which is the only reason any of this is possible. */
+           The embed is same-origin, which is the only reason any of this is possible.
+
+           Invidious sizes its fluid player to 82vh instead of the 16:9 ratio, which
+           pillarboxes every video inside our exactly-16:9 shell — restoring the ratio
+           makes the video reach the shell edges the way YouTube's does.
+
+           Its chrome is also much heavier than YouTube's: a solid control bar and a
+           solid title card fading in on hover reads as the whole video dimming and
+           undimming. YouTube-style gradients keep the controls readable without that. */
         const EMBED_CSS = `
           .vjs-marker { display: none !important; }
+          .player-dimensions.vjs-fluid, .video-js.vjs-fluid { padding-top: 56.25% !important; }
+          .video-js .vjs-control-bar { background: linear-gradient(transparent, rgba(0, 0, 0, .65)) !important; }
+          .video-js .vjs-overlay { background: linear-gradient(rgba(0, 0, 0, .55), transparent) !important;
+            padding: 12px 16px 30px !important; }
+          .video-js .vjs-overlay h1 { font-size: 15px !important; line-height: 1.35 !important;
+            margin: 0 !important; font-weight: 600 !important; }
+          .video-js .vjs-overlay h1 a { color: #fff !important; text-decoration: none !important; }
+          .video-js:hover .vjs-big-play-button, .video-js .vjs-big-play-button { background-color: rgba(35, 35, 35, .5) !important; }
           .sb-marks { position: absolute; left: 0; right: 0; top: 0; bottom: 0;
             pointer-events: none; z-index: 4; }
           .sb-mark { position: absolute; top: 0; height: 100%; min-width: 2px;
@@ -9275,14 +9671,25 @@ def proxy_invidious_ggpht(path: str, request: Request):
     if request.url.query:
         url = f"{url}?{request.url.query}"
     try:
-        with httpx.Client(timeout=20, follow_redirects=True) as client:
-            upstream = client.request(request.method, url, headers=_invidious_proxy_headers(request))
-    except Exception as exc:
+        with _invidious_client().stream(
+            request.method, url, headers=_invidious_proxy_headers(request),
+            timeout=20.0, follow_redirects=True,
+        ) as upstream:
+            content_type = (upstream.headers.get("content-type") or "").lower()
+            status_code = upstream.status_code
+            if request.method == "HEAD":
+                body = b""
+            else:
+                body = bytearray()
+                for chunk in upstream.iter_bytes():
+                    body.extend(chunk)
+                    if len(body) > 5 * 1024 * 1024:
+                        return Response(status_code=502, headers={"cache-control": "no-store"})
+                body = bytes(body)
+    except httpx.HTTPError as exc:
         return Response(status_code=502, headers={"cache-control": "no-store"}, content=str(exc)[:200])
 
-    content_type = (upstream.headers.get("content-type") or "").lower()
-    body = upstream.content if request.method != "HEAD" else b""
-    if upstream.status_code != 200 or not content_type.startswith("image/") or (request.method != "HEAD" and not body):
+    if status_code != 200 or not content_type.startswith("image/") or (request.method != "HEAD" and not body):
         return Response(status_code=502, headers={"cache-control": "no-store"})
     return Response(
         content=body,
@@ -9451,13 +9858,14 @@ def auth_logout(next: str = "/") -> Response:
 
 
 @app.get("/search", response_class=HTMLResponse)
-def search_page(request: Request, q: str = "", limit: int = 40):
+def search_page(request: Request, q: str = "", limit: int = 40, page: int = 1):
     auth_redirect = _login_required_redirect(request)
     if auth_redirect:
         return auth_redirect
     settings = get_settings()
     cleaned = q.strip()
     capped = max(1, min(limit, 100))
+    page_num = max(1, min(int(page or 1), 5))
     local = db.search_videos(cleaned, capped) if cleaned else db.list_recent_videos(capped)
 
     # Searching only the local library answered "which videos do I already have that match"
@@ -9468,7 +9876,7 @@ def search_page(request: Request, q: str = "", limit: int = 40):
     search_error = ""
     if cleaned:
         try:
-            remote = discovery.search_youtube(cleaned)
+            remote = discovery.search_youtube(cleaned, page=page_num)
         except Exception as exc:
             search_error = str(exc)
             logger.warning("youtube search failed for %r: %s", cleaned, exc)
@@ -9483,7 +9891,12 @@ def search_page(request: Request, q: str = "", limit: int = 40):
         except Exception as exc:
             logger.warning("could not store search results for %r: %s", cleaned, exc)
 
-    combined = local + fresh[: max(0, capped - len(local))]
+    # Each source gets its own cap. The old `capped - len(local)` slice meant a full
+    # library page left zero slots for YouTube, so search silently became library-only
+    # as the library grew.
+    local_shown = local[:capped]
+    fresh_shown = fresh[:capped]
+    combined = local_shown + fresh_shown
     rows = "".join(
         _media_row(video, settings, "In your library" if video.get("youtube_video_id") in known else "From YouTube")
         for video in combined
@@ -9495,21 +9908,25 @@ def search_page(request: Request, q: str = "", limit: int = 40):
             else '<p class="empty-copy">No matching videos.</p>'
         )
     heading = f'Results for "{escape(cleaned)}"' if cleaned else "Recent videos"
-    if cleaned:
-        helper = f"{len(local)} from your library, {len(fresh)} from YouTube."
-        if search_error:
-            helper = "Showing library results only — YouTube search could not be reached."
-    else:
-        helper = "Use the search bar in the header to search YouTube and your library."
+    # Page 1 shows every library match, so there is nothing more to load when the
+    # query is empty (recent videos) or YouTube could not be reached.
+    scrollable = bool(cleaned and not search_error)
+    scroll_html = (
+        '<div class="feed-loading" data-search-loading hidden><span></span><span>Loading more results</span></div>\n'
+        '      <div class="feed-sentinel" data-search-sentinel aria-hidden="true"></div>'
+        if scrollable
+        else ""
+    )
     content = f'''
       <section class="page-hero search-summary">
         <div>
           <p class="page-kicker">Search</p>
           <h1>{heading}</h1>
-          <p>{helper}</p>
         </div>
       </section>
-      <section class="result-list">{rows}</section>
+      <section class="result-list" data-search-list data-q="{escape(cleaned, quote=True)}"
+               data-next-page="2" data-search-ok="{'1' if scrollable else '0'}">{rows}</section>
+      {scroll_html}
     '''
     return _app_shell("Search", "search", content, search_value=cleaned, request=request)
 
@@ -9540,7 +9957,7 @@ def _subscription_timeline(videos: list[dict[str, Any]], settings: Any) -> str:
         else:
             groups.append((label, [video]))
     if not groups:
-        return '<p class="empty-copy">No videos from your subscriptions yet. Run a FreshRSS sync to pull them in.</p>'
+        return '<p class="empty-copy">No videos from your subscriptions yet. Run a sync to pull them in.</p>'
     blocks = []
     for index, (label, items) in enumerate(groups):
         cards = "".join(_home_video_card(video, position, settings) for position, video in enumerate(items, start=1))
@@ -9697,7 +10114,7 @@ def subscriptions_page(request: Request, limit: int = 60):
     cards = "".join(_home_video_card(video, index, settings) for index, video in enumerate(videos))
     if not cards:
         cards = (
-            '<p class="empty-copy">No uploads yet. Subscribe to channels in FreshRSS and they '
+            '<p class="empty-copy">No uploads yet. Subscribe to channels and they '
             'will appear here after the next sync.</p>'
         )
     cards = posts_html + cards
@@ -9733,7 +10150,7 @@ def channels_page(request: Request, limit: int = 200, collection: str = "", view
 
     subscription_cards = "".join(_subscription_card(subscription) for subscription in subscriptions)
     if not subscription_cards:
-        subscription_cards = '<p class="empty-copy">No FreshRSS subscriptions imported yet.</p>'
+        subscription_cards = '<p class="empty-copy">No subscriptions yet.</p>'
 
     collection_cards = "".join(_collection_card(item) for item in collections)
     if not collection_cards:
@@ -9816,18 +10233,18 @@ def _playlists_section_html(user_key: str, settings: Any, limit: int = 120) -> s
     if feeds:
         feed_section = f'''
           <section class="section-block">
-            <div class="section-heading"><h2>Playlist feeds from FreshRSS</h2></div>
+            <div class="section-heading"><h2>Playlist feeds</h2></div>
             <div class="channel-grid">{"".join(_subscription_card(item) for item in feeds)}</div>
           </section>
         '''
-    return f'<div class="channel-grid">{cards}</div>{feed_section}'
+    return f'<div class="playlist-grid">{cards}</div>{feed_section}'
 
 
 def _liked_section_html(user_key: str, settings: Any, limit: int = 120) -> str:
     liked = db.list_liked_videos(limit, user_key)
     grid = "".join(_home_video_card(video, index, settings) for index, video in enumerate(liked, start=1))
     if not grid:
-        return '<p class="empty-copy">No liked or starred videos yet. Like a video, or star it in FreshRSS.</p>'
+        return '<p class="empty-copy">No liked videos yet. Like a video to save it here.</p>'
     return f'<div class="video-grid">{grid}</div>'
 
 
@@ -9894,7 +10311,7 @@ def liked_page(request: Request, limit: int = 120):
         return auth_redirect
     user_key = _user_key(request)
     return _library_page_shell(
-        request, "Liked videos", "You", "Videos you liked here, plus anything starred in FreshRSS.",
+        request, "Liked videos", "You", "Videos you liked here.",
         _liked_section_html(user_key, get_settings(), max(1, min(limit, 400))), "liked",
     )
 
@@ -9970,15 +10387,21 @@ def playlist_page(request: Request, playlist_id: str):
     )
     rows = []
     for index, video in enumerate(videos, start=1):
-        video_id = escape(str(video.get("youtube_video_id") or ""))
-        row = _media_row(video, settings)
+        video_id_raw = str(video.get("youtube_video_id") or "")
+        video_id = escape(video_id_raw, quote=True)
         remove = (
             f'<button class="playlist-remove" type="button" data-remove-playlist-item="{video_id}" '
             f'data-playlist-id="{playlist_id_attr}" aria-label="Remove from playlist">{_icon("x")}</button>'
         )
-        row = row.replace('<article class="media-row">', f'<article class="media-row" data-playlist-row="{video_id}"><span class="row-index">{index}</span>', 1)
-        row = row.replace("</article>", f"{remove}</article>", 1)
-        rows.append(row)
+        rows.append(
+            _media_row(
+                video,
+                settings,
+                index=index,
+                playlist_row_id=video_id_raw or None,
+                trailing=remove,
+            )
+        )
     items_html = "".join(rows) or '<p class="empty-copy">This playlist is empty. Use “Save to playlist” from any video menu.</p>'
     description_html = f'<p class="playlist-description">{escape(description_text)}</p>' if description_text else ""
 
@@ -10209,14 +10632,24 @@ def channel_page(request: Request, youtube_channel_id: str, limit: int = 80, sor
     bounded_limit = max(1, min(limit, 500))
     kind = filter if filter in {"shorts", "playlists"} else ""
     query = (q or "").strip()
-    videos = db.list_channel_videos(youtube_channel_id, bounded_limit, sort_key)
-    if query:
-        needle = query.lower()
-        videos = [v for v in videos if needle in str(v.get("title") or "").lower()]
+    # Search the whole stored channel in SQL, not just the first page in Python.
+    # The old in-memory filter made "no results" mean "no results in the first 80".
+    fetch_limit = bounded_limit * 3 if kind == "shorts" and not query else bounded_limit
+    videos = db.list_channel_videos(youtube_channel_id, fetch_limit, sort_key, 0, query)
+    if not query and len(videos) < bounded_limit and kind != "playlists":
+        # First paint was capped at whatever RSS/sync had stored (~15 videos).
+        # Top up from the channel itself so the page reflects the channel, not the cache.
+        try:
+            if _ingest_channel_uploads(youtube_channel_id, bounded_limit, sort_key, max_pages=3):
+                videos = db.list_channel_videos(youtube_channel_id, fetch_limit, sort_key, 0, query)
+        except Exception as exc:
+            logger.info("channel backfill failed for %s: %s", youtube_channel_id, exc)
     if kind == "shorts":
-        videos = [v for v in videos if db.is_short_video(v)]
+        videos = [v for v in videos if db.is_short_video(v)][:bounded_limit]
     elif kind == "playlists":
         videos = []
+    else:
+        videos = videos[:bounded_limit]
     title_text = str(channel.get("title") or "Unknown channel")
     title = escape(title_text)
     video_count = int(channel.get("video_count") or len(videos))
@@ -10361,7 +10794,7 @@ def channel_page(request: Request, youtube_channel_id: str, limit: int = 80, sor
       </nav>
       {f'<div class="ch-filters">{filter_html}</div>' if active_tab == "videos" and not query else ""}
       <section class="video-grid" data-channel-grid data-channel-id="{escape(youtube_channel_id, quote=True)}"
-               data-sort="{sort_key}" data-next-offset="{len(videos)}">{video_grid}</section>
+               data-sort="{sort_key}" data-kind="{kind or "videos"}" data-q="{escape(query, quote=True)}" data-next-offset="{len(videos)}">{video_grid}</section>
       <div class="feed-loading" data-channel-loading hidden><span></span><span>Loading more videos</span></div>
       <div class="feed-sentinel" data-channel-sentinel aria-hidden="true"></div>
       </div>
@@ -10375,13 +10808,16 @@ def api_videos(limit: int = 50) -> dict[str, Any]:
 
 
 @app.get("/api/search")
-def api_search(q: str = "", limit: int = 50, source: str = "all") -> dict[str, Any]:
+def api_search(q: str = "", limit: int = 50, source: str = "all", page: int = 1) -> dict[str, Any]:
     """Search YouTube and the local library.
 
     `source=library` restricts it to what is already stored, which is what this endpoint
-    used to do unconditionally.
+    used to do unconditionally. `page` pages the YouTube side (1-5); the library side is
+    always the top matches. Each side gets its own `limit` so a full library page can
+    no longer starve YouTube results to zero.
     """
     capped = max(1, min(limit, 200))
+    page_num = max(1, min(int(page or 1), 5))
     local = db.search_videos(q, capped)
     if source == "library" or not q.strip():
         return {"items": _json_ready(local), "source": "library"}
@@ -10390,18 +10826,76 @@ def api_search(q: str = "", limit: int = 50, source: str = "all") -> dict[str, A
     remote: list[dict[str, Any]] = []
     error = ""
     try:
-        remote = [item for item in discovery.search_youtube(q) if item.get("youtube_video_id") not in known]
+        remote = [item for item in discovery.search_youtube(q, page=page_num) if item.get("youtube_video_id") not in known]
         if remote:
             db.store_search_results(remote[:capped], q)
     except Exception as exc:
         error = str(exc)
         logger.warning("youtube search failed for %r: %s", q, exc)
+    local_shown = local[:capped]
+    fresh_shown = remote[:capped]
     return {
-        "items": _json_ready(local + remote[: max(0, capped - len(local))]),
-        "library_count": len(local),
-        "youtube_count": len(remote),
+        "items": _json_ready(local_shown + fresh_shown),
+        "library_count": len(local_shown),
+        "youtube_count": len(fresh_shown),
+        "page": page_num,
         "source": "library" if error else "all",
         "detail": error,
+    }
+
+
+@app.get("/api/search/html", tags=["search"], summary="Search results as rendered rows")
+def api_search_html(request: Request, q: str = "", limit: int = 40, page: int = 2) -> dict[str, Any]:
+    """The next pages of a search, already rendered.
+
+    Returns markup for the same reason the channel feed does: the row is rendered
+    server-side, and a second implementation of it in JavaScript would drift from
+    this one.
+
+    Page 1 is the search page itself, which shows every library match. Deeper
+    pages are YouTube-only (`page` pages the YouTube side, 1-5), with anything
+    already stored — including the page-1 YouTube rows, which are stored on
+    sight — left out so scrolling never repeats a video.
+    """
+    settings = get_settings()
+    cleaned = q.strip()
+    capped = max(1, min(limit, 100))
+    page_num = max(1, min(int(page or 1), 5))
+    if not cleaned:
+        return {"ok": True, "html": "", "count": 0, "next_page": page_num, "has_more": False}
+    local = db.search_videos(cleaned, capped) if page_num == 1 else []
+    try:
+        remote = discovery.search_youtube(cleaned, page=page_num)
+    except Exception as exc:
+        logger.warning("youtube search failed for %r (page %d): %s", cleaned, page_num, exc)
+        return {"ok": True, "html": "", "count": 0, "next_page": page_num, "has_more": False}
+
+    if page_num == 1:
+        # Exactly what the search page shows: the library matches first, then
+        # YouTube with those left out.
+        known = {str(video.get("youtube_video_id") or "") for video in local}
+    else:
+        # Page 1 already showed the top library matches; everything stored —
+        # library videos and the stored page-1 YouTube rows — stays off.
+        known = db.video_ids_in_library([item.get("youtube_video_id") for item in remote])
+    fresh = [item for item in remote if item.get("youtube_video_id") not in known]
+    if fresh:
+        try:
+            db.store_search_results(fresh[:capped], cleaned)
+        except Exception as exc:
+            logger.warning("could not store search results for %r: %s", cleaned, exc)
+
+    shown = (local[:capped] if page_num == 1 else []) + fresh[:capped]
+    html = "".join(
+        _media_row(video, settings, "In your library" if video.get("youtube_video_id") in known else "From YouTube")
+        for video in shown
+    )
+    return {
+        "ok": True,
+        "html": html,
+        "count": len(shown),
+        "next_page": page_num + 1,
+        "has_more": page_num < 5 and bool(fresh),
     }
 
 
@@ -10419,16 +10913,18 @@ def api_home_sections(request: Request, page: int = 0, filter: str = "all") -> d
     return {"ok": True, "html": html, "next_page": max(0, page) + 1, "has_more": bool(html.strip())}
 
 
-def _ingest_channel_uploads(youtube_channel_id: str, needed: int) -> int:
+def _ingest_channel_uploads(youtube_channel_id: str, needed: int, sort_key: str = "latest", max_pages: int = 6) -> int:
     """Pull further pages of a channel's uploads into the library.
 
     Paged rather than fetched all at once, and stopped as soon as a page yields nothing
     new, so scrolling a channel costs one upstream request per page instead of hammering
     Invidious for a back catalogue that is mostly already stored.
     """
+    sort_map = {"latest": "newest", "oldest": "oldest", "popular": "popular"}
+    upstream_sort = sort_map.get(sort_key, "newest")
     stored = 0
-    for page in range(1, 4):
-        items = discovery.fetch_channel_uploads(youtube_channel_id, page)
+    for page in range(1, max(1, max_pages) + 1):
+        items = discovery.fetch_channel_uploads(youtube_channel_id, page, sort_by=upstream_sort)
         if not items:
             break
         added = sum(1 for item in items if db.upsert_discovered_video(item, None, "channel", "channel backfill"))
@@ -10440,7 +10936,7 @@ def _ingest_channel_uploads(youtube_channel_id: str, needed: int) -> int:
 
 
 @app.get("/api/channels/{youtube_channel_id}/videos/html", tags=["subscriptions"], summary="Channel videos as rendered cards")
-def api_channel_videos_html(request: Request, youtube_channel_id: str, offset: int = 0, limit: int = 24, sort: str = "latest") -> dict[str, Any]:
+def api_channel_videos_html(request: Request, youtube_channel_id: str, offset: int = 0, limit: int = 24, sort: str = "latest", kind: str = "videos", q: str = "") -> dict[str, Any]:
     """The next page of a channel's videos, already rendered.
 
     Returns markup for the same reason the home feed does: the card is a substantial piece
@@ -10449,23 +10945,49 @@ def api_channel_videos_html(request: Request, youtube_channel_id: str, offset: i
 
     When the local library runs out, this reaches for more from the channel itself so a
     channel page is not limited to whatever happened to be synced.
+
+    `kind` and `q` mirror the tab the grid was rendered from. Without them, scrolling a
+    Shorts tab or a channel search appended Latest videos under it -- and scrolling the
+    Playlists tab (which has no video grid at all) did the same.
     """
     settings = get_settings()
     sort_key = sort if sort in {"latest", "popular", "oldest"} else "latest"
+    kind_key = kind if kind in {"shorts", "playlists"} else "videos"
+    search = (q or "").strip()
     start = max(0, offset)
     size = max(1, min(limit, 60))
-    videos = db.list_channel_videos(youtube_channel_id, size, sort_key, start)
+    if kind_key == "playlists":
+        # Playlists live on their own tab with no video grid to extend; the sentinel
+        # must not pull videos into it.
+        return {"ok": True, "html": "", "count": 0, "fetched_remote": 0, "next_offset": start, "has_more": False}
+    shorts_tab = kind_key == "shorts" and not search
+    # A Shorts window scans past long-form videos, so it reads a wider window and
+    # consumes the whole scan: advancing by the window (not the filtered count)
+    # means no gaps and no duplicates at the boundaries.
+    window = size * 3 if shorts_tab else size
+    videos = db.list_channel_videos(youtube_channel_id, window, sort_key, start, search)
 
     fetched = 0
-    if len(videos) < size and sort_key == "latest":
+    if len(videos) < window:
         # Nothing left locally. Pull the channel's uploads from Invidious, store them, and
         # re-read so the page continues seamlessly instead of simply stopping.
+        # Applies to every sort now — popular/oldest were previously local-only, which
+        # made those tabs look empty on channels with a thin local cache.
         try:
-            fetched = _ingest_channel_uploads(youtube_channel_id, start + size)
+            fetched = _ingest_channel_uploads(youtube_channel_id, start + window, sort_key)
         except Exception as exc:
             logger.info("channel backfill failed for %s: %s", youtube_channel_id, exc)
         if fetched:
-            videos = db.list_channel_videos(youtube_channel_id, size, sort_key, start)
+            videos = db.list_channel_videos(youtube_channel_id, window, sort_key, start, search)
+
+    if shorts_tab:
+        scanned = len(videos)
+        videos = [video for video in videos if db.is_short_video(video)][:size]
+        next_offset = start + window if scanned >= window else start + scanned
+        has_more = scanned >= window or fetched > 0
+    else:
+        next_offset = start + len(videos)
+        has_more = len(videos) >= size
 
     html = "".join(_home_video_card(video, index, settings) for index, video in enumerate(videos))
     return {
@@ -10473,8 +10995,8 @@ def api_channel_videos_html(request: Request, youtube_channel_id: str, offset: i
         "html": html,
         "count": len(videos),
         "fetched_remote": fetched,
-        "next_offset": start + len(videos),
-        "has_more": len(videos) >= size,
+        "next_offset": next_offset,
+        "has_more": has_more,
     }
 
 
@@ -10517,25 +11039,21 @@ def api_takeout_subscriptions(request: Request, limit: int = 500) -> dict[str, A
 
 @app.post("/api/takeout/subscriptions/apply", tags=["recommendations"], summary="Subscribe to imported channels")
 def api_apply_takeout_subscriptions(request: Request, limit: int = 50) -> dict[str, Any]:
-    """Subscribe in FreshRSS to channels the archive says you follow.
+    """Subscribe locally to channels the archive says you follow.
 
-    Deliberately batched and deliberately not automatic on upload. This writes real feeds
-    into FreshRSS, and an archive can name several hundred channels — creating all of them
-    because somebody uploaded a file is not a decision to make on their behalf.
+    Deliberately batched and deliberately not automatic on upload. This writes real
+    subscription rows, and an archive can name several hundred channels — creating all
+    of them because somebody uploaded a file is not a decision to make on their behalf.
     """
     auth_redirect = _login_required_redirect(request)
     if auth_redirect:
         raise HTTPException(status_code=401, detail="Login required")
-    settings = get_settings()
-    if not settings.freshrss_configured:
-        raise HTTPException(status_code=409, detail="FreshRSS is not configured")
 
     user_key = _user_key(request)
     batch = db.pending_takeout_subscriptions(user_key, max(1, min(limit, 200)))
     if not batch:
         return {"ok": True, "subscribed": 0, "failed": 0, "counts": db.takeout_subscription_counts(user_key), "done": True}
 
-    client = FreshRSSClient(settings)
     done: list[str] = []
     failed: list[dict[str, str]] = []
     for item in batch:
@@ -10543,28 +11061,33 @@ def api_apply_takeout_subscriptions(request: Request, limit: int = 50) -> dict[s
         title = str(item.get("title") or channel_id)
         feed_url = _youtube_feed_url(channel_id)
         try:
-            client.subscribe_feed(feed_url, title)
-            stream_id = client.stream_id_for_feed_url(feed_url) or f"feed/{feed_url}"
-            db.upsert_subscription(
-                {"id": stream_id, "title": title, "url": feed_url,
-                 "htmlUrl": f"https://www.youtube.com/channel/{channel_id}", "categories": []},
-                channel_id,
-            )
-            db.upsert_channel(title, channel_id, feed_url)
-            done.append(channel_id)
+            stored = _subscribe_channel_local(channel_id, title, feed_url)
         except Exception as exc:  # noqa: BLE001 - one bad channel must not stop the batch
             message = str(exc)
             logger.info("takeout subscribe failed for %s: %s", channel_id, message)
-            # A channel deleted on YouTube has no feed to subscribe to, so FreshRSS will
-            # refuse it forever. Mark it rather than retrying it on every pass, which is
+            # A channel deleted on YouTube has no feed to fetch, so it will fail
+            # forever. Mark it rather than retrying it on every pass, which is
             # what made the button sit there offering the same handful of channels.
-            permanent = "400" in message or "404" in message
+            permanent = "400" in message or "404" in message or isinstance(exc, ValueError)
             if permanent:
                 db.mark_takeout_subscription_failed(channel_id, message, user_key)
             failed.append({
                 "youtube_channel_id": channel_id, "title": title,
                 "error": message[:160], "permanent": permanent,
             })
+            continue
+        # Subscribed, but a gone feed (deleted channel) would otherwise sit in the
+        # pending list forever: the immediate fetch already proved it.
+        feed_status = stored.get("feed_status")
+        if feed_status in (400, 404, 410):
+            reason = f"feed returned HTTP {feed_status}"
+            db.mark_takeout_subscription_failed(channel_id, reason, user_key)
+            failed.append({
+                "youtube_channel_id": channel_id, "title": title,
+                "error": reason, "permanent": True,
+            })
+            continue
+        done.append(channel_id)
 
     db.mark_takeout_subscribed(done, user_key)
     # Newly subscribed channels have no avatar yet, which is most of why a freshly
@@ -10648,7 +11171,7 @@ def api_status_panel(request: Request):
     """The status body, fetched when the pane is opened.
 
     Rendering it inline meant running live health checks against Postgres, Redis,
-    FreshRSS and Invidious on *every* page load, because the settings dialog is part of
+    the RSS poller and Invidious on *every* page load, because the settings dialog is part of
     the app shell. That alone took home renders from ~0.35s to ~1.4s.
     """
     auth_redirect = _login_required_redirect(request)
@@ -11092,68 +11615,131 @@ def api_channel_videos(youtube_channel_id: str, limit: int = 80, offset: int = 0
     return {"items": _json_ready(db.list_channel_videos(youtube_channel_id, max(1, min(limit, 200)), sort_key, max(0, offset)))}
 
 
+def _fetch_single_feed_best_effort(feed_url: str, youtube_channel_id: str | None = None) -> int | None:
+    """Pull one channel feed right now; never raises, returns the HTTP status.
+
+    A new subscription would otherwise sit empty until the worker's next pass.
+    Every failure mode — network, malformed feed, database — is swallowed and
+    logged: the subscription row already exists, so the next sync recovers.
+    The status lets callers (Takeout) tell a dead feed from a slow network.
+    """
+    try:
+        settings = get_settings()
+        with httpx.Client(timeout=20.0, follow_redirects=True, headers={"User-Agent": "OpenFeed RSS poller"}) as client:
+            result = fetch_channel_feed(client, feed_url)
+        if result.status != 200 or not result.text:
+            return result.status
+        for entry in parse_channel_feed(result.text, feed_url):
+            channel_id = db.upsert_channel(
+                entry["channel_title"], entry.get("youtube_channel_id"), entry.get("feed_url")
+            )
+            video_id = db.upsert_video(entry, channel_id, entry["youtube_video_id"])
+            entry_channel = entry.get("youtube_channel_id")
+            subscription_id = db.subscription_id_for_channel(entry_channel) if entry_channel else None
+            entry["subscription_id"] = subscription_id
+            db.upsert_entry(entry, video_id, subscription_id)
+        subscription_id = db.subscription_id_for_channel(youtube_channel_id) if youtube_channel_id else None
+        if subscription_id:
+            db.record_rss_fetch(
+                subscription_id,
+                etag=result.etag,
+                last_modified=result.last_modified,
+                ok=True,
+                ttl_seconds=settings.rss_poll_ttl_seconds,
+            )
+        return result.status
+    except Exception as exc:  # noqa: BLE001 - the subscribe already succeeded
+        logger.info("single-feed fetch skipped for %s: %s", feed_url, exc)
+        return None
+
+
+def _subscribe_channel_local(
+    youtube_channel_id: str = "", title: str = "", feed_url: str = ""
+) -> dict[str, Any]:
+    """Create the local subscription row for a channel. No remote service involved.
+
+    The channel id is resolved from any of the inputs (a bare channel id, a feed
+    URL carrying ``?channel_id=``, or a title mentioning one) and the channel
+    RSS feed URL is derived from it. A bare id that is not a well-formed channel
+    id is rejected before it can mint a junk row; a bare feed URL (OPML, Takeout,
+    non-YouTube feeds) is always accepted and fetched best-effort. The
+    freshrss_subscriptions row is upserted under a ``feed/<url>`` id, which the
+    dedupe pass collapses if the poller later meets the same feed under another
+    id. Then that one feed is pulled immediately on a best-effort basis; a fetch
+    failure never fails the subscribe. Returns the stored feed_url,
+    youtube_channel_id, title and the immediate fetch's HTTP status (None when
+    the fetch was skipped or never answered).
+    """
+    given_id = (youtube_channel_id or "").strip()
+    given_url = (feed_url or "").strip()
+    if given_id and not given_url and not CHANNEL_ID_STRICT_RE.match(given_id):
+        raise ValueError("That does not look like a YouTube channel ID")
+    resolved_id = (
+        given_id
+        or youtube_channel_id_from_text(feed_url)
+        or youtube_channel_id_from_text(title)
+        or ""
+    )
+    if resolved_id and CHANNEL_ID_STRICT_RE.match(resolved_id):
+        # Canonical form: drops http/trailing-slash variants of the same feed so
+        # re-subscribing cannot mint a second row for the same channel.
+        url = _youtube_feed_url(resolved_id)
+    else:
+        url = given_url or (_youtube_feed_url(resolved_id) if resolved_id else "")
+    if not url:
+        raise ValueError("A feed URL or YouTube channel ID is required")
+    name = (title or "").strip() or resolved_id or url
+    db.upsert_subscription(
+        {
+            "id": f"feed/{url}",
+            "title": name,
+            "url": url,
+            "htmlUrl": f"https://www.youtube.com/channel/{resolved_id}" if resolved_id else None,
+            "categories": [],
+        },
+        resolved_id or None,
+    )
+    feed_status: int | None = None
+    if resolved_id:
+        db.upsert_channel(name, resolved_id, url)
+        feed_status = _fetch_single_feed_best_effort(url, resolved_id)
+        # One channel, off-thread: the subscribe response should not wait on artwork.
+        threading.Thread(target=lambda: enrich_channel(resolved_id), name="channel-art", daemon=True).start()
+    return {"youtube_channel_id": resolved_id or None, "feed_url": url, "title": name, "feed_status": feed_status}
+
+
 @app.post("/api/subscriptions/freshrss")
 def api_subscribe_freshrss(payload: SubscribeRequest) -> dict[str, Any]:
-    settings = get_settings()
-    if not settings.freshrss_configured:
-        raise HTTPException(status_code=409, detail="FreshRSS is not configured")
-
     youtube_channel_id = payload.youtube_channel_id.strip()
     feed_url = payload.feed_url.strip() or (_youtube_feed_url(youtube_channel_id) if youtube_channel_id else "")
     if not feed_url:
         raise HTTPException(status_code=400, detail="A feed URL or YouTube channel ID is required")
+    # A bare id mints the feed URL by itself, so a malformed one must fail here
+    # instead of creating a junk row. (A bare feed URL still goes through and
+    # fails best-effort: OPML/Takeout/non-YouTube feeds.)
+    if youtube_channel_id and not payload.feed_url.strip() and not CHANNEL_ID_STRICT_RE.match(youtube_channel_id):
+        raise HTTPException(status_code=400, detail="That does not look like a YouTube channel ID")
 
     title = payload.title.strip() or youtube_channel_id or feed_url
-    client = FreshRSSClient(settings)
     try:
-        client.subscribe_feed(feed_url, title)
-    except Exception as exc:
-        # A feed FreshRSS already carries is the goal state, not a failure — the local row
-        # may simply be missing, so fall through and reconcile it below rather than
-        # leaving the user with a button that refuses to work.
-        if not client.stream_id_for_feed_url(feed_url):
-            raise HTTPException(status_code=502, detail=f"FreshRSS subscribe failed: {exc}") from exc
-        logger.info("feed %s was already in FreshRSS; reconciling the local row", feed_url)
-
-    # Ask FreshRSS for the id it just assigned. Storing a "feed/<url>" placeholder instead
-    # would collide with the real "feed/<n>" row the next sync imports, listing the
-    # channel twice.
-    stream_id = client.stream_id_for_feed_url(feed_url) or f"feed/{feed_url}"
-    html_url = f"https://www.youtube.com/channel/{youtube_channel_id}" if youtube_channel_id else None
-    db.upsert_subscription(
-        {
-            "id": stream_id,
-            "title": title,
-            "url": feed_url,
-            "htmlUrl": html_url,
-            "categories": [],
-        },
-        youtube_channel_id or None,
-    )
-    if youtube_channel_id:
-        db.upsert_channel(title, youtube_channel_id, feed_url)
-        # One channel, off-thread: the subscribe response should not wait on artwork.
-        threading.Thread(target=lambda: enrich_channel(youtube_channel_id), name="channel-art", daemon=True).start()
-    return {"ok": True, "feed_url": feed_url, "youtube_channel_id": youtube_channel_id or None, "title": title}
+        stored = _subscribe_channel_local(youtube_channel_id, title, feed_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "feed_url": stored["feed_url"], "youtube_channel_id": stored["youtube_channel_id"], "title": stored["title"]}
 
 
 @app.delete("/api/subscriptions/freshrss")
 def api_unsubscribe_freshrss(payload: SubscribeRequest) -> dict[str, Any]:
-    settings = get_settings()
-    if not settings.freshrss_configured:
-        raise HTTPException(status_code=409, detail="FreshRSS is not configured")
-
     youtube_channel_id = payload.youtube_channel_id.strip()
     feed_url = payload.feed_url.strip() or (_youtube_feed_url(youtube_channel_id) if youtube_channel_id else "")
     if not feed_url:
         raise HTTPException(status_code=400, detail="A feed URL or YouTube channel ID is required")
 
-    try:
-        FreshRSSClient(settings).unsubscribe_feed(feed_url)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"FreshRSS unsubscribe failed: {exc}") from exc
-
+    # Local row only: the channel's videos and watch history stay, so
+    # unsubscribing never deletes anything the user has already seen.
     removed = db.remove_subscription(feed_url, youtube_channel_id or None)
+    if not removed:
+        raise HTTPException(status_code=404, detail="No such subscription")
     return {"ok": True, "feed_url": feed_url, "youtube_channel_id": youtube_channel_id or None, "removed_local": removed}
 
 
@@ -11235,7 +11821,7 @@ def api_remove_subscription_collection_member_body(
 
 @app.delete("/api/subscription-collections/{collection_id}/members/{subscription_id:path}")
 def api_remove_subscription_collection_member(request: Request, collection_id: str, subscription_id: str) -> dict[str, Any]:
-    # FreshRSS subscription ids contain a slash ("feed/4"), so this segment must be a path param.
+    # Local subscription ids contain a slash ("feed/4"), so this segment must be a path param.
     deleted = db.remove_subscription_from_collection(collection_id, subscription_id, _user_key(request))
     if not deleted:
         raise HTTPException(status_code=404, detail="Collection member not found")
@@ -11438,6 +12024,50 @@ def _comment_avatar(thumbnails: Any) -> str:
         if index != -1:
             return "/ggpht/" + url[index + len(marker):]
     return ""
+
+
+# Invidious's comments endpoint stopped returning authorThumbnails (empty for every
+# comment), so avatars are resolved lazily against the channel endpoint, which still
+# carries them. Hits live a day, misses ten minutes so a failed lookup does not pin
+# initials on a commenter forever; the cap matches the other in-process caches.
+_COMMENT_AVATAR_CACHE: dict[str, tuple[float, str]] = {}
+_COMMENT_AVATAR_CACHE_TTL = 24 * 3600
+_COMMENT_AVATAR_MISS_TTL = 10 * 60
+_COMMENT_AVATAR_CACHE_CAP = 2000
+
+
+def _comment_avatar_cached(author_id: str) -> tuple[bool, str]:
+    entry = _COMMENT_AVATAR_CACHE.get(author_id)
+    if not entry:
+        return False, ""
+    stored_at, url = entry
+    ttl = _COMMENT_AVATAR_CACHE_TTL if url else _COMMENT_AVATAR_MISS_TTL
+    if time.time() - stored_at > ttl:
+        _COMMENT_AVATAR_CACHE.pop(author_id, None)
+        return False, ""
+    return True, url
+
+
+def _comment_avatar_store(author_id: str, url: str) -> None:
+    _COMMENT_AVATAR_CACHE[author_id] = (time.time(), url)
+    while len(_COMMENT_AVATAR_CACHE) > _COMMENT_AVATAR_CACHE_CAP:
+        _COMMENT_AVATAR_CACHE.pop(next(iter(_COMMENT_AVATAR_CACHE)))
+
+
+def _fetch_commenter_avatar(author_id: str, base_url: str, timeout: float) -> str:
+    """One commenter's avatar via their channel page, for the batch endpoint below."""
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            response = client.get(f"{base_url}/api/v1/channels/{author_id}")
+        if response.status_code != 200:
+            return ""
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return ""
+        return _comment_avatar(payload.get("authorThumbnails"))
+    except Exception as exc:  # noqa: BLE001 - a missing avatar stays as initials
+        logger.info("comment avatar lookup failed for %s: %s", author_id, exc)
+        return ""
 
 
 def _download_filename(title: str, video_id: str, extension: str = "mp4") -> str:
@@ -11835,7 +12465,7 @@ def api_index(request: Request) -> dict[str, Any]:
             "preferences": ["/api/feed/preferences", "/api/playback/preferences"],
             "metadata": ["/api/enrich/recent", "/api/discover/related", "/api/ryd/refresh"],
             "tokens": ["/api/tokens"],
-            "system": ["/api/status/full", "/api/sync/freshrss", "/healthz"],
+            "system": ["/api/status/full", "/api/sync/rss", "/healthz"],
         },
         "route_count": len(routes),
         "routes": routes,
@@ -11882,14 +12512,14 @@ async def api_takeout_import(request: Request, archive: UploadFile = File(...)) 
     except Exception as exc:  # noqa: BLE001 - the import itself already succeeded
         logger.warning("post-import refresh failed: %s", exc)
 
-    # Subscriptions are reported, never acted on: subscribing writes to the user's
-    # FreshRSS account, and doing that silently to hundreds of channels from a file
-    # upload is not a decision this endpoint gets to make.
+    # Subscriptions are reported, never acted on: following hundreds of channels
+    # silently because somebody uploaded a file is not a decision this endpoint
+    # gets to make.
     return {
         "ok": True,
         "summary": summary,
         "imported_at": _json_ready_value(record.get("created_at")),
-        "note": "Subscriptions were read for ranking only. Use Subscriptions to follow any of them in FreshRSS.",
+        "note": "Subscriptions were read for ranking only. Use Subscriptions to follow any of them here.",
     }
 
 
@@ -12020,6 +12650,44 @@ def api_video_dislikes(request: Request, youtube_video_id: str) -> dict[str, Any
     }
 
 
+@app.get("/api/videos/{youtube_video_id}/details")
+def api_video_details(request: Request, youtube_video_id: str) -> dict[str, Any]:
+    """The watch page's description block, re-rendered from the stored row.
+
+    A freshly opened page can render before background enrichment fills in the
+    description, view count or publish date. The watch script polls this -- our
+    own database only, never Invidious -- and swaps the block when it completes,
+    so the first paint does not freeze "No description" on screen. Markup comes
+    from the server for the same reason channel cards do: one renderer, no drift.
+    """
+    _user_key(request)
+    video = db.get_video_by_youtube_id(youtube_video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    summary_text = _description_text(video.get("summary") or video.get("description") or "")
+    has_description = bool(summary_text.strip())
+    views = _compact_count(video.get("view_count"))
+    view_text = f"{escape(views)} views" if views else "Views unavailable"
+    published_relative = _relative_time(video.get("published_at"))
+    published_date = _date_text(video.get("published_at"))
+    published_text = escape(published_relative or published_date)
+    description_meta = " &middot; ".join(part for part in [view_text, published_text] if part)
+    complete = (
+        video.get("view_count") is not None
+        and has_description
+        and not _published_date_is_decoded(video.get("published_at"))
+        and video.get("published_at") is not None
+    )
+    return {
+        "ok": True,
+        "youtube_video_id": youtube_video_id,
+        "complete": complete,
+        "has_description": has_description,
+        "meta_html": description_meta,
+        "body_html": f"<p>{_rich_text(summary_text)}</p>" if has_description else "",
+    }
+
+
 @app.get("/api/comments/{youtube_video_id}")
 def api_comments(request: Request, youtube_video_id: str, continuation: str = "") -> dict[str, Any]:
     """Fetch comments from Invidious. Off unless the user opts in.
@@ -12095,14 +12763,74 @@ def api_comments(request: Request, youtube_video_id: str, continuation: str = ""
     }
 
 
+@app.post("/api/comments/avatars")
+def api_comment_avatars(request: Request, payload: CommentAvatarsRequest) -> dict[str, Any]:
+    """Author avatars for already-rendered comments, resolved lazily as one batch.
+
+    The comments endpoint carries no avatar URLs (Invidious returns an empty
+    authorThumbnails list for every comment), so rows render as initials first
+    and the watch script asks here for the authors on screen. Resolved against
+    the channel endpoint, which still carries thumbnails, with a bounded worker
+    pool and per-fetch timeout so one slow lookup cannot hold the request open.
+    Anything unresolved stays as initials.
+    """
+    auth_redirect = _login_required_redirect(request)
+    if auth_redirect:
+        raise HTTPException(status_code=401, detail="Login required")
+    preferences = db.get_feed_preferences(_user_key(request))
+    if not preferences.get("show_comments"):
+        raise HTTPException(status_code=403, detail="Comments are disabled in settings")
+    settings = get_settings()
+    if not settings.invidious_base_url:
+        raise HTTPException(status_code=502, detail="Invidious is not configured")
+    seen: dict[str, None] = {}
+    for raw in (payload.author_ids or [])[:25]:
+        author_id = str(raw or "").strip()
+        # Channel ids only: the value becomes an upstream path segment, so anything
+        # else is dropped before it can reach a URL.
+        if re.fullmatch(r"[A-Za-z0-9_-]{2,64}", author_id):
+            seen[author_id] = None
+    avatars: dict[str, str] = {}
+    missing: list[str] = []
+    for author_id in seen:
+        hit, url = _comment_avatar_cached(author_id)
+        if hit:
+            if url:
+                avatars[author_id] = url
+        else:
+            missing.append(author_id)
+    missing = missing[:12]
+    if missing:
+        timeout = max(3.0, min(float(settings.enrichment_timeout_seconds or 12), 6.0))
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            try:
+                resolved = list(
+                    pool.map(
+                        lambda aid: _fetch_commenter_avatar(aid, settings.invidious_base_url, timeout),
+                        missing,
+                        timeout=max(10.0, timeout * 2),
+                    )
+                )
+            except Exception:  # noqa: BLE001 - pool timeout still yields cached hits
+                resolved = [""] * len(missing)
+        for author_id, url in zip(missing, resolved):
+            _comment_avatar_store(author_id, url)
+            if url:
+                avatars[author_id] = url
+    return {"ok": True, "avatars": avatars}
+
+
 @app.get("/api/sidebar/subscriptions", response_class=HTMLResponse)
 def api_sidebar_subscriptions(request: Request) -> str:
     """The sidebar subscription list as HTML, so it can refresh in place after a
-    subscribe or unsubscribe without a full page reload."""
+    subscribe or unsubscribe without a full page reload.
+
+    This is the full list (limit=250), not the shell's VISIBLE + 1 probe: expanding
+    "Show more" swaps this markup in, so the shell never has to fetch it upfront."""
     auth_redirect = _login_required_redirect(request)
     if auth_redirect:
         return ""
-    return _sidebar_subscription_group()
+    return _sidebar_subscription_group(limit=250)
 
 
 def _short_card(video: dict[str, Any], position: int) -> str:
@@ -12287,7 +13015,7 @@ def _shorts_slide(video: dict[str, Any], user_key: str = "local") -> str:
 def _shorts_page_html(videos: list[dict[str, Any]], user_key: str) -> str:
     slides = "".join(_shorts_slide(video, user_key) for video in videos)
     if not slides:
-        slides = '<p class="empty-copy">No Shorts in your library yet. Sync FreshRSS, or turn Shorts on in Settings.</p>'
+        slides = '<p class="empty-copy">No Shorts in your library yet. Sync now, or turn Shorts on in Settings.</p>'
     return f'''
       <div class="shorts-viewport" data-shorts-viewport>
         <div class="shorts-stage" data-shorts-stage data-next-offset="{len(videos)}">
@@ -12346,11 +13074,13 @@ def api_shorts(request: Request, offset: int = 0, limit: int = 8) -> dict[str, A
     }
 
 
-@app.post("/api/sync/freshrss")
-def api_sync_freshrss() -> dict[str, Any]:
-    result = sync_freshrss_once()
-    if not result.get("ok") and result.get("status") == "configuration_error":
-        raise HTTPException(status_code=409, detail=result)
+@app.post("/api/sync/rss")
+def api_sync_rss() -> dict[str, Any]:
+    try:
+        result = sync_rss_once(get_settings().rss_poll_limit)
+    except Exception as exc:  # noqa: BLE001 - surfacing as 502, never a 500
+        logger.exception("RSS sync failed: %s", exc)
+        raise HTTPException(status_code=502, detail=f"RSS sync failed: {exc}") from exc
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=result)
     return result
@@ -12376,7 +13106,7 @@ def recommended_feed() -> Response:
               <title>{title}</title>
               <link>{escape(link)}</link>
               <pubDate>{escape(pub_date)}</pubDate>
-              <description>{escape("Invidious discovery" if video.get("source_kind") == "discovery" else "FreshRSS subscription")}: {author}</description>
+              <description>{escape("Invidious discovery" if video.get("source_kind") == "discovery" else "Subscription")}: {author}</description>
             </item>
             """
         )

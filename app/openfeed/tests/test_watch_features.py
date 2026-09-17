@@ -224,6 +224,48 @@ class CommentVoteWeightTests(unittest.TestCase):
         self.assertIn("WHEN event_type = 'more_like_this' THEN 5", source)
 
 
+class WatchedExclusionTests(unittest.TestCase):
+    """Watching a video must keep it out of the recommendation lanes."""
+
+    def test_opened_videos_leave_the_recommendation_lanes(self) -> None:
+        import inspect
+
+        from openfeed import db
+
+        source = inspect.getsource(db.list_recommended_videos)
+        # An open counts as a watch: the page records watch_page_open on render.
+        self.assertIn("COALESCE(er.open_count, 0) = 0", source)
+        # ...as does any playback evidence, timed or not.
+        self.assertIn("COALESCE(pp.percent_completed, 0) = 0", source)
+        self.assertIn("COALESCE(pp.total_watch_seconds, 0) = 0", source)
+
+    def test_continue_watching_keeps_partial_watches(self) -> None:
+        import inspect
+
+        from openfeed import db
+
+        source = inspect.getsource(db.list_recommended_videos)
+        # The resume lane bypasses the watched exclusion; it selects partials by
+        # progress instead, so excluding them here would empty the shelf.
+        self.assertIn("continue-watching", source)
+        self.assertIn("resume_lane", source)
+
+    def test_finished_shorts_leave_the_shorts_shelf(self) -> None:
+        import inspect
+
+        from openfeed import db
+
+        source = inspect.getsource(db.list_short_videos)
+        self.assertIn("COALESCE(pp.completed, false) = false", source)
+
+    def test_the_shorts_viewer_records_watches(self) -> None:
+        # Viewing happens in the viewer, never on a watch page, so without this
+        # nothing is ever recorded and the same shorts keep resurfacing.
+        script = main._home_script()
+        self.assertIn("shorts_viewer", script)
+        self.assertIn("watch_page_open", script)
+
+
 class ThumbIconConsistencyTests(unittest.TestCase):
     def test_the_script_thumbs_come_from_the_server_icon_table(self) -> None:
         # A hand-copied duplicate had already drifted from _THUMB_PATH.

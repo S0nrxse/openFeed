@@ -4,6 +4,29 @@ networks:
   openfeed_net:
     driver: bridge
 
+# Shared OPENFEED_* / sync / cache / concurrency settings so app and worker can't diverge.
+x-openfeed-common-env: &openfeed-common-env
+  SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-1800}
+  ENRICH_AFTER_SYNC_LIMIT: ${ENRICH_AFTER_SYNC_LIMIT:-40}
+  ENRICHMENT_TIMEOUT_SECONDS: ${ENRICHMENT_TIMEOUT_SECONDS:-12}
+  DISCOVER_AFTER_SYNC_LIMIT: ${DISCOVER_AFTER_SYNC_LIMIT:-3}
+  DISCOVER_RELATED_PER_VIDEO: ${DISCOVER_RELATED_PER_VIDEO:-6}
+  INVIDIOUS_BASE_URL: ${INVIDIOUS_BASE_URL:-http://openfeed-invidious:3000}
+  INVIDIOUS_PUBLIC_URL: ${INVIDIOUS_PUBLIC_URL:-http://localhost:8061}
+  OPENFEED_PLAYBACK_FALLBACK: ${OPENFEED_PLAYBACK_FALLBACK:-youtube}
+  OPENFEED_INVIDIOUS_FALLBACKS: ${OPENFEED_INVIDIOUS_FALLBACKS:-}
+  OPENFEED_PLAYBACK_PROBE_TIMEOUT: ${OPENFEED_PLAYBACK_PROBE_TIMEOUT:-4}
+  OPENFEED_YTDLP_ENABLED: ${OPENFEED_YTDLP_ENABLED:-true}
+  OPENFEED_YTDLP_PLAYBACK: ${OPENFEED_YTDLP_PLAYBACK:-true}
+  OPENFEED_YTDLP_TIMEOUT: ${OPENFEED_YTDLP_TIMEOUT:-90}
+  OPENFEED_YTDLP_CACHE_SECONDS: ${OPENFEED_YTDLP_CACHE_SECONDS:-240}
+  OPENFEED_YTDLP_COOKIES_FILE: ${OPENFEED_YTDLP_COOKIES_FILE:-}
+  OPENFEED_YTDLP_EXTRA_ARGS: ${OPENFEED_YTDLP_EXTRA_ARGS:-}
+  OPENFEED_DOWNLOAD_DIR: ${OPENFEED_DOWNLOAD_DIR:-/data/downloads}
+  OPENFEED_DOWNLOAD_RETENTION: ${OPENFEED_DOWNLOAD_RETENTION:-21600}
+  OPENFEED_DOWNLOAD_CONCURRENCY: ${OPENFEED_DOWNLOAD_CONCURRENCY:-2}
+  OPENFEED_DOWNLOAD_MAX_HEIGHT: ${OPENFEED_DOWNLOAD_MAX_HEIGHT:-2160}
+
 services:
   openfeed-postgres:
     image: postgres:17-alpine
@@ -37,72 +60,6 @@ services:
     networks:
       - openfeed_net
 
-  openfeed-freshrss-db:
-    image: postgres:17-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: freshrss_db
-      POSTGRES_USER: freshrss_user
-      POSTGRES_PASSWORD: ${FRESHRSS_DB_PASSWORD:?set FRESHRSS_DB_PASSWORD in .env}
-      TZ: ${TZ:-UTC}
-    volumes:
-      - ${OPENFEED_DATA_DIR:-./data}/freshrss-postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U freshrss_user -d freshrss_db"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    networks:
-      - openfeed_net
-
-  freshrss:
-    image: freshrss/freshrss:latest
-    restart: unless-stopped
-    depends_on:
-      openfeed-freshrss-db:
-        condition: service_healthy
-    ports:
-      - "${FRESHRSS_BIND_IP:-127.0.0.1}:${FRESHRSS_PORT:-8050}:80"
-    environment:
-      TZ: ${TZ:-Etc/UTC}
-      CRON_MIN: ${FRESHRSS_CRON_MIN:-13,43}
-      FRESHRSS_ENV: production
-      OIDC_ENABLED: ${FRESHRSS_OIDC_ENABLED:-0}
-      OIDC_PROVIDER_METADATA_URL: ${FRESHRSS_OIDC_PROVIDER_METADATA_URL:-}
-      OIDC_CLIENT_ID: ${FRESHRSS_OIDC_CLIENT_ID:-}
-      OIDC_CLIENT_SECRET: ${FRESHRSS_OIDC_CLIENT_SECRET:-}
-      OIDC_CLIENT_CRYPTO_KEY: ${FRESHRSS_OIDC_CLIENT_CRYPTO_KEY:-}
-      OIDC_REMOTE_USER_CLAIM: preferred_username
-      OIDC_SCOPES: openid profile email
-      OIDC_X_FORWARDED_HEADERS: X-Forwarded-Host X-Forwarded-Port X-Forwarded-Proto
-      FRESHRSS_INSTALL: |-
-        --api-enabled
-        --base-url ${FRESHRSS_PUBLIC_URL:-http://localhost:8050}
-        --db-base freshrss_db
-        --db-host openfeed-freshrss-db
-        --db-password ${FRESHRSS_DB_PASSWORD:?set FRESHRSS_DB_PASSWORD in .env}
-        --db-type pgsql
-        --db-user freshrss_user
-        --default-user ${FRESHRSS_ADMIN_USER:?set FRESHRSS_ADMIN_USER in .env}
-        --language en
-      FRESHRSS_USER: |-
-        --api-password ${FRESHRSS_ADMIN_API_PASSWORD:?set FRESHRSS_ADMIN_API_PASSWORD in .env}
-        --email ${FRESHRSS_ADMIN_EMAIL:?set FRESHRSS_ADMIN_EMAIL in .env}
-        --language en
-        --password ${FRESHRSS_ADMIN_PASSWORD:?set FRESHRSS_ADMIN_PASSWORD in .env}
-        --user ${FRESHRSS_ADMIN_USER:?set FRESHRSS_ADMIN_USER in .env}
-    volumes:
-      - ${FRESHRSS_DATA_DIR:-./data/freshrss/data}:/var/www/FreshRSS/data
-      - ${FRESHRSS_EXTENSIONS_DIR:-./data/freshrss/extensions}:/var/www/FreshRSS/extensions
-    healthcheck:
-      test: ["CMD", "cli/health.php"]
-      timeout: 10s
-      start_period: 60s
-      interval: 75s
-      retries: 3
-    networks:
-      - openfeed_net
-
   openfeed-app:
     build:
       context: ./app
@@ -113,7 +70,10 @@ services:
         condition: service_healthy
       openfeed-redis:
         condition: service_healthy
+      openfeed-invidious:
+        condition: service_started
     environment:
+      <<: *openfeed-common-env
       TZ: ${TZ:-UTC}
       OPENFEED_PUBLIC_URL: ${OPENFEED_PUBLIC_URL:-http://localhost:8060}
       OPENFEED_SOURCE_URL: ${OPENFEED_SOURCE_URL:-https://github.com/S0nrxse/openFeed}
@@ -134,30 +94,6 @@ services:
       OPENFEED_OIDC_SCOPE: ${OPENFEED_OIDC_SCOPE:-openid email profile}
       DATABASE_URL: postgresql://${POSTGRES_USER:-openfeed}:${POSTGRES_PASSWORD}@openfeed-postgres:5432/${POSTGRES_DB:-openfeed}
       REDIS_URL: ${REDIS_URL:-redis://openfeed-redis:6379/0}
-      FRESHRSS_BASE_URL: ${FRESHRSS_BASE_URL:-http://freshrss}
-      FRESHRSS_USERNAME: ${FRESHRSS_USERNAME:-}
-      FRESHRSS_API_PASSWORD: ${FRESHRSS_API_PASSWORD:-}
-      FRESHRSS_READING_LIST_LIMIT: ${FRESHRSS_READING_LIST_LIMIT:-250}
-      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-1800}
-      ENRICH_AFTER_SYNC_LIMIT: ${ENRICH_AFTER_SYNC_LIMIT:-40}
-      ENRICHMENT_TIMEOUT_SECONDS: ${ENRICHMENT_TIMEOUT_SECONDS:-12}
-      INVIDIOUS_BASE_URL: ${INVIDIOUS_BASE_URL:-http://openfeed-invidious:3000}
-      INVIDIOUS_PUBLIC_URL: ${INVIDIOUS_PUBLIC_URL:-http://localhost:8061}
-      OPENFEED_PLAYBACK_FALLBACK: ${OPENFEED_PLAYBACK_FALLBACK:-youtube}
-      OPENFEED_INVIDIOUS_FALLBACKS: ${OPENFEED_INVIDIOUS_FALLBACKS:-}
-      OPENFEED_PLAYBACK_PROBE_TIMEOUT: ${OPENFEED_PLAYBACK_PROBE_TIMEOUT:-4}
-      OPENFEED_YTDLP_ENABLED: ${OPENFEED_YTDLP_ENABLED:-true}
-      OPENFEED_YTDLP_PLAYBACK: ${OPENFEED_YTDLP_PLAYBACK:-true}
-      OPENFEED_YTDLP_TIMEOUT: ${OPENFEED_YTDLP_TIMEOUT:-90}
-      OPENFEED_YTDLP_CACHE_SECONDS: ${OPENFEED_YTDLP_CACHE_SECONDS:-240}
-      OPENFEED_YTDLP_COOKIES_FILE: ${OPENFEED_YTDLP_COOKIES_FILE:-}
-      OPENFEED_YTDLP_EXTRA_ARGS: ${OPENFEED_YTDLP_EXTRA_ARGS:-}
-      OPENFEED_DOWNLOAD_DIR: ${OPENFEED_DOWNLOAD_DIR:-/data/downloads}
-      OPENFEED_DOWNLOAD_RETENTION: ${OPENFEED_DOWNLOAD_RETENTION:-21600}
-      OPENFEED_DOWNLOAD_CONCURRENCY: ${OPENFEED_DOWNLOAD_CONCURRENCY:-2}
-      OPENFEED_DOWNLOAD_MAX_HEIGHT: ${OPENFEED_DOWNLOAD_MAX_HEIGHT:-2160}
-      DISCOVER_AFTER_SYNC_LIMIT: ${DISCOVER_AFTER_SYNC_LIMIT:-3}
-      DISCOVER_RELATED_PER_VIDEO: ${DISCOVER_RELATED_PER_VIDEO:-6}
     ports:
       - "${OPENFEED_BIND_IP:-127.0.0.1}:${OPENFEED_PORT:-8060}:8000"
     volumes:
@@ -184,23 +120,13 @@ services:
         condition: service_healthy
     command: ["python", "-m", "openfeed.worker"]
     environment:
+      <<: *openfeed-common-env
       TZ: ${TZ:-UTC}
       OPENFEED_PUBLIC_URL: ${OPENFEED_PUBLIC_URL:-http://localhost:8060}
       OPENFEED_SOURCE_URL: ${OPENFEED_SOURCE_URL:-https://github.com/S0nrxse/openFeed}
       OPENFEED_SECRET_KEY: ${OPENFEED_SECRET_KEY:?set OPENFEED_SECRET_KEY in .env}
       DATABASE_URL: postgresql://${POSTGRES_USER:-openfeed}:${POSTGRES_PASSWORD}@openfeed-postgres:5432/${POSTGRES_DB:-openfeed}
       REDIS_URL: ${REDIS_URL:-redis://openfeed-redis:6379/0}
-      FRESHRSS_BASE_URL: ${FRESHRSS_BASE_URL:-http://freshrss}
-      FRESHRSS_USERNAME: ${FRESHRSS_USERNAME:-}
-      FRESHRSS_API_PASSWORD: ${FRESHRSS_API_PASSWORD:-}
-      FRESHRSS_READING_LIST_LIMIT: ${FRESHRSS_READING_LIST_LIMIT:-250}
-      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-1800}
-      ENRICH_AFTER_SYNC_LIMIT: ${ENRICH_AFTER_SYNC_LIMIT:-40}
-      ENRICHMENT_TIMEOUT_SECONDS: ${ENRICHMENT_TIMEOUT_SECONDS:-12}
-      INVIDIOUS_BASE_URL: ${INVIDIOUS_BASE_URL:-http://openfeed-invidious:3000}
-      INVIDIOUS_PUBLIC_URL: ${INVIDIOUS_PUBLIC_URL:-http://localhost:8061}
-      DISCOVER_AFTER_SYNC_LIMIT: ${DISCOVER_AFTER_SYNC_LIMIT:-3}
-      DISCOVER_RELATED_PER_VIDEO: ${DISCOVER_RELATED_PER_VIDEO:-6}
     networks:
       - openfeed_net
 
@@ -303,7 +229,7 @@ services:
     image: typesense/typesense:29.0
     restart: unless-stopped
     profiles: ["search"]
-    command: ["--data-dir", "/data", "--api-key", "${TYPESENSE_API_KEY:?set TYPESENSE_API_KEY in .env}", "--enable-cors"]
+    command: ["--data-dir", "/data", "--api-key", "${TYPESENSE_API_KEY:-}", "--enable-cors"]
     volumes:
       - ${OPENFEED_DATA_DIR:-./data}/typesense:/data
     networks:

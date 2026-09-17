@@ -29,7 +29,12 @@ CREATE TABLE IF NOT EXISTS freshrss_subscriptions (
   youtube_channel_id TEXT,
   categories JSONB NOT NULL DEFAULT '[]'::jsonb,
   first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  etag TEXT,
+  last_modified TEXT,
+  last_checked_at TIMESTAMPTZ,
+  fetch_failures INTEGER NOT NULL DEFAULT 0,
+  next_fetch_after TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS freshrss_entries (
@@ -46,6 +51,15 @@ CREATE TABLE IF NOT EXISTS freshrss_entries (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Direct-RSS polling state on freshrss_subscriptions. The CREATE TABLE above covers
+-- fresh installs; these ALTERs migrate existing databases (init_db replays the whole
+-- file, and ADD COLUMN IF NOT EXISTS is a no-op once the column exists).
+ALTER TABLE freshrss_subscriptions ADD COLUMN IF NOT EXISTS etag TEXT;
+ALTER TABLE freshrss_subscriptions ADD COLUMN IF NOT EXISTS last_modified TEXT;
+ALTER TABLE freshrss_subscriptions ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
+ALTER TABLE freshrss_subscriptions ADD COLUMN IF NOT EXISTS fetch_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE freshrss_subscriptions ADD COLUMN IF NOT EXISTS next_fetch_after TIMESTAMPTZ;
 
 
 CREATE TABLE IF NOT EXISTS subscription_collections (
@@ -103,6 +117,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_published_at ON videos (published_at DESC 
 CREATE INDEX IF NOT EXISTS idx_videos_channel_id ON videos (channel_id);
 CREATE INDEX IF NOT EXISTS idx_freshrss_entries_published_at ON freshrss_entries (published_at DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_freshrss_entries_video_id ON freshrss_entries (video_id);
+CREATE INDEX IF NOT EXISTS idx_freshrss_entries_video_updated ON freshrss_entries (video_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sync_runs_started_at ON sync_runs (started_at DESC);
 ALTER TABLE user_video_events ADD COLUMN IF NOT EXISTS user_key TEXT NOT NULL DEFAULT 'local';
 CREATE INDEX IF NOT EXISTS idx_user_video_events_video_id ON user_video_events (video_id);

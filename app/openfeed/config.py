@@ -62,10 +62,9 @@ class Settings:
     secret_key: str = _env(lambda: _str_env("OPENFEED_SECRET_KEY"))
     database_url: str = _env(lambda: _str_env("DATABASE_URL"))
     redis_url: str = _env(lambda: _str_env("REDIS_URL", "redis://openfeed-redis:6379/0"))
-    freshrss_base_url: str = _env(lambda: _str_env("FRESHRSS_BASE_URL", "http://freshrss", strip_slash=True))
-    freshrss_username: str = _env(lambda: _str_env("FRESHRSS_USERNAME"))
-    freshrss_api_password: str = _env(lambda: _str_env("FRESHRSS_API_PASSWORD"))
-    freshrss_reading_list_limit: int = _env(lambda: _int_env("FRESHRSS_READING_LIST_LIMIT", 250))
+    # Direct YouTube RSS polling of subscribed channels (no FreshRSS involved).
+    rss_poll_limit: int = _env(lambda: _int_env("RSS_POLL_LIMIT", 100))
+    rss_poll_ttl_seconds: int = _env(lambda: _int_env("RSS_POLL_TTL_SECONDS", 3600))
     sync_interval_seconds: int = _env(lambda: _int_env("SYNC_INTERVAL_SECONDS", 1800))
     # Discovered videos arrive with almost no metadata — no tags, usually no publish
     # date — and topic-based ranking cannot see a video whose topics were never
@@ -142,10 +141,6 @@ class Settings:
     @property
     def oidc_public_issuer(self) -> str:
         return f"{self.oidc_issuer}/" if self.oidc_issuer else ""
-
-    @property
-    def freshrss_configured(self) -> bool:
-        return bool(self.freshrss_base_url and self.freshrss_username and self.freshrss_api_password)
 
     @property
     def youtube_fallback_enabled(self) -> bool:

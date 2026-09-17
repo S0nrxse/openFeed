@@ -63,18 +63,20 @@ class MetaRowSpacingTests(unittest.TestCase):
 
 
 class TheaterSizingTests(unittest.TestCase):
-    """The player keeps its width and letterboxes, rather than shrinking off the gutter."""
+    """The player spans both columns at its natural ratio, fitted like YouTube's theater."""
 
-    def test_the_height_is_capped_against_the_viewport(self) -> None:
+    def test_the_player_fits_the_viewport_with_room_for_the_title(self) -> None:
         css = main._home_styles()
-        self.assertIn("height: min(calc(100cqw * 9 / 16), max(280px, calc(100vh - var(--header) - var(--theater-reserve, 196px))))", css)
+        self.assertIn("body.theater .watch-player-shell { width: min(100%, calc((100vh - var(--header) - 120px) * 16 / 9));", css)
+        self.assertIn("height: auto; aspect-ratio: 16 / 9;", css)
+        # The old height cap letterboxed the video with side bars to keep the title
+        # above the fold; fitting the width to the viewport keeps the ratio without bars.
+        self.assertNotIn("--theater-reserve", css)
+        self.assertNotIn("100cqw * 9 / 16", css)
 
-    def test_the_reserve_is_a_tunable_variable(self) -> None:
-        self.assertIn("--theater-reserve: 196px;", main._home_styles())
-
-    def test_the_stage_is_a_size_container(self) -> None:
-        # 100cqw only resolves if the stage declares itself a container.
-        self.assertIn("body.theater .watch-stage { container-type: inline-size;", main._home_styles())
+    def test_the_stage_does_not_need_to_be_a_size_container(self) -> None:
+        # container-type only existed to resolve the 100cqw height cap.
+        self.assertNotIn("body.theater .watch-stage { container-type: inline-size;", main._home_styles())
 
     def test_the_player_meets_the_header_with_no_gap(self) -> None:
         # The page's usual 20px breathing room below the header would read as a seam.
@@ -85,19 +87,38 @@ class TheaterSizingTests(unittest.TestCase):
         # below the up-next heading.
         self.assertIn("body.theater .watch-title { margin-top: 0; }", main._home_styles())
 
-    def test_the_stage_bleeds_past_the_page_gutter(self) -> None:
-        # Edge to edge means cancelling the gutter the rest of the page pads by.
-        self.assertIn("margin: 0 calc(var(--watch-gutter) * -1) 14px;", main._home_styles())
-
-    def test_the_player_width_is_pinned_so_the_cap_cannot_shrink_it(self) -> None:
+    def test_the_stage_stays_inside_the_gutter(self) -> None:
+        # Full-bleed ran to the window edges and felt like a takeover; theater spans
+        # both columns but keeps the page margins, radius and border.
         css = main._home_styles()
-        self.assertIn("body.theater .watch-player-shell { width: 100%; max-width: 100%; margin-inline: 0;", css)
-        # aspect-ratio + max-height would make the browser re-derive width from the clamped
-        # height, pulling the box off the gutter it is supposed to line up with.
-        self.assertNotIn("aspect-ratio: 16 / 9;\n        max-height:", css)
+        self.assertIn("body.theater .watch-stage { background: transparent;", css)
+        self.assertNotIn("margin: 0 calc(var(--watch-gutter) * -1) 14px;", css)
+        shell = css.split("body.theater .watch-player-shell {", 1)[1].split("}", 1)[0]
+        self.assertIn("border-radius: 0", shell)
+        self.assertNotIn("border-left: 0", shell)
 
-    def test_the_iframe_fills_the_capped_box(self) -> None:
-        self.assertIn("body.theater .player-frame { height: 100%; aspect-ratio: auto; }", main._home_styles())
+    def test_the_player_width_is_pinned(self) -> None:
+        css = main._home_styles()
+        self.assertIn("body.theater .watch-player-shell { width: min(100%, calc((100vh - var(--header) - 120px) * 16 / 9));", css)
+
+    def test_the_theater_corners_do_not_eat_the_video(self) -> None:
+        # Any round on the theater player visibly crops the video corners, so it is
+        # square like YouTube's theater instead of carrying the card radius.
+        css = main._home_styles()
+        shell = css.split("body.theater .watch-player-shell {", 1)[1].split("}", 1)[0]
+        self.assertIn("border-radius: 0;", shell)
+
+    def test_the_iframe_fills_the_shell(self) -> None:
+        # Height comes from the shell's ratio, not a second ratio on the frame —
+        # two competing aspect-ratios stuttered on resize.
+        self.assertIn("body.theater .player-frame { width: 100%; height: 100%; }", main._home_styles())
+
+    def test_theater_does_not_transition_its_size(self) -> None:
+        # The transition exists for sidebar open/close elsewhere; in theater the
+        # shell tracks the window live, so animating it only rubber-bands.
+        css = main._home_styles()
+        self.assertIn("body.nav-ready:not(.theater) .watch-player-shell { transition:", css)
+        self.assertNotIn("body.nav-ready .watch-player-shell { transition:", css)
 
     def test_vertical_shorts_keep_their_own_ratio_instead_of_letterboxing(self) -> None:
         css = main._home_styles()
@@ -207,40 +228,85 @@ class SubscriptionStateTests(unittest.TestCase):
         self.assertIn("cs.feed_url AS channel_subscription_feed_url", source)
 
 
-class SubscribeIdempotencyTests(unittest.TestCase):
-    """Subscribing to a feed FreshRSS already has is the goal state, not an error."""
+class SubscribeLocalTests(unittest.TestCase):
+    """Subscriptions are local rows: subscribing upserts, unsubscribing deletes the row only."""
 
-    def _call(self, subscribe_error: Exception | None, existing_stream: str | None) -> dict[str, object]:
-        class _Client:
-            def __init__(self, *args: object, **kwargs: object) -> None:
-                pass
-
-            def subscribe_feed(self, feed_url: str, title: str | None = None) -> None:
-                if subscribe_error:
-                    raise subscribe_error
-
-            def stream_id_for_feed_url(self, feed_url: str) -> str | None:
-                return existing_stream
-
-        payload = main.SubscribeRequest(youtube_channel_id="UC1", title="Chan", feed_url="https://feed")
-        settings = SimpleNamespace(freshrss_configured=True)
-        with patch.object(main, "FreshRSSClient", _Client), \
-             patch.object(main, "get_settings", return_value=settings), \
-             patch.object(main.db, "upsert_subscription"), \
-             patch.object(main.db, "upsert_channel"):
+    def _subscribe(self, **overrides) -> dict[str, object]:
+        params = {"youtube_channel_id": "UC1", "title": "Chan", "feed_url": "https://feed"}
+        params.update(overrides)
+        payload = main.SubscribeRequest(**params)
+        with patch.object(main.db, "upsert_subscription"), \
+             patch.object(main.db, "upsert_channel"), \
+             patch.object(main, "_fetch_single_feed_best_effort"), \
+             patch.object(main, "enrich_channel"):
             return main.api_subscribe_freshrss(payload)
 
-    def test_an_already_subscribed_feed_succeeds(self) -> None:
-        result = self._call(RuntimeError("already subscribed"), "feed/7")
+    def test_subscribe_creates_a_local_row_and_succeeds(self) -> None:
+        with patch.object(main.db, "upsert_subscription") as upserted, \
+             patch.object(main.db, "upsert_channel"), \
+             patch.object(main, "_fetch_single_feed_best_effort"), \
+             patch.object(main, "enrich_channel"):
+            result = main.api_subscribe_freshrss(
+                main.SubscribeRequest(youtube_channel_id="UC1", title="Chan", feed_url="https://feed")
+            )
         self.assertTrue(result["ok"])
+        self.assertEqual(result["feed_url"], "https://feed")
+        upserted.assert_called_once()
 
-    def test_a_genuine_failure_still_raises(self) -> None:
+    def test_subscribing_twice_is_idempotent(self) -> None:
+        self.assertTrue(self._subscribe()["ok"])
+        self.assertTrue(self._subscribe()["ok"])
+
+    def test_subscribe_without_a_feed_or_channel_is_a_400(self) -> None:
         with self.assertRaises(main.HTTPException) as caught:
-            self._call(RuntimeError("connection refused"), None)
-        self.assertEqual(caught.exception.status_code, 502)
+            self._subscribe(youtube_channel_id="", feed_url="", title="")
+        self.assertEqual(caught.exception.status_code, 400)
 
-    def test_the_happy_path_is_unchanged(self) -> None:
-        self.assertTrue(self._call(None, "feed/7")["ok"])
+    def test_subscribe_with_a_garbage_bare_channel_id_is_a_400(self) -> None:
+        # A bare id mints the feed URL by itself, so a malformed one must fail
+        # here instead of creating a junk row. A bare feed URL still goes
+        # through (OPML/Takeout/non-YouTube feeds) and fails best-effort.
+        with self.assertRaises(main.HTTPException) as caught:
+            self._subscribe(youtube_channel_id="NOTAREALID", feed_url="", title="")
+        self.assertEqual(caught.exception.status_code, 400)
+
+    def test_subscribe_canonicalizes_url_variants_to_one_row(self) -> None:
+        channel = "UC" + "b" * 22
+        with patch.object(main.db, "upsert_subscription") as upserted, \
+             patch.object(main.db, "upsert_channel"), \
+             patch.object(main, "_fetch_single_feed_best_effort"), \
+             patch.object(main, "enrich_channel"):
+            first = main.api_subscribe_freshrss(
+                main.SubscribeRequest(youtube_channel_id=channel, title="C", feed_url="http://www.youtube.com/feeds/videos.xml?channel_id=" + channel + "/")
+            )
+            second = main.api_subscribe_freshrss(
+                main.SubscribeRequest(youtube_channel_id="", title="C", feed_url="https://www.youtube.com/feeds/videos.xml?channel_id=" + channel)
+            )
+        self.assertEqual(first["feed_url"], second["feed_url"])
+        self.assertEqual(
+            first["feed_url"], f"https://www.youtube.com/feeds/videos.xml?channel_id={channel}"
+        )
+
+    def test_unsubscribe_removes_only_the_local_row(self) -> None:
+        payload = main.SubscribeRequest(youtube_channel_id="UC1", title="Chan", feed_url="https://feed")
+        with patch.object(main.db, "remove_subscription", return_value=True) as removed:
+            result = main.api_unsubscribe_freshrss(payload)
+        removed.assert_called_once_with("https://feed", "UC1")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["removed_local"])
+
+    def test_unsubscribe_without_a_feed_or_channel_is_a_400(self) -> None:
+        payload = main.SubscribeRequest(youtube_channel_id="", title="", feed_url="")
+        with self.assertRaises(main.HTTPException) as caught:
+            main.api_unsubscribe_freshrss(payload)
+        self.assertEqual(caught.exception.status_code, 400)
+
+    def test_unsubscribe_of_a_missing_row_is_a_404(self) -> None:
+        payload = main.SubscribeRequest(youtube_channel_id="UC1", title="Chan", feed_url="https://feed")
+        with patch.object(main.db, "remove_subscription", return_value=0):
+            with self.assertRaises(main.HTTPException) as caught:
+                main.api_unsubscribe_freshrss(payload)
+        self.assertEqual(caught.exception.status_code, 404)
 
 
 class WatchOptionsMenuTests(unittest.TestCase):
@@ -351,6 +417,29 @@ class RelatedSuggestionTests(unittest.TestCase):
         ]
         self.assertEqual(self._related(pool), ["other"])
 
+    def test_one_channel_cannot_fill_the_rail(self) -> None:
+        # A pool with real variety: the cap holds and the rail still fills.
+        pool = (
+            [{"youtube_video_id": f"same{i}", "title": "same channel video",
+              "duration_seconds": 900, "tags": ["synth"], "youtube_channel_id": "UC_anchor"}
+             for i in range(6)]
+            + [{"youtube_video_id": f"other{i}", "title": "other channel video",
+                "duration_seconds": 900, "tags": [], "youtube_channel_id": f"UC_other{i}"}
+               for i in range(20)]
+        )
+        out = self._related(pool)
+        self.assertEqual(sum(1 for vid in out if vid.startswith("same")), 2)
+        self.assertEqual(len(out), 14)
+
+    def test_a_narrow_pool_still_fills_the_rail(self) -> None:
+        # Backfill, not empty slots, when one channel genuinely dominates the pool.
+        pool = [
+            {"youtube_video_id": f"same{i}", "title": "same channel video",
+             "duration_seconds": 900, "tags": ["synth"], "youtube_channel_id": "UC_anchor"}
+            for i in range(6)
+        ]
+        self.assertEqual(len(self._related(pool)), 6)
+
     def test_duplicates_across_both_pools_appear_once(self) -> None:
         row = {"youtube_video_id": "dupe", "title": "video", "duration_seconds": 900, "tags": []}
         with patch.object(db, "get_video_by_youtube_id", return_value=self.ANCHOR), \
@@ -381,6 +470,23 @@ class EmbedMarkerTests(unittest.TestCase):
         script = main._player_script()
         self.assertIn("openfeed-embed-style", script)
         self.assertIn("doc.getElementById('openfeed-embed-style')", script)
+
+
+class EmbedChromeTests(unittest.TestCase):
+    """The Invidious player is restyled toward YouTube inside our own embed."""
+
+    def test_the_video_fills_the_frame_instead_of_pillarboxing(self) -> None:
+        # Invidious sizes its fluid player to 82vh, which bars every video inside
+        # our exactly-16:9 shell; the ratio override makes it reach the edges.
+        script = main._player_script()
+        self.assertIn(".player-dimensions.vjs-fluid, .video-js.vjs-fluid { padding-top: 56.25% !important; }", script)
+
+    def test_hover_chrome_is_gradients_not_a_dim(self) -> None:
+        # A solid bar and title card fading in read as the video dimming; faint
+        # gradients keep the controls readable without that.
+        script = main._player_script()
+        self.assertIn(".video-js .vjs-control-bar { background: linear-gradient(transparent, rgba(0, 0, 0, .65)) !important; }", script)
+        self.assertIn(".video-js .vjs-overlay { background: linear-gradient(rgba(0, 0, 0, .55), transparent) !important;", script)
 
 
 class CommentVoteSpacingTests(unittest.TestCase):
@@ -551,3 +657,273 @@ class FaviconTests(unittest.TestCase):
     def test_the_player_iframe_does_not_carry_one(self) -> None:
         # Nothing displays a favicon for an embedded frame.
         self.assertNotIn("_head_icons", inspect.getsource(main.watch_player))
+
+
+class PublishedDateDecodedTests(unittest.TestCase):
+    """List endpoints report "2 days ago" as the fetch wall-clock; the single-video
+    endpoint reports a real date at midnight UTC. That difference is the signature."""
+
+    def test_midnight_utc_is_a_real_date(self) -> None:
+        from datetime import datetime, timezone
+
+        self.assertFalse(main._published_date_is_decoded(datetime(2026, 9, 1, tzinfo=timezone.utc)))
+
+    def test_a_wall_clock_time_is_decoded(self) -> None:
+        from datetime import datetime, timezone
+
+        self.assertTrue(main._published_date_is_decoded(datetime(2026, 9, 1, 15, 30, tzinfo=timezone.utc)))
+
+    def test_missing_and_naive_values_do_not_crash(self) -> None:
+        from datetime import datetime
+
+        self.assertFalse(main._published_date_is_decoded(None))
+        self.assertFalse(main._published_date_is_decoded(datetime(2026, 9, 1, 0, 0)))
+        self.assertTrue(main._published_date_is_decoded(datetime(2026, 9, 1, 12, 0)))
+
+
+class VideoDetailsEndpointTests(unittest.TestCase):
+    """The watch page polls this for details that arrive after first paint."""
+
+    COMPLETE = {
+        "youtube_video_id": "vid1", "title": "A video", "view_count": 138,
+        "summary": "hello https://example.com", "like_count": 6,
+        "published_at": __import__("datetime").datetime(2026, 9, 1, tzinfo=__import__("datetime").timezone.utc),
+    }
+
+    def _details(self, row: dict) -> dict:
+        with patch.object(main, "_user_key", return_value="local"), \
+             patch.object(db, "get_video_by_youtube_id", return_value=row):
+            return main.api_video_details(None, row["youtube_video_id"])
+
+    def test_a_complete_row_reports_complete_with_rendered_markup(self) -> None:
+        out = self._details(dict(self.COMPLETE))
+        self.assertTrue(out["complete"])
+        self.assertTrue(out["has_description"])
+        self.assertIn("138 views", out["meta_html"])
+        self.assertIn("https://example.com", out["body_html"])
+
+    def test_a_pending_row_is_incomplete_with_no_body(self) -> None:
+        row = dict(self.COMPLETE, summary="", description="")
+        out = self._details(row)
+        self.assertFalse(out["complete"])
+        self.assertFalse(out["has_description"])
+        self.assertEqual(out["body_html"], "")
+
+    def test_a_decoded_date_keeps_it_pending(self) -> None:
+        from datetime import datetime, timezone
+
+        row = dict(self.COMPLETE, published_at=datetime(2026, 9, 15, 20, 0, tzinfo=timezone.utc))
+        self.assertFalse(self._details(row)["complete"])
+
+
+class ChannelVideosHtmlTests(unittest.TestCase):
+    """Load-more has to continue the tab it was rendered from, not Latest."""
+
+    def _row(self, youtube_video_id: str, duration: int) -> dict:
+        return {"youtube_video_id": youtube_video_id, "title": youtube_video_id,
+                "url": f"https://www.youtube.com/watch?v={youtube_video_id}",
+                "duration_seconds": duration, "channel_title": "Chan"}
+
+    def test_playlists_tab_returns_empty_and_never_queries(self) -> None:
+        with patch.object(db, "list_channel_videos") as videos:
+            out = main.api_channel_videos_html(None, "UC_x", kind="playlists")
+        videos.assert_not_called()
+        self.assertEqual(out, {"ok": True, "html": "", "count": 0, "fetched_remote": 0,
+                               "next_offset": 0, "has_more": False})
+
+    def test_search_query_reaches_the_library_query(self) -> None:
+        with patch.object(db, "list_channel_videos", return_value=[]) as videos, \
+             patch.object(main, "_ingest_channel_uploads", return_value=0):
+            main.api_channel_videos_html(None, "UC_x", q="synth")
+        self.assertEqual(videos.call_args[0][4], "synth")
+
+    def test_shorts_tab_scans_a_window_and_filters(self) -> None:
+        rows = [self._row(f"long{i}", 600) for i in range(71)] + [self._row("short1", 30)]
+        with patch.object(db, "list_channel_videos", return_value=rows), \
+             patch.object(main, "_ingest_channel_uploads", return_value=0):
+            out = main.api_channel_videos_html(None, "UC_x", offset=0, limit=24, kind="shorts")
+        self.assertEqual(out["count"], 1)
+        self.assertIn("short1", out["html"])
+        self.assertNotIn("long0", out["html"])
+        # The whole 72-row window is consumed, so scrolling continues past it.
+        self.assertEqual(out["next_offset"], 72)
+        self.assertTrue(out["has_more"])
+
+
+class SearchHtmlTests(unittest.TestCase):
+    """Search scrolls through YouTube pages without repeating what is shown."""
+
+    def _row(self, youtube_video_id: str) -> dict:
+        return {"youtube_video_id": youtube_video_id, "title": youtube_video_id}
+
+    def _fake_row(self, video: dict, settings: object, badge: str) -> str:
+        return f'<article data-video-id="{video["youtube_video_id"]}">{badge}:{video["youtube_video_id"]}</article>'
+
+    def _html(self, **kwargs) -> dict:
+        from openfeed import discovery
+
+        settings = SimpleNamespace()
+        with patch.object(main, "get_settings", return_value=settings), \
+             patch.object(main, "_media_row", side_effect=self._fake_row), \
+             patch.object(db, "search_videos", return_value=kwargs.pop("local", [])) as local, \
+             patch.object(discovery, "search_youtube", return_value=kwargs.pop("remote", [])) as remote, \
+             patch.object(db, "store_search_results", return_value=0) as stored, \
+             patch.object(db, "video_ids_in_library", return_value=kwargs.pop("member", set())) as membership:
+            out = main.api_search_html(None, **kwargs)
+        return {"out": out, "local": local, "remote": remote, "stored": stored, "membership": membership}
+
+    def test_empty_query_returns_nothing_and_never_searches(self) -> None:
+        from openfeed import discovery
+
+        with patch.object(discovery, "search_youtube") as remote:
+            out = main.api_search_html(None, q="   ")
+        remote.assert_not_called()
+        self.assertEqual(out, {"ok": True, "html": "", "count": 0, "next_page": 2, "has_more": False})
+
+    def test_later_pages_are_youtube_only_and_skip_what_is_stored(self) -> None:
+        seen = self._html(q="synth", page=2, local=[self._row("lib1")], member={"lib1", "page1"},
+                          remote=[self._row("lib1"), self._row("page1"), self._row("new2")])
+        seen["local"].assert_not_called()
+        # The library side is page 1's job; page 2 only checks stored membership.
+        seen["membership"].assert_called_once()
+        out = seen["out"]
+        self.assertNotIn("lib1", out["html"])
+        self.assertNotIn("page1", out["html"])
+        self.assertIn("From YouTube:new2", out["html"])
+        self.assertEqual(out["count"], 1)
+        self.assertEqual(out["next_page"], 3)
+        self.assertTrue(out["has_more"])
+        seen["stored"].assert_called_once()
+
+    def test_last_page_never_reports_more(self) -> None:
+        seen = self._html(q="synth", page=5, remote=[self._row("new5")])
+        self.assertEqual(seen["out"]["next_page"], 6)
+        self.assertFalse(seen["out"]["has_more"])
+
+    def test_an_unreachable_youtube_side_stops_the_scroll(self) -> None:
+        from openfeed import discovery
+
+        settings = SimpleNamespace()
+        with patch.object(main, "get_settings", return_value=settings), \
+             patch.object(discovery, "search_youtube", side_effect=RuntimeError("down")):
+            out = main.api_search_html(None, q="synth", page=2)
+        self.assertEqual(out, {"ok": True, "html": "", "count": 0, "next_page": 2, "has_more": False})
+
+    def test_page_one_mirrors_the_search_page(self) -> None:
+        seen = self._html(q="synth", page=1, local=[self._row("lib1")],
+                          remote=[self._row("lib1"), self._row("new1")])
+        out = seen["out"]
+        self.assertIn("In your library:lib1", out["html"])
+        self.assertIn("From YouTube:new1", out["html"])
+        self.assertEqual(out["count"], 2)
+        self.assertTrue(out["has_more"])
+
+
+class SearchPageTests(unittest.TestCase):
+    """The search hero names the query; the counts line is gone."""
+
+    def _content(self, q: str, remote: list | None = None, error: bool = False) -> str:
+        from openfeed import discovery
+
+        rows = remote if remote is not None else [{"youtube_video_id": "new1", "title": "new1"}]
+        search = RuntimeError("down") if error else None
+        settings = SimpleNamespace()
+        with patch.object(main, "_login_required_redirect", return_value=None), \
+             patch.object(main, "get_settings", return_value=settings), \
+             patch.object(db, "search_videos", return_value=[]), \
+             patch.object(db, "list_recent_videos", return_value=[]), \
+             patch.object(discovery, "search_youtube", return_value=rows, side_effect=None if not error else search), \
+             patch.object(db, "store_search_results", return_value=0), \
+             patch.object(main, "_media_row", return_value='<article data-video-id="new1"></article>'), \
+             patch.object(main, "_app_shell", return_value="") as shell:
+            main.search_page(None, q=q)
+        return shell.call_args[0][2]
+
+    def test_heading_stays_but_the_counts_line_is_gone(self) -> None:
+        content = self._content(" derezzed ")
+        self.assertIn("Results for", content)
+        self.assertIn("derezzed", content)
+        self.assertNotIn("from your library", content)
+        self.assertNotIn("from YouTube", content)
+
+    def test_a_searchable_page_carries_the_scroll_hooks(self) -> None:
+        content = self._content("synth")
+        self.assertIn("data-search-list", content)
+        self.assertIn('data-q="synth"', content)
+        self.assertIn('data-next-page="2"', content)
+        self.assertIn('data-search-ok="1"', content)
+        self.assertIn("data-search-sentinel", content)
+        self.assertIn("data-search-loading", content)
+
+    def test_an_unreachable_youtube_side_has_no_sentinel(self) -> None:
+        content = self._content("synth", error=True)
+        self.assertIn('data-search-ok="0"', content)
+        self.assertNotIn("data-search-sentinel", content)
+
+    def test_recent_videos_have_no_sentinel(self) -> None:
+        content = self._content("")
+        self.assertNotIn("data-search-sentinel", content)
+
+
+class CommentAvatarResolverTests(unittest.TestCase):
+    """Invidious returns no comment avatars, so rows resolve them lazily as a batch."""
+
+    def _avatars(self, ids: list) -> dict:
+        settings = SimpleNamespace(invidious_base_url="http://inv", enrichment_timeout_seconds=5)
+        with patch.object(main, "_login_required_redirect", return_value=None), \
+             patch.object(main, "_user_key", return_value="local"), \
+             patch.object(db, "get_feed_preferences", return_value={"show_comments": True}), \
+             patch.object(main, "get_settings", return_value=settings):
+            return main.api_comment_avatars(None, main.CommentAvatarsRequest(author_ids=ids))
+
+    def test_non_channel_ids_never_reach_the_network(self) -> None:
+        with patch.object(main, "_fetch_commenter_avatar") as fetch:
+            out = self._avatars(["../../etc/passwd", "", "x", "has space", "a" * 65])
+        fetch.assert_not_called()
+        # Nothing valid was even considered; nothing cached, nothing returned.
+        self.assertEqual(out, {"ok": True, "avatars": {}})
+
+    def test_cache_hits_skip_the_network(self) -> None:
+        main._comment_avatar_store("UC_cached", "/ggpht/abc")
+        try:
+            with patch.object(main, "_fetch_commenter_avatar") as fetch:
+                out = self._avatars(["UC_cached"])
+            fetch.assert_not_called()
+            self.assertEqual(out["avatars"], {"UC_cached": "/ggpht/abc"})
+        finally:
+            main._COMMENT_AVATAR_CACHE.pop("UC_cached", None)
+
+    def test_misses_are_fetched_stored_and_returned(self) -> None:
+        main._COMMENT_AVATAR_CACHE.pop("UC_new", None)
+        try:
+            with patch.object(main, "_fetch_commenter_avatar", return_value="/ggpht/new") as fetch:
+                out = self._avatars(["UC_new"])
+            fetch.assert_called_once()
+            self.assertEqual(out["avatars"], {"UC_new": "/ggpht/new"})
+            hit, url = main._comment_avatar_cached("UC_new")
+            self.assertTrue(hit)
+            self.assertEqual(url, "/ggpht/new")
+        finally:
+            main._COMMENT_AVATAR_CACHE.pop("UC_new", None)
+
+    def test_an_expired_miss_is_looked_up_again(self) -> None:
+        main._COMMENT_AVATAR_CACHE["UC_retry"] = (0.0, "")
+        try:
+            with patch.object(main, "_fetch_commenter_avatar", return_value="/ggpht/r") as fetch:
+                out = self._avatars(["UC_retry"])
+            fetch.assert_called_once()
+            self.assertEqual(out["avatars"], {"UC_retry": "/ggpht/r"})
+        finally:
+            main._COMMENT_AVATAR_CACHE.pop("UC_retry", None)
+
+    def test_disabled_comments_are_forbidden(self) -> None:
+        from fastapi import HTTPException
+
+        settings = SimpleNamespace(invidious_base_url="http://inv", enrichment_timeout_seconds=5)
+        with patch.object(main, "_login_required_redirect", return_value=None), \
+             patch.object(main, "_user_key", return_value="local"), \
+             patch.object(db, "get_feed_preferences", return_value={}), \
+             patch.object(main, "get_settings", return_value=settings):
+            with self.assertRaises(HTTPException) as caught:
+                main.api_comment_avatars(None, main.CommentAvatarsRequest(author_ids=["UC_x"]))
+        self.assertEqual(caught.exception.status_code, 403)

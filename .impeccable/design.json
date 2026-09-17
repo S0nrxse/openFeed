@@ -1,0 +1,243 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-05T00:00:00.000Z",
+  "title": "Design System: OpenFeed",
+  "extensions": {
+    "colorMeta": {
+      "blackout": {
+        "role": "neutral",
+        "displayName": "Blackout",
+        "canonical": "oklch(11% 0.002 285)",
+        "tonalRamp": ["oklch(11% 0.002 285)", "oklch(18% 0.003 285)", "oklch(26% 0.004 285)", "oklch(37% 0.006 285)", "oklch(50% 0.008 285)", "oklch(64% 0.008 285)", "oklch(80% 0.005 285)", "oklch(95% 0.002 285)"]
+      },
+      "cold-ash": {
+        "role": "neutral",
+        "displayName": "Cold Ash",
+        "canonical": "oklch(16.5% 0.003 285)",
+        "tonalRamp": ["oklch(11% 0.002 285)", "oklch(18% 0.003 285)", "oklch(26% 0.004 285)", "oklch(37% 0.006 285)", "oklch(50% 0.008 285)", "oklch(64% 0.008 285)", "oklch(80% 0.005 285)", "oklch(95% 0.002 285)"]
+      },
+      "overlay-ash": {
+        "role": "neutral",
+        "displayName": "Overlay Ash",
+        "canonical": "oklch(18.5% 0.003 285)",
+        "tonalRamp": ["oklch(11% 0.002 285)", "oklch(18% 0.003 285)", "oklch(26% 0.004 285)", "oklch(37% 0.006 285)", "oklch(50% 0.008 285)", "oklch(64% 0.008 285)", "oklch(80% 0.005 285)", "oklch(95% 0.002 285)"]
+      },
+      "graphite": {
+        "role": "neutral",
+        "displayName": "Graphite",
+        "canonical": "oklch(21.5% 0.004 285)",
+        "tonalRamp": ["oklch(11% 0.002 285)", "oklch(18% 0.003 285)", "oklch(26% 0.004 285)", "oklch(37% 0.006 285)", "oklch(50% 0.008 285)", "oklch(64% 0.008 285)", "oklch(80% 0.005 285)", "oklch(95% 0.002 285)"]
+      },
+      "dry-slate": {
+        "role": "neutral",
+        "displayName": "Dry Slate",
+        "canonical": "oklch(26.5% 0.005 285)",
+        "tonalRamp": ["oklch(11% 0.002 285)", "oklch(18% 0.003 285)", "oklch(26% 0.004 285)", "oklch(37% 0.006 285)", "oklch(50% 0.008 285)", "oklch(64% 0.008 285)", "oklch(80% 0.005 285)", "oklch(95% 0.002 285)"]
+      },
+      "bone": {
+        "role": "neutral",
+        "displayName": "Bone",
+        "canonical": "oklch(94% 0.002 285)",
+        "tonalRamp": ["oklch(11% 0.002 285)", "oklch(18% 0.003 285)", "oklch(26% 0.004 285)", "oklch(37% 0.006 285)", "oklch(50% 0.008 285)", "oklch(64% 0.008 285)", "oklch(80% 0.005 285)", "oklch(95% 0.002 285)"]
+      },
+      "smoke": {
+        "role": "neutral",
+        "displayName": "Smoke",
+        "canonical": "oklch(62% 0.012 285)",
+        "tonalRamp": ["oklch(15% 0.006 285)", "oklch(24% 0.008 285)", "oklch(33% 0.010 285)", "oklch(43% 0.012 285)", "oklch(53% 0.012 285)", "oklch(66% 0.012 285)", "oklch(81% 0.008 285)", "oklch(95% 0.004 285)"]
+      },
+      "deep-smoke": {
+        "role": "neutral",
+        "displayName": "Deep Smoke",
+        "canonical": "oklch(51% 0.012 285)",
+        "tonalRamp": ["oklch(15% 0.006 285)", "oklch(24% 0.008 285)", "oklch(33% 0.010 285)", "oklch(43% 0.012 285)", "oklch(53% 0.012 285)", "oklch(66% 0.012 285)", "oklch(81% 0.008 285)", "oklch(95% 0.004 285)"]
+      },
+      "ember": {
+        "role": "primary",
+        "displayName": "Ember",
+        "canonical": "oklch(62% 0.19 22)",
+        "tonalRamp": ["oklch(15% 0.06 22)", "oklch(25% 0.10 22)", "oklch(36% 0.14 22)", "oklch(47% 0.17 22)", "oklch(62% 0.19 22)", "oklch(72% 0.16 22)", "oklch(84% 0.10 22)", "oklch(95% 0.04 22)"]
+      },
+      "ember-text": {
+        "role": "primary",
+        "displayName": "Ember Text",
+        "canonical": "oklch(69% 0.165 20)",
+        "tonalRamp": ["oklch(15% 0.06 20)", "oklch(25% 0.10 20)", "oklch(36% 0.13 20)", "oklch(48% 0.16 20)", "oklch(60% 0.17 20)", "oklch(69% 0.165 20)", "oklch(83% 0.10 20)", "oklch(95% 0.04 20)"]
+      },
+      "cobalt-link": {
+        "role": "secondary",
+        "displayName": "Cobalt Link",
+        "canonical": "oklch(72% 0.13 258)",
+        "tonalRamp": ["oklch(16% 0.05 258)", "oklch(26% 0.08 258)", "oklch(37% 0.11 258)", "oklch(48% 0.13 258)", "oklch(60% 0.14 258)", "oklch(72% 0.13 258)", "oklch(84% 0.08 258)", "oklch(95% 0.03 258)"]
+      },
+      "live-green": {
+        "role": "tertiary",
+        "displayName": "Live Green",
+        "canonical": "oklch(68% 0.17 145)",
+        "tonalRamp": ["oklch(16% 0.05 145)", "oklch(26% 0.08 145)", "oklch(36% 0.11 145)", "oklch(47% 0.14 145)", "oklch(58% 0.16 145)", "oklch(68% 0.17 145)", "oklch(83% 0.11 145)", "oklch(95% 0.04 145)"]
+      },
+      "amber-hold": {
+        "role": "tertiary",
+        "displayName": "Amber Hold",
+        "canonical": "oklch(71% 0.14 79)",
+        "tonalRamp": ["oklch(16% 0.04 79)", "oklch(26% 0.07 79)", "oklch(37% 0.10 79)", "oklch(48% 0.12 79)", "oklch(60% 0.13 79)", "oklch(71% 0.14 79)", "oklch(84% 0.09 79)", "oklch(95% 0.04 79)"]
+      }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "Largest type in the product. Dialog and page titles only; appears twice in the entire stylesheet." },
+      "headline": { "displayName": "Headline", "purpose": "Channel names on channel pages." },
+      "title": { "displayName": "Title", "purpose": "Home-feed section headings such as 'Recommended for you'." },
+      "body": { "displayName": "Body", "purpose": "Navigation items, chips, search input, general interface copy." },
+      "label": { "displayName": "Label", "purpose": "Uppercase section eyebrows and field labels, always in Deep Smoke. The only uppercase in the system." }
+    },
+    "shadows": [
+      { "name": "overlay", "value": "0 12px 32px rgba(0,0,0,.55)", "purpose": "Dropdown menus and popovers. The --shadow token." },
+      { "name": "dialog", "value": "0 24px 64px rgba(0,0,0,.7)", "purpose": "Modal dialogs only; must separate from a whole page rather than a local panel." },
+      { "name": "thumbnail-lift", "value": "0 1px 3px rgba(0,0,0,.5)", "purpose": "Under overlaid thumbnail badges so duration text survives a light frame behind it." },
+      { "name": "status-glow-healthy", "value": "0 0 8px rgba(63,185,80,.45)", "purpose": "Halo under a healthy playback-source dot. Diagnostic only." },
+      { "name": "status-glow-cooling", "value": "0 0 8px rgba(210,153,34,.4)", "purpose": "Halo under a source in cooldown." },
+      { "name": "status-glow-failing", "value": "0 0 8px rgba(229,72,77,.4)", "purpose": "Halo under a failing source." },
+      { "name": "focus-ring", "value": "0 0 0 2px rgba(255,255,255,.3)", "purpose": "The only focus treatment in the system. Never colored." }
+    ],
+    "motion": [
+      { "name": "state", "value": "120ms ease", "purpose": "Default for background and color state changes. The most common transition in the stylesheet." },
+      { "name": "control", "value": "140ms ease", "purpose": "Pill and button state changes, including border materialization." },
+      { "name": "move", "value": "180ms ease", "purpose": "Transform and opacity changes on larger moving elements." },
+      { "name": "press", "value": "cubic-bezier(.2,.8,.3,1)", "purpose": "The scale(.96) active-press curve. The system's signature feedback." },
+      { "name": "press-overshoot", "value": "cubic-bezier(.2,.8,.3,1.2)", "purpose": "Slight-overshoot variant used on one reaction control." },
+      { "name": "panel", "value": "220ms ease", "purpose": "Shorts comment-panel column expansion." }
+    ],
+    "breakpoints": [
+      { "name": "primary", "value": "900px" },
+      { "name": "wide", "value": "1300px" },
+      { "name": "desktop-narrow", "value": "1100px" },
+      { "name": "laptop", "value": "1000px" },
+      { "name": "tablet", "value": "760px" },
+      { "name": "tablet-narrow", "value": "720px" },
+      { "name": "phone-wide", "value": "700px" },
+      { "name": "phone", "value": "560px" },
+      { "name": "phone-small", "value": "430px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Pill Action",
+      "kind": "button",
+      "refersTo": "pill-action",
+      "description": "The primary control of the system. Fully round, Graphite at rest, presses to 96%.",
+      "html": "<button class=\"ds-pill\">Subscribe</button>",
+      "css": ".ds-pill { min-height: 36px; padding: 0 15px; border: 1px solid transparent; border-radius: 999px; background: var(--surface-2, #1a1a1d); color: var(--text, #ededef); font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', Inter, 'Segoe UI', Roboto, system-ui, sans-serif; font-size: 13px; font-weight: 550; letter-spacing: -.005em; display: inline-flex; align-items: center; gap: 8px; cursor: pointer; white-space: nowrap; transition: background .14s ease, border-color .14s ease, color .14s ease, transform .14s cubic-bezier(.2,.8,.3,1); } .ds-pill:hover { background: var(--surface-3, #232327); border-color: rgba(255,255,255,.055); } .ds-pill:focus-visible { outline: none; box-shadow: 0 0 0 2px rgba(255,255,255,.3); } .ds-pill:active { transform: scale(.96); } .ds-pill:disabled { cursor: default; opacity: .55; }"
+    },
+    {
+      "name": "Pill Action — Danger",
+      "kind": "button",
+      "refersTo": "pill-action",
+      "description": "Destructive variant. Text shifts to Ember Text; the fill stays Graphite.",
+      "html": "<button class=\"ds-pill-danger\"><svg viewBox=\"0 0 24 24\" width=\"17\" height=\"17\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3 6h18\"/><path d=\"M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6\"/><path d=\"M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2\"/></svg>Remove from history</button>",
+      "css": ".ds-pill-danger { min-height: 36px; padding: 0 15px; border: 1px solid transparent; border-radius: 999px; background: var(--surface-2, #1a1a1d); color: #f2686c; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', Inter, 'Segoe UI', Roboto, system-ui, sans-serif; font-size: 13px; font-weight: 550; letter-spacing: -.005em; display: inline-flex; align-items: center; gap: 8px; cursor: pointer; white-space: nowrap; transition: background .14s ease, border-color .14s ease, transform .14s cubic-bezier(.2,.8,.3,1); } .ds-pill-danger:hover { background: var(--surface-3, #232327); border-color: rgba(255,255,255,.055); } .ds-pill-danger:focus-visible { outline: none; box-shadow: 0 0 0 2px rgba(255,255,255,.3); } .ds-pill-danger:active { transform: scale(.96); }"
+    },
+    {
+      "name": "Icon Button",
+      "kind": "button",
+      "refersTo": "pill-action",
+      "description": "34px round, transparent at rest, Smoke icon that brightens on hover.",
+      "html": "<button class=\"ds-icon-btn\" aria-label=\"More options\"><svg viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"12\" cy=\"5\" r=\"1\"/><circle cx=\"12\" cy=\"12\" r=\"1\"/><circle cx=\"12\" cy=\"19\" r=\"1\"/></svg></button>",
+      "css": ".ds-icon-btn { width: 34px; height: 34px; border: 0; border-radius: 999px; background: transparent; color: var(--muted, #8b8b93); display: grid; place-items: center; cursor: pointer; transition: background .12s ease, color .12s ease; } .ds-icon-btn:hover { background: var(--surface-2, #1a1a1d); color: var(--text, #ededef); } .ds-icon-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px rgba(255,255,255,.3); }"
+    },
+    {
+      "name": "Filter Chip",
+      "kind": "chip",
+      "refersTo": "chip",
+      "description": "Unselected filter. Graphite fill, steps to Dry Slate on hover.",
+      "html": "<button class=\"ds-chip\">Recently Uploaded</button>",
+      "css": ".ds-chip { display: inline-flex; align-items: center; min-height: 34px; padding: 0 14px; border: 0; border-radius: 999px; background: var(--surface-2, #1a1a1d); color: var(--text, #ededef); font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', Inter, 'Segoe UI', Roboto, system-ui, sans-serif; font-size: 13.5px; font-weight: 500; cursor: pointer; white-space: nowrap; transition: background .12s ease, color .12s ease; } .ds-chip:hover { background: var(--surface-3, #232327); } .ds-chip:focus-visible { outline: none; box-shadow: 0 0 0 2px rgba(255,255,255,.3); }"
+    },
+    {
+      "name": "Filter Chip — Selected",
+      "kind": "chip",
+      "refersTo": "chip-active",
+      "description": "Selection is marked by full inversion — Bone background, Blackout text — never by accent color.",
+      "html": "<button class=\"ds-chip-active\" aria-pressed=\"true\">All</button>",
+      "css": ".ds-chip-active { display: inline-flex; align-items: center; min-height: 34px; padding: 0 14px; border: 0; border-radius: 999px; background: var(--text, #ededef); color: var(--bg, #0a0a0b); font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', Inter, 'Segoe UI', Roboto, system-ui, sans-serif; font-size: 13.5px; font-weight: 500; cursor: pointer; white-space: nowrap; } .ds-chip-active:focus-visible { outline: none; box-shadow: 0 0 0 2px rgba(255,255,255,.3); }"
+    },
+    {
+      "name": "Search Field",
+      "kind": "input",
+      "refersTo": "search-field",
+      "description": "Fully round, Cold Ash inside a hairline, with a 52px submit cell divided off by a soft border.",
+      "html": "<form class=\"ds-search\"><input type=\"search\" placeholder=\"Search\" aria-label=\"Search\"><button type=\"submit\" aria-label=\"Search\"><svg viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"m21 21-4.34-4.34\"/><circle cx=\"11\" cy=\"11\" r=\"8\"/></svg></button></form>",
+      "css": ".ds-search { width: 100%; max-width: 560px; height: 36px; display: flex; align-items: center; border: 1px solid rgba(255,255,255,.09); border-radius: 999px; background: var(--surface, #121214); overflow: hidden; transition: border-color .12s ease, background .12s ease; } .ds-search:hover { background: var(--surface-2, #1a1a1d); } .ds-search:focus-within { border-color: rgba(255,255,255,.22); background: var(--surface-2, #1a1a1d); } .ds-search input { flex: 1; min-width: 0; height: 100%; border: 0; background: transparent; color: var(--text, #ededef); padding: 0 16px; outline: none; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', Inter, 'Segoe UI', Roboto, system-ui, sans-serif; font-size: 13.5px; } .ds-search input::placeholder { color: var(--muted-2, #6a6a72); } .ds-search button { width: 52px; height: 100%; border: 0; border-left: 1px solid rgba(255,255,255,.055); background: var(--surface-2, #1a1a1d); color: var(--muted, #8b8b93); display: grid; place-items: center; cursor: pointer; transition: background .12s ease, color .12s ease; } .ds-search button:hover { color: var(--text, #ededef); background: var(--surface-3, #232327); }"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "text-input",
+      "description": "8px radius on a Blackout fill — inputs recede below their container, the inverse of buttons.",
+      "html": "<label class=\"ds-field\"><span class=\"ds-field-label\">Instance URL</span><input class=\"ds-field-input\" type=\"text\" value=\"http://localhost:8061\"></label>",
+      "css": ".ds-field { display: grid; gap: 6px; max-width: 320px; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', Inter, 'Segoe UI', Roboto, system-ui, sans-serif; } .ds-field-label { font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted-2, #6a6a72); } .ds-field-input { width: 100%; min-height: 36px; border: 1px solid rgba(255,255,255,.09); border-radius: 8px; background: var(--bg, #0a0a0b); color: var(--text, #ededef); padding: 0 11px; outline: none; font: inherit; font-size: 13px; transition: border-color .12s ease; } .ds-field-input:hover { border-color: rgba(255,255,255,.16); } .ds-field-input:focus-visible { box-shadow: 0 0 0 2px rgba(255,255,255,.3); }"
+    },
+    {
+      "name": "Sidebar Nav Item",
+      "kind": "nav",
+      "refersTo": "nav-item-active",
+      "description": "Active state fills Dry Slate and turns the icon — and only the icon — Ember. An Ember dot marks unread activity.",
+      "html": "<nav class=\"ds-nav\"><a class=\"ds-nav-item ds-nav-item-active\" href=\"#\"><svg viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8\"/><path d=\"M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z\"/></svg><span>Home</span></a><a class=\"ds-nav-item\" href=\"#\"><svg viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/><path d=\"M7 10l5 5 5-5\"/><path d=\"M12 15V3\"/></svg><span>Downloads</span><i class=\"ds-nav-dot\"></i></a></nav>",
+      "css": ".ds-nav { display: grid; gap: 2px; width: 244px; padding: 10px; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', Inter, 'Segoe UI', Roboto, system-ui, sans-serif; } .ds-nav-item { position: relative; min-height: 38px; border-radius: 10px; display: flex; align-items: center; gap: 16px; padding: 0 12px; color: var(--text, #ededef); font-size: 13.5px; text-decoration: none; transition: background .12s ease, color .12s ease; } .ds-nav-item svg { color: var(--muted, #8b8b93); flex: 0 0 auto; } .ds-nav-item:hover { background: var(--surface-2, #1a1a1d); } .ds-nav-item-active { background: var(--surface-3, #232327); font-weight: 500; } .ds-nav-item-active svg { color: var(--accent, #e5484d); } .ds-nav-dot { width: 5px; height: 5px; margin-left: auto; border-radius: 999px; background: var(--accent, #e5484d); flex: 0 0 auto; }"
+    },
+    {
+      "name": "Video Card",
+      "kind": "card",
+      "refersTo": null,
+      "description": "The signature component. No fill, no border, no padding — the 12px thumbnail over pure black is the entire container.",
+      "html": "<article class=\"ds-card\"><div class=\"ds-thumb\"><span class=\"ds-thumb-fallback\">OpenFeed</span><span class=\"ds-duration\">27:32</span></div><div class=\"ds-card-row\"><span class=\"ds-avatar\">T-</span><div class=\"ds-card-copy\"><h3>Fable Broke My App and Couldn't Fix It</h3><p>Theo - t3.gg</p><p>91K views · 2 days ago</p></div></div></article>",
+      "css": ".ds-card { min-width: 0; max-width: 320px; color: var(--text, #ededef); font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', Inter, 'Segoe UI', Roboto, system-ui, sans-serif; } .ds-thumb { position: relative; display: grid; place-items: center; aspect-ratio: 16 / 9; overflow: hidden; border-radius: 12px; background: #000; border: 1px solid rgba(255,255,255,.055); } .ds-thumb-fallback { display: grid; place-items: center; width: 42px; height: 26px; border-radius: 6px; background: var(--surface-3, #232327); color: var(--muted, #8b8b93); font-weight: 600; font-size: 10px; } .ds-duration { position: absolute; right: 6px; bottom: 6px; padding: 1px 5px; border-radius: 4px; background: rgba(0,0,0,.8); color: #fff; font-size: 11.5px; font-weight: 550; box-shadow: 0 1px 3px rgba(0,0,0,.5); } .ds-card-row { display: grid; grid-template-columns: 36px minmax(0,1fr); gap: 12px; margin-top: 12px; } .ds-avatar { width: 36px; height: 36px; border-radius: 999px; background: var(--surface-3, #232327); color: var(--muted, #8b8b93); display: grid; place-items: center; font-size: 12px; font-weight: 600; } .ds-card-copy { min-width: 0; } .ds-card-copy h3 { margin: 0; font-size: 14.5px; line-height: 1.4; font-weight: 550; letter-spacing: -.008em; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; } .ds-card-copy p { margin: 4px 0 0; color: var(--muted, #8b8b93); font-size: 12.5px; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }"
+    },
+    {
+      "name": "Menu Panel",
+      "kind": "custom",
+      "refersTo": "menu-panel",
+      "description": "The only surface that casts a shadow, on Overlay Ash so it separates from the panel behind it.",
+      "html": "<div class=\"ds-menu\"><button class=\"ds-menu-row\"><svg viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/><path d=\"M7 10l5 5 5-5\"/><path d=\"M12 15V3\"/></svg><span>Download</span></button><button class=\"ds-menu-row\"><svg viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M5 12h14\"/><path d=\"M12 5v14\"/></svg><span>Add to collection</span></button><button class=\"ds-menu-row ds-menu-row-danger\"><svg viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3 6h18\"/><path d=\"M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6\"/></svg><span>Remove from history</span></button></div>",
+      "css": ".ds-menu { width: 268px; padding: 5px; border: 1px solid rgba(255,255,255,.09); border-radius: 14px; background: var(--menu, #151517); box-shadow: 0 12px 32px rgba(0,0,0,.55); display: grid; gap: 1px; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', Inter, 'Segoe UI', Roboto, system-ui, sans-serif; } .ds-menu-row { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 36px; padding: 0 10px; border: 0; border-radius: 10px; background: transparent; color: var(--text, #ededef); font-size: 13px; font-weight: 500; text-align: left; cursor: pointer; transition: background .12s ease, color .12s ease; } .ds-menu-row svg { color: var(--muted, #8b8b93); flex: 0 0 auto; } .ds-menu-row:hover { background: var(--surface-2, #1a1a1d); } .ds-menu-row:focus-visible { outline: none; box-shadow: 0 0 0 2px rgba(255,255,255,.3); } .ds-menu-row-danger, .ds-menu-row-danger svg { color: #f2686c; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Quiet Control Room",
+    "overview": "OpenFeed looks like an instrument panel running in a dark room. The interface sits at near-black and stays there; nothing glows, nothing gradients, nothing competes with the thumbnails. Every surface is one of four steps on a single cold-grey ramp, separated by hairlines thin enough to read as seams rather than boxes. The result is a shell that disappears the moment content loads into it — which is the point, because the content is video artwork and the chrome's job is to hold it without arguing.\n\nDensity is deliberate and high. Type runs small (11–17px across almost the entire interface) and lands on half-pixel steps — 11.5, 12.5, 13.5, 14.5 — because the system would rather fit one more row of real information than pad a card. Weights do the same thing at finer grain than usual, using 550, 650, and 680 where most systems would jump 500 → 600 → 700. This is a tool for someone who uses it every day and already knows where everything is, so legibility beats spaciousness and scanability beats emphasis.\n\nColor is treated as instrumentation, not decoration. The palette is functionally monochrome, and the red is a light on a panel: it marks the brand, unread activity, danger, and failure, and it stays off the rest of the time. A blue appears only where a human wrote a link. A green and an amber appear only where a backend is reporting its own health. Nothing in the system is colored because color would look nice there.",
+    "keyCharacteristics": [
+      "Four-step tonal ramp from #0a0a0b to #232327; depth from value, not shadow",
+      "Hairline borders at 5.5–9% white; no heavy strokes anywhere",
+      "Pill-first geometry — 52 of 144 radius declarations are fully round",
+      "Small, dense type on half-pixel steps with intermediate weights (550/650/680)",
+      "Accent red used 33 times across 1,371 lines of CSS, almost all of it status",
+      "Press feedback is physical: controls scale to 96% on :active"
+    ],
+    "rules": [
+      { "name": "The Panel Light Rule", "body": "Ember means something happened here or this will destroy something. It is never a decorative fill, never a default button background, and never an active-state background. One exception is permitted: a single filled Ember primary action per screen, and only where the user is making a real commitment (deleting data, wiping history, confirming an irreversible import). If two red fills appear on one screen, one of them is wrong.", "section": "colors" },
+      { "name": "The Read-It-Don't-See-It Rule", "body": "When red must be read as text, use Ember Text (#f2686c), not Ember. Ember is for shapes you notice; Ember Text is for words you read.", "section": "colors" },
+      { "name": "The Borrowed Blue Rule", "body": "Cobalt Link belongs to creator-authored content. Product chrome never uses it — a blue button would read as someone else's link.", "section": "colors" },
+      { "name": "The Half-Step Rule", "body": "The scale moves in half-pixels (11.5, 12.5, 13.5, 14.5) on purpose. When a new size is needed, take the nearest existing step rather than introducing a round number — a 14px title next to a 14.5px one reads as a mistake, not a variation.", "section": "typography" },
+      { "name": "The Uppercase Tax Rule", "body": "Uppercase appears only at 11px/600 with +0.07em tracking, and only for eyebrows and field labels. Uppercase at any other size is not part of this system.", "section": "typography" },
+      { "name": "The Ramp-Not-Riser Rule", "body": "To make something feel raised, move it up the tonal ramp (Graphite → Dry Slate) and let its hairline do the separating. Reach for box-shadow only when the element genuinely overlaps unrelated content — a menu, a dialog. A shadow on an in-flow card is out of system.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do move up the tonal ramp for emphasis — Graphite at rest, Dry Slate on hover — and let the 1px hairline do the containing.",
+      "Do reach for 999px first. If a new control is not a container, it is probably a pill.",
+      "Do carry the scale(.96) press onto any new pressable control, paired with a prefers-reduced-motion guard that disables both the transition and the transform. The stylesheet already has nine such guards; match the pattern.",
+      "Do use Ember Text (#f2686c) whenever red needs to be read as words.",
+      "Do keep new type on the existing half-pixel steps (11, 11.5, 12, 12.5, 13, 13.5, 14.5, 17, 19) and the existing weights (500, 550, 600, 650).",
+      "Do invert — Bone background, Blackout text — to mark a selected filter.",
+      "Do put status color only where a backend is actually reporting status."
+    ],
+    "donts": [
+      "Don't use Ember as a background fill for an ordinary control, an active tab, or a selected chip. The system marks those with tonal shift and inversion. The single permitted exception is one filled Ember confirm action per screen, on a genuinely destructive commitment.",
+      "Don't add box-shadow to anything that sits in normal flow. Shadows are for menus and dialogs.",
+      "Don't introduce a second font family. The system is one platform-native stack tuned by weight and tracking.",
+      "Don't use Cobalt Link (#6ea8ff) in product chrome — it means 'a creator wrote this.'",
+      "Don't put borders wider than 1px, or borders in any color other than white at low alpha, in a resting state.",
+      "Don't give video cards a fill, a border, or padding. The thumbnail is the container.",
+      "Don't assume an 8pt grid. Spacing here is 2px-granular, and 6px/10px/14px are first-class values.",
+      "Don't add a colored focus ring. Focus is always 0 0 0 2px rgba(255,255,255,.3)."
+    ]
+  }
+}

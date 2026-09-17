@@ -196,25 +196,40 @@ def rebuild_vectors(limit: int = 500, force: bool = False) -> dict[str, Any]:
     return {"ok": True, "candidates": len(rows), "updated": stored, "vocabulary": len(idf)}
 
 
-def profile_vector(user_key: str = "local", limit: int = 120) -> dict[str, float]:
+def _parse_vector(value: Any) -> dict[str, float] | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    if not isinstance(value, dict) or not value:
+        return None
+    cleaned = {str(term): float(weight) for term, weight in value.items() if str(term).strip()}
+    return cleaned or None
+
+
+def profile_vector(user_key: str = "local", limit: int = 200) -> dict[str, float]:
     """What this user's viewing looks like, as one vector.
 
-    A watch-time-weighted centroid of what they actually watched: a video watched to the
-    end pulls the profile toward its subject far harder than one abandoned after a few
-    seconds, which is the distinction the old tag overlap could not make at all.
+    A watch-time-weighted centroid of what they actually watched, plus explicit
+    endorsements: a video watched to the end pulls the profile toward its subject
+    far harder than one abandoned after a few seconds, and a like / more-like-this
+    pulls harder still — it is a stated preference, not just attention held.
     """
-    rows = db.watched_topic_vectors(user_key, limit)
-    if not rows:
+    try:
+        rows = db.watched_topic_vectors(user_key, limit)
+    except Exception:
+        rows = []
+    try:
+        liked_rows = db.liked_topic_vectors(user_key, 100)
+    except Exception:
+        liked_rows = []
+    if not rows and not liked_rows:
         return {}
     total: dict[str, float] = {}
     for row in rows:
-        vector = row.get("topic_vector")
-        if isinstance(vector, str):
-            try:
-                vector = json.loads(vector)
-            except ValueError:
-                vector = None
-        if not isinstance(vector, dict) or not vector:
+        vector = _parse_vector(row.get("topic_vector"))
+        if not vector:
             continue
         seconds = float(row.get("total_watch_seconds") or 0)
         completed = bool(row.get("completed"))
@@ -228,13 +243,68 @@ def profile_vector(user_key: str = "local", limit: int = 120) -> dict[str, float
             continue
         for term, value in vector.items():
             total[term] = total.get(term, 0.0) + float(value) * weight
+    for row in liked_rows:
+        vector = _parse_vector(row.get("topic_vector"))
+        if not vector:
+            continue
+        # Explicit endorsement outweighs passive watching: roughly an hour of watch
+        # time, decaying with age like everything else. More-like-this counts extra.
+        weight = 2.2 + (0.8 * float(row.get("more_like_count") or 0))
+        weight *= db.recency_weight(row.get("endorsed_at") or row.get("updated_at"))
+        if weight <= 0:
+            continue
+        for term, value in vector.items():
+            total[term] = total.get(term, 0.0) + float(value) * weight
     if not total:
         return {}
-    top = dict(sorted(total.items(), key=lambda item: item[1], reverse=True)[:VECTOR_TERMS * 3])
+    top = dict(sorted(total.items(), key=lambda item: item[1], reverse=True)[:VECTOR_TERMS * 4])
     norm = math.sqrt(sum(value * value for value in top.values()))
     if not norm:
         return {}
     return {term: value / norm for term, value in top.items()}
+
+
+def interest_exemplars(user_key: str = "local", limit: int = 30) -> list[dict[str, float]]:
+    """Recent concrete interests, kept separate instead of averaged.
+
+    The centroid above answers "what does this user like on average" — which for a
+    user into tech, cooking and music is a point in the middle matching none of
+    them. These exemplars answer "what are some specific things they loved": the
+    newest liked videos first, then the heaviest recent watches. Scoring takes the
+    max over them, so each interest survives on its own.
+    """
+    exemplars: list[dict[str, float]] = []
+    try:
+        liked_rows = db.liked_topic_vectors(user_key, min(limit, 20))
+    except Exception:
+        liked_rows = []
+    for row in liked_rows:
+        vector = _parse_vector(row.get("topic_vector"))
+        if vector and vector not in exemplars:
+            exemplars.append(vector)
+        if len(exemplars) >= limit:
+            return exemplars
+    try:
+        watched_rows = db.watched_topic_vectors(user_key, 60)
+    except Exception:
+        watched_rows = []
+    scored: list[tuple[float, dict[str, float]]] = []
+    for row in watched_rows:
+        vector = _parse_vector(row.get("topic_vector"))
+        if not vector or vector in exemplars:
+            continue
+        seconds = float(row.get("total_watch_seconds") or 0)
+        weight = (math.log1p(max(seconds, 0.0) / 60.0) + (0.75 if row.get("completed") else 0.0)) * db.recency_weight(
+            row.get("last_watched_at")
+        )
+        if weight > 0:
+            scored.append((weight, vector))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    for _, vector in scored:
+        exemplars.append(vector)
+        if len(exemplars) >= limit:
+            break
+    return exemplars
 
 
 def explain(video_vector: dict[str, float], profile: dict[str, float], top: int = 4) -> list[str]:
@@ -252,6 +322,7 @@ __all__ = [
     "cosine",
     "document_terms",
     "explain",
+    "interest_exemplars",
     "inverse_document_frequencies",
     "profile_vector",
     "rebuild_vectors",

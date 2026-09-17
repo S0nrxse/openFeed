@@ -232,6 +232,8 @@ def fetch_segments(video_id: str, categories: Iterable[str], *, force: bool = Fa
                 for cached_key, (expires, _) in list(_cache.items()):
                     if expires <= now:
                         _cache.pop(cached_key, None)
+                while len(_cache) > 512:
+                    _cache.pop(next(iter(_cache)), None)
     return segments
 
 

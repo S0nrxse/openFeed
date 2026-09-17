@@ -172,7 +172,9 @@ def search_youtube(query: str, page: int = 1, sort: str = "relevance") -> list[d
             continue
         video = _normalize_related(item)
         if video:
-            video["published_at"] = None
+            # Keep the date the backend reported (already filtered for fabricated
+            # "just now" values). Dropping it made every search result undated,
+            # which sank it in ranking and hid recency from the UI.
             results.append(video)
     return results
 
@@ -357,7 +359,7 @@ def grow_library(user_key: str = "local", include_trending: bool = True) -> dict
     return report
 
 
-def backfill_subscription_uploads(limit: int = 200, per_channel_pages: int = 1) -> dict[str, Any]:
+def backfill_subscription_uploads(limit: int = 200, per_channel_pages: int = 2) -> dict[str, Any]:
     """Fetch recent uploads for every subscribed channel.
 
     The subscription feed is ordered by publish date, which only works if the videos are

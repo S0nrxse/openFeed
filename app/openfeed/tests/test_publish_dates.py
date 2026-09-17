@@ -118,7 +118,9 @@ class ContinuousRepairTests(unittest.TestCase):
 
         from openfeed import worker
 
-        self.assertIn("verify_publish_dates", inspect.getsource(worker.main))
+        # The cycle body moved to run_once() so the sync/enrich block could be
+        # guarded; main() is just the restart loop around it now.
+        self.assertIn("verify_publish_dates", inspect.getsource(worker.run_once))
 
     def test_refreshing_the_feed_also_re_reads_dates(self) -> None:
         import inspect
