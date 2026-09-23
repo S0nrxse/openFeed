@@ -78,9 +78,31 @@ def base_args() -> list[str]:
         args += ["--cookies", settings.ytdlp_cookies_file]
     if settings.ytdlp_extra_args:
         try:
-            args += shlex.split(settings.ytdlp_extra_args)
+            extra = shlex.split(settings.ytdlp_extra_args)
         except ValueError:
             logger.warning("OPENFEED_YTDLP_EXTRA_ARGS is not parseable as shell words; ignoring it")
+            extra = []
+        # --exec* runs an arbitrary shell command per video, --load-info* reads
+        # local JSON files into the process, and --config-locations loads option
+        # files from disk: none of these belong in an env-passed flag string.
+        blocked_prefixes = ("--exec", "--load-info", "--config-location")
+        filtered: list[str] = []
+        index = 0
+        while index < len(extra):
+            token = extra[index]
+            name = token.split("=", 1)[0]
+            if any(name == prefix or name.startswith(prefix) for prefix in blocked_prefixes):
+                logger.warning("ignoring blocked yt-dlp extra arg: %s", name)
+                index += 1
+                # Bare `--flag value` form: drop the flag's value token(s) too, since
+                # an --exec command is typically multiple words (`--exec echo hi`).
+                if "=" not in token:
+                    while index < len(extra) and not extra[index].startswith("-"):
+                        index += 1
+                continue
+            filtered.append(token)
+            index += 1
+        args += filtered
     return args
 
 
@@ -113,6 +135,8 @@ def _cache_put(video_id: str, payload: dict[str, Any]) -> None:
             for key, (expires_at, _) in list(_cache.items()):
                 if expires_at <= now:
                     _cache.pop(key, None)
+            while len(_cache) > 128:
+                _cache.pop(next(iter(_cache)), None)
 
 
 def clear_cache() -> None:

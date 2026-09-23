@@ -25,7 +25,7 @@ with, endorsed by, or derived from the video's author.
 
 - Search, channels, playlists, collections, likes, and watch history
 - Channel pages with tabs, filters, links and community posts
-- FreshRSS synchronisation for subscriptions
+- Direct YouTube RSS polling for subscriptions
 - Optional Authentik OIDC login with group-based access
 - Responsive desktop and mobile interface
 
@@ -104,7 +104,6 @@ few minutes. Later starts take seconds.
 | Service | URL | What it is |
 | --- | --- | --- |
 | **OpenFeed** | http://localhost:8060 | The app |
-| FreshRSS | http://localhost:8050 | Subscription sync |
 | Invidious | http://localhost:8061 | Playback and metadata backend |
 
 All ports bind to `127.0.0.1` unless you change them in `.env`, so nothing is reachable
@@ -312,7 +311,7 @@ you point it at your own fork.
 ## Acknowledgements
 
 OpenFeed stands on [Invidious](https://invidious.io/),
-[yt-dlp](https://github.com/yt-dlp/yt-dlp), [FreshRSS](https://freshrss.org/),
+[yt-dlp](https://github.com/yt-dlp/yt-dlp),
 [SponsorBlock](https://sponsor.ajay.app/) and
 [Return YouTube Dislike](https://returnyoutubedislike.com/). It is not affiliated with
 YouTube or Google.

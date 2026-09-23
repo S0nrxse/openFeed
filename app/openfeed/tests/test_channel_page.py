@@ -227,7 +227,7 @@ class BrandMarkTests(unittest.TestCase):
 
     def test_it_is_a_shape_not_type_set_at_nine_pixels(self) -> None:
         mark = main._brand_mark()
-        self.assertIn("<svg", mark)
+        self.assertIn("/assets/openfeed-logo.png", mark)
         self.assertNotIn(">Open<", mark)
 
     def test_the_wordmark_carries_the_name(self) -> None:
@@ -235,9 +235,11 @@ class BrandMarkTests(unittest.TestCase):
         self.assertIn(".brand-word b { font-weight: 680;", header)
 
     def test_nothing_in_the_glyph_is_smaller_than_a_stroke(self) -> None:
-        # Sub-pixel detail is what made the old mark mush; the arcs are 1.9 units on a
-        # 24 unit grid, which is just under 2px at render size.
-        self.assertIn('stroke-width="1.9"', main._brand_mark())
+        # The drawn SVG mark is gone; the served logo file carries its own
+        # artwork, so there is no sub-pixel stroke detail left to go mushy.
+        mark = main._brand_mark()
+        self.assertIn("<img", mark)
+        self.assertNotIn("<svg", mark)
 
     def test_the_tile_still_reads_as_a_button_sized_target(self) -> None:
         css = main._home_styles()

@@ -5,6 +5,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 CHANNEL_ID_RE = re.compile(r"(UC[A-Za-z0-9_-]{20,})")
+# A bare channel id handed to subscribe: "UC" + 22 base64url chars, nothing else.
+CHANNEL_ID_STRICT_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 
 
 def youtube_video_id_from_url(url: str | None) -> str | None:

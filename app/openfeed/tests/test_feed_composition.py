@@ -15,6 +15,70 @@ def _video(video_id: str, channel: str, source: str = "subscription", **extra: o
     return row
 
 
+class SpreadChannelsTests(unittest.TestCase):
+    """One channel must not clog neighboring slots in a ranked shelf."""
+
+    def _positions(self, ordered: list[dict[str, object]], channel: str) -> list[int]:
+        return [index for index, row in enumerate(ordered) if row["youtube_channel_id"] == channel]
+
+    def test_repeats_are_pushed_apart(self) -> None:
+        ranked = [
+            _video("f0", "fireship"), _video("a0", "ai-rev"), _video("o0", "openai"),
+            _video("a1", "ai-exp"), _video("f1", "fireship"), _video("t0", "tldr"),
+            _video("m0", "mkbhd"), _video("v0", "veritas"), _video("f2", "fireship"),
+            _video("c0", "coldcut"), _video("l0", "linus"), _video("s0", "stuff"),
+        ]
+        ordered = main._spread_channels(ranked)
+        self.assertEqual(len(ordered), len(ranked), "spreading reorders, it never drops")
+        positions = self._positions(ordered, "fireship")
+        self.assertEqual(len(positions), 3)
+        for first, second in zip(positions, positions[1:]):
+            self.assertGreaterEqual(second - first, 5)
+
+    def test_top_pick_survives_and_order_stays_merit_led(self) -> None:
+        ranked = [_video("f0", "fireship"), _video("a0", "ai-rev"), _video("f1", "fireship")]
+        ordered = main._spread_channels(ranked)
+        self.assertEqual(ordered[0]["youtube_video_id"], "f0")
+
+    def test_single_channel_pool_still_fills(self) -> None:
+        ranked = [_video(f"f{index}", "fireship") for index in range(6)]
+        ordered = main._spread_channels(ranked)
+        self.assertEqual([row["youtube_video_id"] for row in ordered], [f"f{index}" for index in range(6)])
+
+    def test_videos_without_a_channel_are_unconstrained(self) -> None:
+        ranked = [_video("u0", ""), _video("u1", ""), _video("f0", "fireship")]
+        ordered = main._spread_channels(ranked)
+        self.assertEqual([row["youtube_video_id"] for row in ordered], ["u0", "u1", "f0"])
+
+    def test_even_split_relaxes_into_alternation(self) -> None:
+        ranked = [_video(f"a{index}", "chan-a") for index in range(3)]
+        ranked += [_video(f"b{index}", "chan-b") for index in range(3)]
+        ordered = main._spread_channels(ranked)
+        channels = [row["youtube_channel_id"] for row in ordered]
+        self.assertEqual(len(ordered), 6, "a dominated pool still fills, nothing is dropped")
+        for first, second in zip(channels, channels[1:]):
+            self.assertNotEqual(first, second, "a 50/50 pool should alternate, never sit adjacent")
+
+    def test_dedupe_spreads_recommended_shelves_by_default(self) -> None:
+        videos = [
+            _video("f0", "fireship"), _video("a0", "ai-rev"), _video("o0", "openai"),
+            _video("a1", "ai-exp"), _video("f1", "fireship"), _video("t0", "tldr"),
+            _video("m0", "mkbhd"), _video("v0", "veritas"), _video("f2", "fireship"),
+            _video("c0", "coldcut"), _video("l0", "linus"), _video("s0", "stuff"),
+        ]
+        ordered = main._dedupe_section_videos(videos, set(), 12)
+        positions = self._positions(ordered, "fireship")
+        for first, second in zip(positions, positions[1:]):
+            self.assertGreaterEqual(second - first, 5)
+
+    def test_dedupe_leaves_chronological_shelves_alone_on_request(self) -> None:
+        videos = [_video("f0", "fireship"), _video("f1", "fireship"), _video("a0", "ai-rev")]
+        ordered = main._dedupe_section_videos(videos, set(), 3, spread_channels=False)
+        self.assertEqual(
+            [row["youtube_video_id"] for row in ordered], ["f0", "f1", "a0"]
+        )
+
+
 class BlendSubscriptionsTests(unittest.TestCase):
     def test_recommendations_lead_and_subscriptions_are_woven_in(self) -> None:
         primary = [_video(f"r{index}", f"chan-r{index}", "discovery") for index in range(9)]

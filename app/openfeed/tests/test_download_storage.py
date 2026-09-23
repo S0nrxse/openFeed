@@ -47,7 +47,7 @@ class RetainedDownloadStorageTests(unittest.TestCase):
             self.assertEqual(Path(job.path).read_bytes(), job.id.encode())
             self.assertEqual(call.args[2:4], (filename, job.path))
             self.assertEqual(call.kwargs["user_key"], job.user_key)
-            self.assertEqual(downloads.resolve_completed_path(job), Path(job.path))
+            self.assertEqual(downloads.resolve_completed_path(job), Path(job.path).resolve())
         self.assertEqual(legacy.read_bytes(), b"legacy-shared-copy")
 
     def test_uncertain_registration_failure_does_not_discard_a_referenced_job_file(self) -> None:
