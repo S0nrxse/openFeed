@@ -357,7 +357,11 @@ async def enforce_api_access(request: Request, call_next):
     if path in {"/api/status/full", "/api/sync/runs"} and not _user_is_admin(user):
         return JSONResponse({"detail": "admin_required"}, status_code=status.HTTP_403_FORBIDDEN)
 
-    return await call_next(request)
+    response = await call_next(request)
+    if path.startswith("/api/tokens"):
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Pragma"] = "no-cache"
+    return response
 
 
 def _user_key(request: Request | None) -> str:
@@ -925,6 +929,7 @@ def proxy_invidious(request: Request, upstream_path: str):
 # The only static files the app serves. An explicit map rather than a directory mount:
 # the name from the URL never reaches the filesystem, so there is no path to traverse.
 _STATIC_ASSETS: dict[str, str] = {
+    "api-tokens-v1.js": "text/javascript",
     "favicon-32.png": "image/png",
     "apple-touch-icon.png": "image/png",
 }
@@ -2174,6 +2179,31 @@ def _sponsorblock_settings_html(user_key: str = "local") -> str:
     '''
 
 
+def _api_tokens_pane(user: dict[str, Any]) -> str:
+    if not user.get("authenticated") or user.get("via_token"):
+        return '<p role="status">Sign in with Authentik to manage API tokens.</p><a class="primary-action" href="/auth/login?next=/%3Fsettings%3Dapi-tokens">Sign in</a>'
+    return '''
+      <form class="api-token-form" data-api-token-form>
+        <label class="text-field">Name<input name="name" value="noah-tools-api" required maxlength="120" autocomplete="off"></label>
+        <div class="text-field"><label for="api-token-access">Access</label><select class="field-input" id="api-token-access" name="access"><option value="read" selected>Read only</option><option value="write">Read and write</option></select></div>
+        <div class="settings-pane-actions"><button class="primary-action" type="submit">Create token</button></div>
+      </form>
+      <div class="api-token-result" data-api-token-result hidden>
+        <label class="text-field">New token<input data-api-token-value readonly autocomplete="off" spellcheck="false" aria-label="New API token"></label>
+        <p class="dialog-note">Copy this token now. It will not be shown again.</p>
+        <div class="settings-pane-actions"><button class="primary-action" type="button" data-api-token-copy>Copy token</button><button class="text-action" type="button" data-api-token-dismiss>Hide token</button></div>
+      </div>
+      <div class="settings-pane-actions"><button class="text-action" type="button" data-api-token-refresh>Refresh tokens</button></div>
+      <p class="status-line" role="status" aria-live="polite" data-api-token-status></p>
+      <div class="api-token-list" data-api-token-list aria-label="Your API tokens"></div>
+    '''
+
+
+@app.get("/settings", include_in_schema=False)
+def settings_shortcut() -> RedirectResponse:
+    return RedirectResponse(url="/?settings=api-tokens", status_code=303)
+
+
 def _settings_dialog(user: dict[str, Any] | None = None, user_key: str = "local") -> str:
     settings = get_settings()
     user = user or _current_user(None)
@@ -2229,6 +2259,7 @@ def _settings_dialog(user: dict[str, Any] | None = None, user_key: str = "local"
         ("content", "Content", "home"),
         ("import", "Import", "spark"),
         ("account", "Account", "user"),
+        ("api-tokens", "API tokens", "settings"),
         ("services", "Services", "status"),
         ("status", "Status", "spark"),
     ]
@@ -2322,6 +2353,11 @@ def _settings_dialog(user: dict[str, Any] | None = None, user_key: str = "local"
               <dl class="settings-list"><dt>Mode</dt><dd>{escape(settings.auth_mode)}</dd><dt>OIDC</dt><dd>{configured}</dd><dt>Login policy</dt><dd>{require_login}</dd><dt>Required group</dt><dd><code>{required_group}</code></dd><dt>Access</dt><dd>{authorized}</dd><dt>Subject</dt><dd><code>{sub}</code></dd></dl>
             </section>
 
+            <section class="settings-pane" data-settings-pane-body="api-tokens" role="tabpanel">
+              <header class="settings-pane-head"><h3>API tokens</h3></header>
+              {_api_tokens_pane(user)}
+            </section>
+
             <section class="settings-pane" data-settings-pane-body="services" role="tabpanel">
               <header class="settings-pane-head">
                 <h3>Services</h3>
@@ -2333,6 +2369,7 @@ def _settings_dialog(user: dict[str, Any] | None = None, user_key: str = "local"
           </div>
         </div>
       </dialog>
+      <script src="/assets/api-tokens-v1.js" defer></script>
     '''
 
 
@@ -3147,6 +3184,14 @@ def _home_styles() -> str:
       .settings-identity small { display: block; color: var(--muted); font-size: 12px; margin-bottom: 10px; }
       .profile-dot.lg { width: 40px; height: 40px; font-size: 13px; }
       .field-label { margin: 0; font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted-2); }
+      .api-token-form, .api-token-result, .api-token-list { display: grid; gap: 12px; min-width: 0; }
+      .api-token-result { padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-2); }
+      .api-token-result[hidden] { display: none; }
+      .api-token-result input { font-family: ui-monospace, monospace; }
+      .api-token-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border-soft); }
+      .api-token-row strong, .api-token-row small { display: block; overflow-wrap: anywhere; }
+      .api-token-row small { color: var(--muted); font-size: 12px; margin-top: 5px; }
+      [data-api-token-status]:empty { display: none; }
 
       /* draggable playback source list */
       .source-list { display: grid; gap: 8px; }

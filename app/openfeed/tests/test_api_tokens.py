@@ -298,6 +298,21 @@ class TokenGuardTests(unittest.TestCase):
         listing.assert_called_once_with("browser-actor", False)
         revoke.assert_called_once_with(self.record["id"], "browser-actor")
 
+    def test_token_responses_are_not_cacheable(self) -> None:
+        self.browser(["noah_perm_myyt_access"])
+        with patch.object(db, "list_api_tokens", return_value=[self.record]), \
+             patch.object(db, "create_api_token", return_value=self.record), \
+             patch.object(db, "revoke_api_token", return_value=self.record):
+            for method, path, body in (
+                ("GET", "/api/tokens", None),
+                ("POST", "/api/tokens", {"name": "NOAH", "read_only": True}),
+                ("DELETE", f"/api/tokens/{self.record['id']}", None),
+            ):
+                response = self.client.request(method, path, json=body)
+                self.assertIn(response.status_code, (200, 201))
+                self.assertEqual(response.headers["cache-control"], "private, no-store")
+                self.assertEqual(response.headers["pragma"], "no-cache")
+
     def test_invalid_and_revoked_tokens_never_use_public_or_cookie_fallback(self) -> None:
         self.browser(["operators"])
         health = self.enterContext(patch.object(db, "db_status", return_value={"ok": True}))

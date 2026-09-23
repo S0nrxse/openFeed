@@ -194,8 +194,13 @@ Persistent files are stored under `OPENFEED_DATA_DIR`, which defaults to `./data
 
 ### API Authentication
 
-Sign in with an account authorized to use OpenFeed, then create an API token in
-Settings or through `POST /api/tokens` using that browser session. Send the one-time
+Sign in with an account authorized to use OpenFeed, then open **Settings → API tokens**
+(direct link: `/?settings=api-tokens`; `/settings` redirects there). Enter a name,
+choose **Read only** or **Read and write**, and click **Create token**. Use **Copy token**
+before closing Settings: the full value is shown once and is cleared when the
+dialog closes. The same pane lists token prefixes/access/last-use and supports
+revocation. Creation is also available through `POST /api/tokens` using that
+browser session. Send the one-time
 plaintext credential as `Authorization: Bearer ofd_...`. Only its hash is stored.
 For actor-owned integrations, issue a separate credential from each actor's browser
 session and store it in that actor's credential store. The API uses the issuer's
