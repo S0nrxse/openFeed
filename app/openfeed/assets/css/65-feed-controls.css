@@ -1,0 +1,79 @@
+/* ---------- feed controls ----------
+   Deliberately plain. The panel this replaced animated a gradient from cyan to
+   magenta as the slider moved, which had nothing to do with the rest of the
+   interface and made a settings panel look like a screensaver. */
+.fc-dialog[open] { width: min(640px, calc(100vw - 40px)); max-height: min(88dvh, 860px); display: flex; flex-direction: column; }
+.fc-dialog form { display: flex; flex-direction: column; min-height: 0; }
+.fc-head { flex: 0 0 auto; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
+  padding: 16px 12px 12px 20px; border-bottom: 1px solid var(--border-soft); }
+.fc-kicker { margin: 0 0 4px; color: var(--muted-2); font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; }
+.fc-head h2 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -.014em; outline: none; }
+.fc-body { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 20px; display: grid; }
+.fc-section { min-width: 0; padding: 16px 0; border-bottom: 1px solid var(--border-soft); }
+.fc-section:last-child { border-bottom: 0; }
+.fc-section h3 { margin: 0 0 8px; color: var(--muted-2); font-size: 11px; font-weight: 600; line-height: 1.2; letter-spacing: .07em; text-transform: uppercase; }
+.fc-caption { margin: 8px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+.fc-section h3 + .fc-caption { margin-top: 0; }
+
+/* Measured composition. One bar, two real numbers, counted not derived. Neutral, because
+   neither share is good or bad and Ember would read as an alarm. */
+.fc-measure { display: grid; gap: 8px; }
+.fc-bar { display: block; height: 8px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
+.fc-bar-fill { display: block; height: 100%; background: var(--bone); border-radius: 999px; }
+.fc-legend { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); font-size: 12.5px; }
+.fc-legend b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; margin-left: 4px; }
+.fc-dot { width: 8px; height: 8px; border-radius: 999px; display: inline-block; margin-right: 6px; }
+.fc-dot.subs { background: var(--bone); }
+.fc-dot.disc { background: var(--surface-3); border: 1px solid var(--border); }
+
+/* Per-signal rows: what it is, how much of the feed it touched. */
+.fc-signals { display: grid; margin-top: 8px; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); overflow: hidden; }
+.fc-signals > .fc-caption { margin: 0; padding: 12px 14px; }
+.fc-signal-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 4px 12px; padding: 8px 14px; }
+.fc-signal-row + .fc-signal-row { border-top: 1px solid var(--border-soft); }
+.fc-signal-row[aria-hidden="true"] { display: block; }
+.fc-signal-copy { display: grid; gap: 1px; min-width: 0; }
+.fc-signal-copy strong { font-size: 13px; font-weight: 550; }
+.fc-signal-copy small { color: var(--muted); font-size: 12px; line-height: 1.4; }
+.fc-signal-row > b { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.fc-meter { grid-column: 1 / -1; display: block; height: 3px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
+.fc-meter i { display: block; height: 100%; border-radius: 999px; background: var(--muted); }
+
+.fc-section .range-field { margin-top: 4px; }
+.fc-section .range-field .fc-slider { grid-column: 1 / -1; }
+.fc-section .set-panel { margin-top: 8px; }
+
+.fc-field { display: grid; gap: 6px; margin-bottom: 10px; }
+.fc-field span { color: var(--muted); font-size: 12.5px; }
+
+.fc-channels { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.fc-channel { position: relative; display: inline-flex; align-items: center; gap: 6px; max-width: 100%; min-height: 32px; padding: 0 12px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); color: var(--text);
+  font-size: 12.5px; cursor: pointer; transition: background var(--dur-press) ease, transform var(--dur-press) var(--ease-press); }
+.fc-channel > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fc-channel:hover { background: var(--surface-3); }
+.fc-channel:active { transform: scale(.96); }
+.fc-channel small { color: var(--muted-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.fc-channel-mark { display: none; color: var(--muted); font-size: 12px; font-style: normal; }
+.fc-channel.is-muted { background: transparent; color: var(--muted-2); }
+.fc-channel.is-muted > span { text-decoration: line-through; }
+.fc-channel.is-muted small { display: none; }
+.fc-channel.is-muted .fc-channel-mark { display: inline; }
+.fc-channel-skeleton { width: 112px; height: 32px; border-radius: 999px; }
+
+/* Every muted creator with its own Unmute, including ones muted from a card menu. */
+.fc-muted { margin-top: 14px; }
+.fc-muted-head { margin: 0 0 6px; color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.fc-muted-list { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.fc-muted-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 40px;
+  padding: 4px 4px 4px 12px; border-radius: var(--r-control); background: var(--surface-2); }
+.fc-muted-name { min-width: 0; overflow: hidden; color: var(--text); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+
+.fc-foot { flex: 0 0 auto; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px;
+  padding: 12px 20px; border-top: 1px solid var(--border-soft); }
+.fc-foot .status-line { flex: 1 1 100%; margin: 0; }
+.fc-foot .status-line:empty { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .fc-channel { transition: none; }
+  .fc-channel:active { transform: none; }
+}

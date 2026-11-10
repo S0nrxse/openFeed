@@ -136,19 +136,26 @@ class PlaybackLadderTests(unittest.TestCase):
     def test_invidious_leads_when_it_can_serve_the_video(self) -> None:
         sources, _ = self._sources()
         self.assertEqual(sources[0]["id"], "invidious")
-        self.assertEqual(sources[-1]["id"], "youtube")
 
-    def test_failed_probe_puts_the_fallback_first_and_keeps_invidious_last(self) -> None:
+    def test_the_youtube_embed_is_never_in_the_automatic_ladder(self) -> None:
+        # Even with the admin allowing it and the user opted in, YouTube is a button
+        # the viewer presses, never a rung the player walks to by itself.
+        with patch.object(main.privacy, "youtube_allowed", lambda: True), \
+             patch.object(main.privacy, "get_choices", lambda user_key="local": {"youtube_player": True, "public_instances": False}):
+            sources, _ = self._sources(response=_FakeResponse(404, "not found"))
+        self.assertNotIn("youtube", [source["id"] for source in sources])
+
+    def test_failed_probe_keeps_invidious_in_the_ladder(self) -> None:
         sources, reason = self._sources(response=_FakeResponse(404, "not found"))
-        self.assertEqual([source["id"] for source in sources], ["youtube", "invidious"])
+        self.assertEqual([source["id"] for source in sources], ["invidious"])
         self.assertTrue(reason)
 
     def test_a_source_in_cooldown_sinks_but_is_never_dropped(self) -> None:
-        main.mark_source_result("youtube", False)
-        sources, _ = self._sources()
+        main.mark_source_result("ytdlp", False)
+        sources, _ = self._sources(ytdlp=True)
         ids = [source["id"] for source in sources]
-        self.assertIn("youtube", ids)
-        self.assertEqual(ids[-1], "youtube")
+        self.assertIn("ytdlp", ids)
+        self.assertEqual(ids[-1], "ytdlp")
 
     def test_disabled_sources_are_left_out_entirely(self) -> None:
         sources, _ = self._sources(youtube_fallback=False, response=_FakeResponse(404, "nope"))
@@ -159,14 +166,13 @@ class PlaybackLadderTests(unittest.TestCase):
         self.assertEqual(sources, [])
         self.assertIn("settings", reason)
 
-    def test_public_instances_are_tried_before_youtube(self) -> None:
+    def test_public_instances_are_never_tried_automatically(self) -> None:
         sources, _ = self._sources(
             response=_FakeResponse(404, "not found"),
             public_invidious_enabled=True,
             public_invidious_urls=["https://yewtu.be"],
         )
-        ids = [source["id"] for source in sources]
-        self.assertLess(ids.index("invidious:yewtu.be"), ids.index("youtube"))
+        self.assertNotIn("invidious:yewtu.be", [source["id"] for source in sources])
 
     def test_video_ids_are_url_encoded_into_source_urls(self) -> None:
         sources, _ = self._sources("a/b?c")
@@ -208,9 +214,9 @@ class SourceOrderingTests(unittest.TestCase):
                 return main._all_playback_sources()
 
     def test_disabled_sources_are_still_listed_so_they_can_be_switched_back_on(self) -> None:
-        sources = self._all(disabled_sources=["youtube"])
-        youtube = next(source for source in sources if source["id"] == "youtube")
-        self.assertFalse(youtube["enabled"])
+        sources = self._all(ytdlp=True, disabled_sources=["ytdlp"])
+        ytdlp = next(source for source in sources if source["id"] == "ytdlp")
+        self.assertFalse(ytdlp["enabled"])
 
     def test_only_enabled_sources_reach_the_player(self) -> None:
         with patch.object(db, "get_playback_preferences", return_value=_prefs(disabled_sources=["youtube"])):
@@ -219,16 +225,20 @@ class SourceOrderingTests(unittest.TestCase):
         self.assertNotIn("youtube", ids)
 
     def test_dragged_order_is_honoured(self) -> None:
-        ids = [source["id"] for source in self._all(source_order=["youtube", "invidious"])]
-        self.assertEqual(ids[:2], ["youtube", "invidious"])
+        ids = [source["id"] for source in self._all(ytdlp=True, source_order=["ytdlp", "invidious"])]
+        self.assertEqual(ids[:2], ["ytdlp", "invidious"])
 
     def test_unranked_sources_keep_their_natural_place(self) -> None:
+        ids = [source["id"] for source in self._all(ytdlp=True, source_order=["ytdlp"])]
+        self.assertEqual(ids, ["ytdlp", "invidious"])
+
+    def test_third_party_players_are_not_in_the_ranked_list(self) -> None:
+        # A stored order or URL list from before the opt-in cannot bring them back in.
         ids = [source["id"] for source in self._all(
-            source_order=["youtube"],
+            source_order=["youtube", "invidious:yewtu.be"],
             public_invidious_urls=["https://yewtu.be"],
         )]
-        self.assertEqual(ids[0], "youtube")
-        self.assertIn("invidious:yewtu.be", ids)
+        self.assertEqual(ids, ["invidious"])
 
     def test_legacy_flags_migrate_into_the_disabled_list(self) -> None:
         preferences = db.normalize_playback_preferences({"youtube_fallback": False, "prefer_local": False})
@@ -267,11 +277,11 @@ class YtdlpLadderTests(unittest.TestCase):
         sources, _ = self._sources()
         self.assertEqual(sources[0]["id"], "invidious")
 
-    def test_it_sits_between_invidious_and_youtube(self) -> None:
-        # Extracting the stream ourselves keeps the viewer private, so it is tried before
-        # handing them to YouTube's own embed.
+    def test_it_follows_invidious(self) -> None:
+        # Extracting the stream ourselves keeps the viewer private, so it is the last
+        # automatic rung. Nothing third-party comes after it.
         ids = [source["id"] for source in self._sources()[0]]
-        self.assertLess(ids.index("ytdlp"), ids.index("youtube"))
+        self.assertEqual(ids, ["invidious", "ytdlp"])
 
     def test_it_leads_once_invidious_cannot_serve_the_video(self) -> None:
         ids = [source["id"] for source in self._sources(response=_FakeResponse(404, "nope"))[0]]
@@ -289,9 +299,8 @@ class YtdlpLadderTests(unittest.TestCase):
 
     def test_a_cooled_down_ytdlp_sinks_but_is_not_dropped(self) -> None:
         main.mark_source_result("ytdlp", False)
-        ids = [source["id"] for source in self._sources()[0]]
-        self.assertIn("ytdlp", ids)
-        self.assertGreater(ids.index("ytdlp"), ids.index("youtube"))
+        ids = [source["id"] for source in self._sources(response=_FakeResponse(404, "nope"))[0]]
+        self.assertEqual(ids, ["invidious", "ytdlp"])
 
 
 class DownloadedSourceTests(unittest.TestCase):

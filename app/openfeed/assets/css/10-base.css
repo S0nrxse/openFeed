@@ -1,0 +1,24 @@
+* { box-sizing: border-box; }
+html { background: var(--bg); -webkit-tap-highlight-color: transparent; }
+body { margin: 0; min-width: 320px; background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; letter-spacing: -.006em; }
+a { color: inherit; text-decoration: none; }
+button, input, select { font: inherit; letter-spacing: inherit; touch-action: manipulation; }
+button { color: inherit; }
+/* Scoped to page content: the app shell, dialogs and menus style their own
+   headings explicitly, so a global rule only leaked letter-spacing into them. */
+main h1, main h2, main h3 { letter-spacing: -.018em; font-weight: 600; }
+.icon { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; flex: 0 0 auto; }
+:focus-visible { outline: none; box-shadow: var(--focus); }
+/* Keyboard-only way past the header/sidebar/nav. Hidden until focused. */
+.skip-link { position: fixed; top: -48px; left: 12px; z-index: 200; border-radius: 999px; background: var(--surface-2); color: var(--text); border: 1px solid var(--border); padding: 8px 14px; font-size: 13px; transition: top var(--dur-press) ease; }
+.skip-link:focus-visible { top: 8px; box-shadow: var(--focus); }
+/* The skip-link target itself takes programmatic focus; a ring around the whole
+   page would be noise, so only the link shows one. */
+#main:focus { box-shadow: none; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--scrollbar); border: 3px solid var(--bg); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-hover); }
+/* Durations and counts line up in columns and do not jitter as they change. */
+.bell-badge, .playlist-count, .stat-value, .menu-trailing, .channel-card p, .collection-card-body p,
+.playlist-body p, .channel-hero-meta, .ch-meta, .collection-hero-meta, .notification-copy small,
+.comment-time, .post-meta, .check p, .status-scroll td { font-variant-numeric: tabular-nums; }

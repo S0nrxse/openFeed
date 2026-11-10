@@ -1,0 +1,69 @@
+/* ---------- community posts ---------- */
+/* One readable column of hairline-separated posts. The shelf keeps its cards: it sits
+   among video tiles, where a row without a box would not read as an item. */
+.post-list { display: grid; gap: 0; max-width: 640px; }
+.post-list.is-shelf { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; max-width: none; }
+.post-card { padding: 16px 0; border-bottom: 1px solid var(--border-soft); }
+.post-list.is-shelf .post-card { border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); padding: 16px 18px; }
+.post-card.is-compact { padding: 14px; }
+.post-head { display: grid; grid-template-columns: 36px minmax(0,1fr) auto; gap: 12px; align-items: center; margin-bottom: 10px; }
+.post-head .avatar { width: 36px; height: 36px; }
+.post-head strong { display: block; font-size: 13.5px; font-weight: 600; }
+.post-head small { color: var(--muted-2); font-size: 11.5px; }
+.post-flag { margin-left: 6px; padding: 1px 6px; border-radius: 999px; background: var(--surface-3); color: var(--muted); font-size: 10px; }
+.post-permalink { color: var(--muted); display: grid; place-items: center; width: var(--hit); height: var(--hit); margin: calc((26px - var(--hit)) / 2) 0; border-radius: 999px; }
+.post-permalink:hover { background: var(--surface-3); color: var(--text); }
+.post-body { font-size: 14.5px; line-height: 1.55; overflow-wrap: anywhere; }
+.post-list.is-shelf .post-body { font-size: 13.5px; }
+.post-card.is-compact .post-body { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.post-meta { margin: 10px 0 0; color: var(--muted-2); font-size: 12px; }
+.post-images { display: grid; gap: 6px; margin-top: 12px; }
+.post-images.is-multi { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+.post-images img { width: 100%; border-radius: 10px; display: block; }
+.post-video { display: grid; grid-template-columns: 168px minmax(0,1fr); gap: 12px; margin-top: 12px;
+  padding: 8px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-2); }
+.post-video-thumb { position: relative; aspect-ratio: 16/9; border-radius: 8px; overflow: hidden; background: var(--thumb-bed); }
+.post-video-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.post-video-copy { display: grid; align-content: center; gap: 4px; min-width: 0; }
+.post-video-copy strong { font-size: 13px; line-height: 1.35; }
+.post-video-copy small { color: var(--muted); font-size: 11.5px; }
+.post-playlist { display: flex; align-items: center; gap: 10px; margin-top: 12px; padding: 11px 13px;
+  border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-2); }
+.post-unsupported { display: flex; gap: 8px; align-items: flex-start; margin: 12px 0 0; padding: 10px 12px;
+  border: 1px dashed var(--border); border-radius: 10px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.post-unsupported .icon { width: 15px; height: 15px; flex: 0 0 auto; margin-top: 1px; }
+.post-more { margin-top: 16px; }
+@media (pointer: coarse) {
+  .poll-choice { min-height: var(--hit); }
+  .post-card .link-action { min-height: var(--hit); }
+}
+
+/* Poll. YouTube publishes no per-option split, so a row never shows a share of anything:
+   tonal at rest, inverted once it is the choice recorded on this machine. */
+.post-poll { display: grid; gap: 6px; margin-top: 12px; }
+.poll-label { margin: 0 0 2px; color: var(--muted-2); font-size: 11px; font-weight: 600; line-height: 1.2; letter-spacing: .07em; text-transform: uppercase; }
+.poll-choice { position: relative; display: flex; align-items: center; gap: 10px; min-height: 40px;
+  padding: 0 12px; border: 0; border-radius: var(--r-control); background: var(--surface-2);
+  color: var(--text); font-size: 13px; text-align: left; cursor: pointer; overflow: hidden;
+  transition: background var(--dur-press) ease, color var(--dur-press) ease, transform var(--dur-press) var(--ease-press); }
+.poll-choice:hover { background: var(--surface-3); }
+.poll-choice:active { transform: scale(.985); }
+.poll-choice:focus-visible { outline: 0; box-shadow: var(--focus); }
+.poll-choice.is-picked, .poll-choice.is-picked:hover { background: var(--bone); color: var(--on-bone); font-weight: 550; }
+.poll-text { position: relative; flex: 1 1 auto; min-width: 0; }
+.poll-mark { position: relative; opacity: 0; color: currentColor; display: grid; place-items: center; }
+.poll-choice.is-picked .poll-mark { opacity: 1; }
+.poll-mark .icon { width: 15px; height: 15px; }
+.poll-note { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0 0; padding: 10px 12px;
+  border: 1px solid var(--border-soft); border-radius: var(--r-control); background: transparent;
+  color: var(--muted); font-size: 11.5px; line-height: 1.55; }
+.poll-note .icon { width: 14px; height: 14px; flex: 0 0 auto; margin-top: 2px; }
+.poll-note strong { color: var(--text); }
+@media (prefers-reduced-motion: reduce) { .poll-choice { transition: none; } .poll-choice:active { transform: none; } }
+@media (pointer: coarse) { .poll-choice { min-height: 44px; } }
+
+/* Single post: one 680px column. */
+.post-detail { max-width: 680px; margin-inline: auto; display: grid; gap: 12px; }
+.post-back { justify-self: start; margin-left: -8px; }
+.post-detail .post-list { max-width: none; }
+.post-detail .comments { margin-top: 12px; }

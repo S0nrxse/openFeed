@@ -154,8 +154,11 @@ class TokenGuardTests(unittest.TestCase):
 
     def browser(self, groups: list[str]) -> None:
         self.client.headers.pop("authorization", None)
+        # Real sessions carry the time they were issued at; the admin gate ages
+        # admin rights from that snapshot, so the fixture says "just signed in".
         self.client.cookies.set(main.get_settings().session_cookie, main._sign_payload({
             "sub": "browser-actor", "groups": groups,
+            "iat": main._utc_timestamp(),
             "expires_at": main._utc_timestamp() + 600,
         }))
 
@@ -284,7 +287,9 @@ class TokenGuardTests(unittest.TestCase):
 
     def test_anonymous_cannot_manage_tokens_even_when_login_is_optional(self) -> None:
         self.client.headers.pop("authorization")
-        with patch.dict(os.environ, {"OPENFEED_REQUIRE_LOGIN": "false"}):
+        # Optional login means sign-in is on but not required; with sign-in off entirely
+        # the local profile owns tokens (test_playback_prefs.LocalTokenTests).
+        with patch.dict(os.environ, {"OPENFEED_REQUIRE_LOGIN": "false", "OPENFEED_AUTH_MODE": "authentik_oidc"}):
             for method, path in (("GET", "/api/tokens"), ("POST", "/api/tokens"),
                                  ("DELETE", f"/api/tokens/{self.record['id']}")):
                 self.assertEqual(self.client.request(method, path, json={}).status_code, 401)
@@ -602,7 +607,9 @@ class TokenSchemaTests(unittest.TestCase):
         subscription_ids = ("feed/4", "feed%2F4", " feed/4 ")
         with self.connect() as conn:
             for subscription_id in subscription_ids:
-                conn.execute("INSERT INTO freshrss_subscriptions (id, title) VALUES (%s, 'Test')", (subscription_id,))
+                conn.execute("INSERT INTO feeds (id, title) VALUES (%s, 'Test')", (subscription_id,))
+                # Only a feed its owner follows can go into a collection.
+                conn.execute("INSERT INTO user_subscriptions (user_key, feed_id) VALUES ('owner-1', %s)", (subscription_id,))
         for subscription_id in subscription_ids:
             self.assertIsNotNone(db.add_subscription_to_collection(collection_id, subscription_id, "owner-1"))
         with patch.dict(os.environ, {

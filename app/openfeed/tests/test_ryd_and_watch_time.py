@@ -257,7 +257,8 @@ class WatchTimeProfileTests(unittest.TestCase):
     def test_thin_history_is_discounted_so_one_video_cannot_take_over(self) -> None:
         # 10 minutes of history out of the hour needed for full weight.
         rows = [{"youtube_channel_id": "UC_a", "author": "A", "tags": ["space"], "seconds": 600, "completions": 0, "last_watched_at": _NOW}]
-        self.assertAlmostEqual(self._profile(rows)["confidence"], 600 / db.WATCH_TIME_CONFIDENCE_SECONDS)
+        # _NOW is fixed at import, so a long suite run adds a hair of decay before this runs.
+        self.assertAlmostEqual(self._profile(rows)["confidence"], 600 / db.WATCH_TIME_CONFIDENCE_SECONDS, places=4)
 
     def test_ample_history_earns_full_weight(self) -> None:
         rows = [{"youtube_channel_id": "UC_a", "author": "A", "tags": ["space"], "seconds": 99999, "completions": 4, "last_watched_at": _NOW}]

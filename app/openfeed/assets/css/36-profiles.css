@@ -1,0 +1,71 @@
+/* Household profiles: the avatar, the "Who's watching" picker, the account-menu switcher
+   and Settings -> Profiles. The swatches are the one place a hue identifies a person
+   rather than a state (DESIGN.md -> Profile swatches). They are muted, sit well below
+   Ember in chroma, and never appear outside a profile avatar. */
+:root {
+  --profile-graphite: #3a3a40;
+  --profile-slate: #4c5a78;
+  --profile-sage: #4d6b5c;
+  --profile-clay: #7a5a45;
+  --profile-plum: #6a4f74;
+  --profile-steel: #47697a;
+}
+
+.profile-avatar { display: inline-grid; place-items: center; flex: 0 0 auto; width: 36px; height: 36px; border-radius: 999px; background: var(--profile-graphite); color: var(--text); font-size: 14px; font-weight: 650; line-height: 1; letter-spacing: -.01em; user-select: none; }
+.profile-avatar[data-profile-color="slate"] { background: var(--profile-slate); }
+.profile-avatar[data-profile-color="sage"] { background: var(--profile-sage); }
+.profile-avatar[data-profile-color="clay"] { background: var(--profile-clay); }
+.profile-avatar[data-profile-color="plum"] { background: var(--profile-plum); }
+.profile-avatar[data-profile-color="steel"] { background: var(--profile-steel); }
+.profile-avatar.sm { width: 22px; height: 22px; font-size: 10.5px; }
+.profile-avatar.fill { width: 100%; height: 100%; font-size: 12px; }
+.profile-avatar.xl { width: 112px; height: 112px; font-size: 44px; font-weight: 600; }
+.profile-dot:has(> .profile-avatar.fill) { border-color: transparent; overflow: hidden; }
+
+/* Account menu: profile rows are submit buttons inside one-button forms. */
+.profile-select-form { display: contents; }
+.menu-group-label { margin: 6px 10px 2px; color: var(--muted-2); font-size: 11px; font-weight: 600; line-height: 1.2; letter-spacing: .07em; text-transform: uppercase; }
+.profile-switch-list { display: grid; }
+.profile-switch-list .menu-row { font: inherit; font-size: 13px; }
+.profile-switch-list .menu-icon { display: grid; place-items: center; }
+.profile-switch-list .menu-trailing { color: var(--muted-2); font-size: 11.5px; }
+
+/* "Who's watching?" */
+.profile-picker-body { min-height: 100dvh; margin: 0; background: var(--bg); color: var(--text); }
+.profile-picker { display: grid; justify-items: center; align-content: center; gap: 28px; min-height: 100dvh; padding: calc(32px + var(--safe-top)) 16px calc(32px + var(--safe-bottom)); box-sizing: border-box; text-align: center; }
+.profile-picker-brand { position: absolute; top: calc(14px + var(--safe-top)); left: calc(16px + var(--safe-left)); }
+.profile-picker h1 { margin: 0; font-size: 22px; font-weight: 650; line-height: 1.25; letter-spacing: -.02em; }
+.profile-picker-grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 24px 28px; max-width: 760px; margin: 0; padding: 0; list-style: none; }
+.profile-tile { display: grid; justify-items: center; gap: 10px; width: 132px; padding: 10px 8px 12px; border: 1px solid transparent; border-radius: var(--r-panel); background: transparent; color: var(--muted); font: inherit; cursor: pointer; transition: background var(--dur-press) ease, color var(--dur-press) ease, transform var(--dur-press) var(--ease-press); }
+.profile-tile:hover, .profile-tile:focus-visible { background: var(--surface-2); color: var(--text); outline: none; }
+.profile-tile:focus-visible { box-shadow: var(--focus); }
+.profile-tile:active { transform: scale(.96); }
+.profile-tile-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14.5px; font-weight: 550; letter-spacing: -.008em; }
+.profile-tile-badge { margin-top: -4px; padding: 2px 8px; border-radius: 999px; background: var(--surface-3); color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .02em; }
+.profile-picker-note { max-width: 46ch; margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+.profile-picker-account { margin: -16px 0 0; color: var(--muted-2); font-size: 12px; }
+
+/* Settings -> Profiles */
+.profile-row .set-row { grid-template-columns: auto minmax(0, 1fr) auto; }
+.profile-actions { flex-wrap: wrap; }
+.profile-edit, .profile-add { display: grid; gap: 14px; min-width: 0; padding: 12px 14px 14px; }
+.profile-edit { border-top: 1px solid var(--border-soft); background: var(--bg); }
+.profile-edit[hidden] { display: none; }
+.profile-edit .text-field, .profile-add .text-field { gap: 6px; max-width: 360px; }
+.profile-edit .toggle-row, .profile-add .toggle-row { min-height: 0; padding: 0; }
+.profile-edit .toggle-row:hover, .profile-add .toggle-row:hover { background: transparent; }
+.profile-edit-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.profile-swatches { display: flex; flex-wrap: wrap; gap: 6px; }
+.profile-swatch { display: grid; place-items: center; width: var(--hit); height: var(--hit); border-radius: 999px; cursor: pointer; }
+.profile-swatch .profile-avatar { width: 24px; height: 24px; box-shadow: 0 0 0 1px var(--border); transition: box-shadow var(--dur-press) ease; }
+.profile-swatch input:checked + .profile-avatar { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--bone); }
+.profile-swatch input:focus-visible + .profile-avatar { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--focus-ink); }
+
+@media (max-width: 600px) {
+  .profile-picker { gap: 22px; }
+  .profile-picker-grid { display: grid; grid-template-columns: repeat(2, 132px); gap: 14px 18px; }
+  .profile-avatar.xl { width: 92px; height: 92px; font-size: 36px; }
+  .profile-row .set-row { grid-template-columns: auto minmax(0, 1fr); }
+  .profile-row .set-control { grid-column: 1 / -1; }
+  .profile-edit .text-field, .profile-add .text-field { max-width: none; }
+}

@@ -27,6 +27,7 @@ import threading
 import time
 from typing import Any
 
+from . import outbound
 from .config import get_settings
 
 logger = logging.getLogger("openfeed.ytdlp")
@@ -73,7 +74,7 @@ def base_args() -> list[str]:
     supplies stays out of this process's memory and out of the logs.
     """
     settings = get_settings()
-    args = ["--no-playlist", "--no-warnings", "--ignore-config"]
+    args = ["--no-playlist", "--no-warnings", "--ignore-config", *outbound.ytdlp_args()]
     if settings.ytdlp_cookies_file:
         args += ["--cookies", settings.ytdlp_cookies_file]
     if settings.ytdlp_extra_args:
@@ -82,10 +83,26 @@ def base_args() -> list[str]:
         except ValueError:
             logger.warning("OPENFEED_YTDLP_EXTRA_ARGS is not parseable as shell words; ignoring it")
             extra = []
-        # --exec* runs an arbitrary shell command per video, --load-info* reads
-        # local JSON files into the process, and --config-locations loads option
-        # files from disk: none of these belong in an env-passed flag string.
-        blocked_prefixes = ("--exec", "--load-info", "--config-location")
+        # These flags execute commands, load local files into the process or swap the
+        # helper binaries: none of these belong in an env-passed flag string.
+        # - --exec* runs an arbitrary shell command per video
+        # - --load-info* reads local JSON into the process, --config-location loads
+        #   option files from disk
+        # - --use-postprocessor / --postprocessor-args reach ExecAfterDownload's exec_cmd
+        # - --external-downloader* swaps the fetch binary, --ffmpeg-location points at an
+        #   arbitrary binary in ffmpeg's place, --downloader* is the external-downloader alias
+        # - --netrc-cmd runs a command to fetch credentials
+        blocked_prefixes = (
+            "--exec",
+            "--load-info",
+            "--config-location",
+            "--use-postprocessor",
+            "--postprocessor",
+            "--external-downloader",
+            "--downloader",
+            "--ffmpeg-location",
+            "--netrc-cmd",
+        )
         filtered: list[str] = []
         index = 0
         while index < len(extra):

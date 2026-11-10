@@ -190,7 +190,10 @@ class DatePrecedenceTests(unittest.TestCase):
         # rewriting thousands of corrected rows with approximations.
         from openfeed import db
 
-        sql = self._sql(db.upsert_discovered_video)
+        # One statement serves the single-row and the batched (channel page) writer.
+        sql = db._DISCOVERED_VIDEO_UPSERT_SQL
+        for writer in (db.upsert_discovered_video, db.upsert_discovered_videos):
+            self.assertIn("_DISCOVERED_VIDEO_UPSERT_SQL", self._sql(writer))
         self.assertIn("published_at = COALESCE(videos.published_at, EXCLUDED.published_at)", sql)
         self.assertNotIn("published_at = COALESCE(EXCLUDED.published_at, videos.published_at)", sql)
 
@@ -209,6 +212,6 @@ class DatePrecedenceTests(unittest.TestCase):
         # anything, and an overwriting discovery undoes every correction.
         from openfeed import db
 
-        discovery = "COALESCE(videos.published_at, EXCLUDED.published_at)" in self._sql(db.upsert_discovered_video)
+        discovery = "COALESCE(videos.published_at, EXCLUDED.published_at)" in db._DISCOVERED_VIDEO_UPSERT_SQL
         enrichment = "COALESCE(to_timestamp(NULLIF(%s, 0)), published_at)" in self._sql(db.update_video_metadata)
         self.assertTrue(discovery and enrichment)

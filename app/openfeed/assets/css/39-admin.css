@@ -1,0 +1,46 @@
+/* Admin: the tabs across Server, Users and Status, and Admin, Server (admin_pages.py).
+   Built from the settings grammar (35-settings.css) and the accounts page frame
+   (38-accounts.css); only what those lack is here. */
+
+.admin-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: -6px 0 2px; }
+.admin-tab { position: relative; display: inline-flex; align-items: center; min-height: 34px; padding: 0 14px; border-radius: 999px;
+  background: var(--surface-2); color: var(--text); font-size: 13.5px; font-weight: 500; text-decoration: none; white-space: nowrap;
+  transition: background var(--dur-press) ease, color var(--dur-press) ease; }
+.admin-tab:hover { background: var(--surface-3); }
+.admin-tab.is-active { background: var(--bone); color: var(--on-bone); }
+.admin-tab:focus-visible { outline: none; box-shadow: var(--focus); }
+.status-page + .admin-tabs, .page-head + .admin-tabs { margin-top: 0; }
+.app-page > .admin-tabs { margin-bottom: 18px; }
+
+.admin-page { display: contents; }
+.admin-form { display: grid; min-width: 0; }
+.admin-form > * + * { border-top: 1px solid var(--border-soft); }
+.admin-form-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; padding: 10px 14px; }
+.admin-number { gap: 8px; }
+.admin-number .field-input { width: 112px; text-align: right; font-variant-numeric: tabular-nums; }
+.admin-unit { color: var(--muted); font-size: 12px; }
+.admin-textarea-row { grid-template-columns: minmax(0, 1fr) minmax(0, 300px); align-items: start; }
+.admin-textarea { width: 100%; min-height: 76px; padding: 8px 11px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; line-height: 1.5; box-sizing: border-box; }
+
+/* Test all sources and Diagnose write their findings here. */
+.admin-results:empty { display: none; }
+.admin-results { display: grid; gap: 0; }
+.admin-result { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; min-height: 44px; padding: 8px 14px; font-size: 12.5px; }
+.admin-results > * + * { border-top: 1px solid var(--border-soft); }
+.admin-result-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--muted-2); }
+.admin-result.is-ok .admin-result-dot { background: var(--live); }
+.admin-result.is-bad .admin-result-dot { background: var(--accent); }
+.admin-result strong { font-weight: 550; overflow-wrap: anywhere; }
+.admin-result small { display: block; color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.admin-result-time { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* Downloads: a member's own storage against the quota. */
+.storage-strip.is-near .storage-bar .is-downloads { background: var(--hold); }
+.storage-strip.is-full .storage-bar .is-downloads { background: var(--accent); }
+
+@media (max-width: 640px) {
+  .admin-textarea-row { grid-template-columns: minmax(0, 1fr); }
+  .admin-number .field-input { width: 96px; }
+  .admin-form-actions { justify-content: stretch; }
+  .admin-form-actions .btn { flex: 1 1 auto; }
+}

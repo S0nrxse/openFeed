@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,13 +11,19 @@ from typing import Any
 
 import httpx
 
-from . import db
+from . import db, outbound
 from .config import get_settings
 from .youtube_ids import VIDEO_ID_RE, youtube_channel_id_from_text
 
 logger = logging.getLogger(__name__)
 
 CHANNEL_FEED_URL_TEMPLATE = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+
+# Feeds are documents we do not control: bounded bodies keep a "feed" from turning
+# into an OOM lever, and DOCTYPE/entity rejection keeps the stdlib parser from
+# expanding entities at all (no defusedxml dependency needed for what we parse).
+MAX_FEED_BODY_BYTES = 2 * 1024 * 1024
+MAX_FEED_REDIRECTS = 5
 
 _ATOM_NS = "http://www.w3.org/2005/Atom"
 _YT_NS = "http://www.youtube.com/xml/schemas/2015"
@@ -44,6 +51,12 @@ class ChannelFeedResult:
     last_modified: str | None = None
 
 
+def _same_host_redirect(a: str, b: str) -> bool:
+    host_a = urllib.parse.urlsplit(a).hostname or ""
+    host_b = urllib.parse.urlsplit(b).hostname or ""
+    return host_a.lower() == host_b.lower()
+
+
 def fetch_channel_feed(
     httpx_client: httpx.Client,
     url: str,
@@ -56,27 +69,68 @@ def fetch_channel_feed(
     Sends If-None-Match / If-Modified-Since when values are available and
     never raises: every httpx failure becomes ``status=None`` so the caller
     can record it and move on to the next channel.
+
+    Redirects are followed only when they stay on the same host. A feed that
+    hops hosts would otherwise let any subscribed URL become a proxy for
+    fetching arbitrary internal addresses with the app's credentials.
     """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ChannelFeedResult(status=None, text=None, etag=None, last_modified=None)
     headers: dict[str, str] = {"User-Agent": "OpenFeed RSS poller"}
     if etag:
         headers["If-None-Match"] = etag
     if last_modified:
         headers["If-Modified-Since"] = last_modified
     try:
-        response = httpx_client.get(url, headers=headers, timeout=timeout)
+        current_url = url
+        for _ in range(MAX_FEED_REDIRECTS + 1):
+            response = httpx_client.get(current_url, headers=headers, timeout=timeout, follow_redirects=False)
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = (response.headers.get("location") or "").strip()
+                response.close()
+                if not location or not _same_host_redirect(current_url, location):
+                    return ChannelFeedResult(status=None, text=None, etag=None, last_modified=None)
+                next_url = urllib.parse.urljoin(current_url, location)
+                if urllib.parse.urlsplit(next_url).scheme not in {"http", "https"}:
+                    return ChannelFeedResult(status=None, text=None, etag=None, last_modified=None)
+                current_url = next_url
+                continue
+            break
+        else:
+            return ChannelFeedResult(status=None, text=None, etag=None, last_modified=None)
+        response_etag = response.headers.get("etag")
+        response_last_modified = response.headers.get("last-modified")
+        if response.status_code == 304:
+            return ChannelFeedResult(status=304, text=None, etag=response_etag, last_modified=response_last_modified)
+        if response.status_code != 200:
+            return ChannelFeedResult(
+                status=response.status_code, text=None, etag=response_etag, last_modified=response_last_modified
+            )
+        if _int_header(response.headers.get("content-length")) > MAX_FEED_BODY_BYTES:
+            logger.warning("feed body from %s exceeds the %d byte cap", current_url, MAX_FEED_BODY_BYTES)
+            return ChannelFeedResult(status=None, text=None, etag=None, last_modified=None)
+        body = b""
+        try:
+            for chunk in response.iter_bytes():
+                body += chunk
+                if len(body) > MAX_FEED_BODY_BYTES:
+                    logger.warning("feed body from %s exceeds the %d byte cap", current_url, MAX_FEED_BODY_BYTES)
+                    return ChannelFeedResult(status=None, text=None, etag=None, last_modified=None)
+        finally:
+            response.close()
+        return ChannelFeedResult(
+            status=200, text=body.decode("utf-8", errors="replace"), etag=response_etag, last_modified=response_last_modified
+        )
     except Exception:
         return ChannelFeedResult(status=None, text=None, etag=None, last_modified=None)
-    response_etag = response.headers.get("etag")
-    response_last_modified = response.headers.get("last-modified")
-    if response.status_code == 304:
-        return ChannelFeedResult(status=304, text=None, etag=response_etag, last_modified=response_last_modified)
-    if response.status_code != 200:
-        return ChannelFeedResult(
-            status=response.status_code, text=None, etag=response_etag, last_modified=response_last_modified
-        )
-    return ChannelFeedResult(
-        status=200, text=response.text, etag=response_etag, last_modified=response_last_modified
-    )
+
+
+def _int_header(value: str | None) -> int:
+    try:
+        return int(value or "")
+    except (TypeError, ValueError):
+        return 0
 
 
 def _local_name(tag: str) -> str:
@@ -135,16 +189,20 @@ def _parse_published_at(value: str | None) -> datetime | None:
 def parse_channel_feed(xml_text: str, feed_url: str) -> list[dict[str, Any]]:
     """Parse a YouTube channel Atom feed into ``normalize_entry``-shaped dicts.
 
-    Same entry-dict keys as ``freshrss.normalize_entry``: id,
+    Entry dicts carry: id,
     youtube_video_id, youtube_channel_id, subscription_id, channel_title,
     feed_url, title, url, thumbnail_url, author, summary, published_at
-    (timezone-aware datetime or None), is_read, is_starred, raw.
+    (timezone-aware datetime or None), raw.
 
-    Fresh RSS entries start unread and unstarred; ``subscription_id`` is None
+    ``subscription_id`` is None
     here and filled in by the caller. Entries without a video id are skipped.
     Raises ``xml.etree.ElementTree.ParseError`` on malformed XML so the caller
-    can record the channel fetch as failed.
+    can record the channel fetch as failed. Feeds declaring a DOCTYPE (entity
+    expansion in the stdlib parser) are treated as malformed for the same reason.
     """
+    lowered = xml_text[:65536].lower()
+    if "<!doctype" in lowered or "<!entity" in lowered:
+        raise ET.ParseError("feed declares DOCTYPE/entities, which the poller does not accept")
     root = ET.fromstring(xml_text)
     feed_author: str | None = None
     for child in root:
@@ -206,8 +264,6 @@ def parse_channel_feed(xml_text: str, feed_url: str) -> list[dict[str, Any]]:
                 "author": author_name or channel_title,
                 "summary": description,
                 "published_at": published_at,
-                "is_read": False,
-                "is_starred": False,
                 "raw": {
                     "yt:videoId": video_id,
                     "yt:channelId": entry_channel_id,
@@ -227,7 +283,7 @@ def parse_channel_feed(xml_text: str, feed_url: str) -> list[dict[str, Any]]:
 def sync_rss_once(channel_limit: int | None = None) -> dict[str, Any]:
     """Poll due YouTube channel RSS feeds and store new entries.
 
-    Mirrors ``sync_freshrss_once``: returns ``{ok, sync_run_id,
+    Returns ``{ok, sync_run_id,
     subscriptions_count, entries_count, message}`` with ``status`` + ``message``
     on failure. ``subscriptions_count`` is channels polled, ``entries_count``
     is entries stored. One bad feed never kills the loop: per-channel failures
@@ -260,7 +316,9 @@ def sync_rss_once(channel_limit: int | None = None) -> dict[str, Any]:
                 "entries_count": 0,
                 "message": message,
             }
-        with httpx.Client(timeout=20.0, follow_redirects=True, headers={"User-Agent": "OpenFeed RSS poller"}) as client:
+        # Straight to youtube.com, as Invidious does for its own subscriptions; through
+        # OPENFEED_OUTBOUND_PROXY when one is set.
+        with outbound.client(timeout=20.0, follow_redirects=True, headers={"User-Agent": "OpenFeed RSS poller"}) as client:
             for channel in channels:
                 sub_id = channel.get("id")
                 try:
@@ -293,7 +351,9 @@ def sync_rss_once(channel_limit: int | None = None) -> dict[str, Any]:
                     if result.status != 200 or result.text is None:
                         db.record_rss_fetch(sub_id, ok=False)
                         continue
+                    feed_title = ""
                     for entry in parse_channel_feed(result.text, url):
+                        feed_title = feed_title or str(entry.get("channel_title") or "")
                         channel_id = db.upsert_channel(
                             entry["channel_title"], entry.get("youtube_channel_id"), entry.get("feed_url")
                         )
@@ -302,6 +362,10 @@ def sync_rss_once(channel_limit: int | None = None) -> dict[str, Any]:
                         subscription_id = (
                             db.subscription_id_for_channel(entry_channel) if entry_channel else None
                         )
+                        if not subscription_id and not youtube_channel_id:
+                            # A feed with no channel of its own (a playlist feed): its videos
+                            # belong to it, so its bell and its row count them.
+                            subscription_id = sub_id
                         entry["subscription_id"] = subscription_id
                         db.upsert_entry(entry, video_id, subscription_id)
                         entries_count += 1
@@ -312,6 +376,10 @@ def sync_rss_once(channel_limit: int | None = None) -> dict[str, Any]:
                         ok=True,
                         ttl_seconds=ttl_seconds,
                     )
+                    if youtube_channel_id and feed_title:
+                        # The shared feed takes the channel's own name, whatever title
+                        # its first subscriber happened to send.
+                        db.refresh_feed_title(sub_id, feed_title)
                 except Exception:
                     logger.exception("RSS poll failed for channel %s", sub_id)
                     try:

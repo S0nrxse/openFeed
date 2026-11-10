@@ -21,7 +21,11 @@ CREATE TABLE IF NOT EXISTS videos (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS freshrss_subscriptions (
+-- One row per feed OpenFeed polls, shared by everyone who follows it: a channel is
+-- fetched once however many people subscribe. Who follows what is user_subscriptions.
+-- (Installs from before 2026-11 had these two tables under other names; migrations.py
+-- renames them at startup, before this file runs.)
+CREATE TABLE IF NOT EXISTS feeds (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
   feed_url TEXT,
@@ -37,29 +41,42 @@ CREATE TABLE IF NOT EXISTS freshrss_subscriptions (
   next_fetch_after TIMESTAMPTZ
 );
 
-CREATE TABLE IF NOT EXISTS freshrss_entries (
+-- Items read from a feed. subscription_id names the feed (feeds.id), not a person.
+CREATE TABLE IF NOT EXISTS feed_entries (
   id TEXT PRIMARY KEY,
   video_id BIGINT REFERENCES videos(id) ON DELETE SET NULL,
-  subscription_id TEXT REFERENCES freshrss_subscriptions(id) ON DELETE SET NULL,
+  subscription_id TEXT REFERENCES feeds(id) ON DELETE SET NULL,
   title TEXT NOT NULL,
   url TEXT,
   author TEXT,
   published_at TIMESTAMPTZ,
-  is_read BOOLEAN NOT NULL DEFAULT false,
-  is_starred BOOLEAN NOT NULL DEFAULT false,
   raw JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Direct-RSS polling state on freshrss_subscriptions. The CREATE TABLE above covers
--- fresh installs; these ALTERs migrate existing databases (init_db replays the whole
--- file, and ADD COLUMN IF NOT EXISTS is a no-op once the column exists).
-ALTER TABLE freshrss_subscriptions ADD COLUMN IF NOT EXISTS etag TEXT;
-ALTER TABLE freshrss_subscriptions ADD COLUMN IF NOT EXISTS last_modified TEXT;
-ALTER TABLE freshrss_subscriptions ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
-ALTER TABLE freshrss_subscriptions ADD COLUMN IF NOT EXISTS fetch_failures INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE freshrss_subscriptions ADD COLUMN IF NOT EXISTS next_fetch_after TIMESTAMPTZ;
+-- Direct-RSS polling state on feeds. The CREATE TABLE above covers fresh installs;
+-- these ALTERs migrate existing databases (init_db replays the whole file, and ADD
+-- COLUMN IF NOT EXISTS is a no-op once the column exists).
+ALTER TABLE feeds ADD COLUMN IF NOT EXISTS etag TEXT;
+ALTER TABLE feeds ADD COLUMN IF NOT EXISTS last_modified TEXT;
+ALTER TABLE feeds ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
+ALTER TABLE feeds ADD COLUMN IF NOT EXISTS fetch_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE feeds ADD COLUMN IF NOT EXISTS next_fetch_after TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_feeds_youtube_channel ON feeds (youtube_channel_id);
+
+-- Who follows which feed. Per user_key, so per household profile too: each profile is
+-- its own person. The poller fetches only feeds with at least one row here; the last
+-- unsubscribe stops polling and keeps the entries and videos already stored. On the
+-- upgrade that creates this table, migrations.py gives the existing feeds to every
+-- user_key that has data, so nobody's feed empties.
+CREATE TABLE IF NOT EXISTS user_subscriptions (
+  user_key TEXT NOT NULL,
+  feed_id TEXT NOT NULL REFERENCES feeds(id) ON DELETE CASCADE ON UPDATE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_key, feed_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_subscriptions_feed ON user_subscriptions (feed_id);
 
 
 CREATE TABLE IF NOT EXISTS subscription_collections (
@@ -77,7 +94,7 @@ CREATE INDEX IF NOT EXISTS idx_subscription_collections_user_time ON subscriptio
 CREATE TABLE IF NOT EXISTS subscription_collection_members (
   id BIGSERIAL PRIMARY KEY,
   collection_id UUID NOT NULL REFERENCES subscription_collections(id) ON DELETE CASCADE,
-  subscription_id TEXT NOT NULL REFERENCES freshrss_subscriptions(id) ON DELETE CASCADE,
+  subscription_id TEXT NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
   added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (collection_id, subscription_id)
 );
@@ -115,9 +132,9 @@ CREATE TABLE IF NOT EXISTS user_video_events (
 
 CREATE INDEX IF NOT EXISTS idx_videos_published_at ON videos (published_at DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_videos_channel_id ON videos (channel_id);
-CREATE INDEX IF NOT EXISTS idx_freshrss_entries_published_at ON freshrss_entries (published_at DESC NULLS LAST);
-CREATE INDEX IF NOT EXISTS idx_freshrss_entries_video_id ON freshrss_entries (video_id);
-CREATE INDEX IF NOT EXISTS idx_freshrss_entries_video_updated ON freshrss_entries (video_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_feed_entries_published_at ON feed_entries (published_at DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_feed_entries_video_id ON feed_entries (video_id);
+CREATE INDEX IF NOT EXISTS idx_feed_entries_video_updated ON feed_entries (video_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sync_runs_started_at ON sync_runs (started_at DESC);
 ALTER TABLE user_video_events ADD COLUMN IF NOT EXISTS user_key TEXT NOT NULL DEFAULT 'local';
 CREATE INDEX IF NOT EXISTS idx_user_video_events_video_id ON user_video_events (video_id);
@@ -194,6 +211,35 @@ CREATE TABLE IF NOT EXISTS playlist_items (
 
 CREATE INDEX IF NOT EXISTS idx_playlist_items_playlist_position ON playlist_items (playlist_id, position, added_at);
 CREATE INDEX IF NOT EXISTS idx_playlist_items_video ON playlist_items (video_id);
+
+-- Library tools (library_tools.py). A playlist's own sort (Manual unless the owner picks
+-- another), the YouTube playlist it was imported from, and who may open it: visibility
+-- above is 'private', 'unlisted' (anyone signed in to this install who has the link) or
+-- 'public' (also listed on everyone's Playlists page).
+ALTER TABLE playlists ADD COLUMN IF NOT EXISTS sort_key TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE playlists ADD COLUMN IF NOT EXISTS source_playlist_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_playlists_shared ON playlists (visibility, updated_at DESC) WHERE visibility <> 'private';
+
+-- "Pause watch history", per profile. While paused nothing new is written to history,
+-- resume positions or watch time, so watching sends the recommender no new signal.
+CREATE TABLE IF NOT EXISTS user_history_settings (
+  user_key TEXT PRIMARY KEY,
+  paused BOOLEAN NOT NULL DEFAULT false,
+  paused_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- A deleted playlist or collection, kept as a snapshot so the toast's Undo can put it
+-- back with the same id. Rows older than a day are purged on the next delete.
+CREATE TABLE IF NOT EXISTS library_trash (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_key TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  snapshot JSONB NOT NULL,
+  deleted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_library_trash_user_time ON library_trash (user_key, deleted_at DESC);
 
 ALTER TABLE videos ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE videos ADD COLUMN IF NOT EXISTS duration_seconds INTEGER;
@@ -452,8 +498,8 @@ ALTER TABLE videos ADD COLUMN IF NOT EXISTS topic_vector_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_videos_topic_vector_missing ON videos (id) WHERE topic_vector IS NULL;
 
 -- Channels found in a Takeout archive's subscriptions.csv. Stored rather than acted on
--- immediately: subscribing writes to FreshRSS, and silently creating several hundred
--- feeds because somebody uploaded a file is not a decision this app should make alone.
+-- immediately: silently subscribing to several hundred channels because somebody
+-- uploaded a file is not a decision this app should make alone.
 CREATE TABLE IF NOT EXISTS takeout_subscriptions (
   user_key TEXT NOT NULL DEFAULT 'local',
   youtube_channel_id TEXT NOT NULL,
@@ -495,5 +541,164 @@ CREATE INDEX IF NOT EXISTS idx_recommendation_candidates_run_position ON recomme
 CREATE INDEX IF NOT EXISTS idx_recommendation_candidates_video ON recommendation_candidates (youtube_video_id);
 CREATE INDEX IF NOT EXISTS idx_feed_impressions_user_time ON feed_impressions (user_id, shown_at DESC);
 CREATE INDEX IF NOT EXISTS idx_feed_impressions_video_time ON feed_impressions (youtube_video_id, shown_at DESC);
+-- Ranker v2 rotation reads a user's impressions by the user_key stored in metadata.
+CREATE INDEX IF NOT EXISTS idx_feed_impressions_userkey_time ON feed_impressions ((metadata->>'user_key'), shown_at DESC);
 CREATE INDEX IF NOT EXISTS idx_user_channel_preferences_channel ON user_channel_preferences (youtube_channel_id);
 CREATE INDEX IF NOT EXISTS idx_gorse_sync_state_status ON gorse_sync_state (status, updated_at DESC);
+
+-- Household profiles inside one account (Settings -> Profiles). account_key is the
+-- account's own identity: the Authentik sub, or 'local' with sign-in off. Each profile
+-- has its own user_key, and every per-user table is keyed by user_key, so a profile is
+-- separated from the others without any change to those tables. The main profile's
+-- user_key IS the account_key, which is why adding profiles moves no existing data. A
+-- row appears only once somebody manages profiles; until then the account is its one
+-- implicit main profile. Subscriptions are per profile too (user_subscriptions).
+CREATE TABLE IF NOT EXISTS account_profiles (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_key TEXT NOT NULL,
+  user_key TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  color TEXT NOT NULL DEFAULT 'graphite',
+  is_kids BOOLEAN NOT NULL DEFAULT false,
+  is_main BOOLEAN NOT NULL DEFAULT false,
+  position INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_account_profiles_account ON account_profiles (account_key, position, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_account_profiles_one_main ON account_profiles (account_key) WHERE is_main;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_account_profiles_name ON account_profiles (account_key, lower(name));
+
+-- Provenance: which person brought a video into the shared catalog, or touched it. Videos,
+-- channels and related links are one catalog for the install (a cache of public YouTube
+-- data, like Invidious'), and those rows never say who caused them. This table does, so the
+-- per-person surfaces that read the catalog (recommendations, Home shelves, Shorts, Up next,
+-- library search) can stay inside what that person has a reason to see. One row per
+-- (person, video): `source` is the first reason (catalog_scope.SOURCES: 'search', 'watch',
+-- 'event', 'feedback', 'playlist', 'channel', 'discovery', 'takeout', 'download', 'catalog'),
+-- `first_seen` when.
+-- See catalog_scope.py and PRIVACY.md ("Shared catalog").
+CREATE TABLE IF NOT EXISTS video_provenance (
+  user_key TEXT NOT NULL,
+  video_id BIGINT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+  source TEXT NOT NULL,
+  first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_key, video_id)
+);
+CREATE INDEX IF NOT EXISTS idx_video_provenance_video ON video_provenance (video_id);
+-- The scope function reads feed entries by feed, and the classic ranker's subscription test
+-- by channel; neither had an index on that side.
+CREATE INDEX IF NOT EXISTS idx_feed_entries_subscription ON feed_entries (subscription_id);
+
+-- The catalog as it stood when an install first hosted a second person (a household profile,
+-- or sign-in turned on), claimed by the one person who had built it: every video id up to
+-- `through_video_id`. A range instead of one provenance row per video keeps the original
+-- owner's scope check a comparison (catalog_scope.claim_catalog).
+CREATE TABLE IF NOT EXISTS catalog_claims (
+  user_key TEXT PRIMARY KEY,
+  through_video_id BIGINT NOT NULL,
+  claimed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Every video one person has a reason to see, beyond their claimed range: their provenance
+-- rows, everything from the feeds and channels they follow, and videos discovered as related
+-- to either (one link, from video_discoveries). The ranker adds the related lists stored on
+-- those videos in memory (ranker.scope_mask). catalog_scope.video_filter_sql wraps it as
+-- `(v.id <= <claim> OR v.id IN (SELECT openfeed_video_scope(%s)))`.
+CREATE OR REPLACE FUNCTION openfeed_video_scope(p_user TEXT) RETURNS SETOF BIGINT
+LANGUAGE sql STABLE ROWS 4000 AS $$
+  WITH claim AS (
+    SELECT COALESCE(max(cc.through_video_id), 0) AS through FROM catalog_claims cc WHERE cc.user_key = p_user
+  ),
+  own AS MATERIALIZED (
+    SELECT vp.video_id AS id FROM video_provenance vp WHERE vp.user_key = p_user
+    UNION
+    SELECT v.id FROM videos v
+    WHERE v.channel_id IN (
+      SELECT c.id FROM channels c
+      JOIN feeds f ON f.youtube_channel_id = c.youtube_channel_id
+      JOIN user_subscriptions us ON us.feed_id = f.id
+      WHERE us.user_key = p_user)
+    UNION
+    SELECT fe.video_id FROM feed_entries fe
+    JOIN user_subscriptions us ON us.feed_id = fe.subscription_id
+    WHERE us.user_key = p_user AND fe.video_id IS NOT NULL
+  ),
+  related AS MATERIALIZED (
+    SELECT vd.discovered_video_id AS id FROM own JOIN video_discoveries vd ON vd.source_video_id = own.id
+  )
+  SELECT s.id FROM (
+    SELECT id FROM own
+    UNION
+    SELECT id FROM related
+    UNION
+    SELECT vd.discovered_video_id FROM video_discoveries vd, claim
+    WHERE claim.through > 0 AND vd.source_video_id <= claim.through AND vd.discovered_video_id > claim.through
+  ) s
+  WHERE s.id > (SELECT through FROM claim)
+$$;
+
+-- Watching, rating, saving and downloading a video are reasons to see it, whatever code
+-- path wrote the row, so these are recorded by the database rather than by each caller.
+CREATE OR REPLACE FUNCTION openfeed_note_provenance() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.video_id IS NOT NULL AND NEW.user_key IS NOT NULL THEN
+    INSERT INTO video_provenance (user_key, video_id, source)
+    VALUES (NEW.user_key, NEW.video_id, TG_ARGV[0])
+    ON CONFLICT (user_key, video_id) DO NOTHING;
+  END IF;
+  RETURN NULL;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION openfeed_note_playlist_provenance() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.video_id IS NOT NULL THEN
+    INSERT INTO video_provenance (user_key, video_id, source)
+    SELECT p.user_key, NEW.video_id, 'playlist' FROM playlists p WHERE p.id = NEW.playlist_id
+    ON CONFLICT (user_key, video_id) DO NOTHING;
+  END IF;
+  RETURN NULL;
+END
+$$;
+
+-- Removing a video from history (one, several or all) deletes its progress row; the
+-- watching it recorded goes with it. Other reasons (a like, a playlist, a search) stay.
+CREATE OR REPLACE FUNCTION openfeed_forget_watch_provenance() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.video_id IS NOT NULL THEN
+    DELETE FROM video_provenance
+    WHERE user_key = OLD.user_key AND video_id = OLD.video_id AND source IN ('watch', 'event');
+  END IF;
+  RETURN NULL;
+END
+$$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'openfeed_provenance_progress_forget') THEN
+    CREATE TRIGGER openfeed_provenance_progress_forget AFTER DELETE ON playback_progress
+      FOR EACH ROW EXECUTE FUNCTION openfeed_forget_watch_provenance();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'openfeed_provenance_progress') THEN
+    CREATE TRIGGER openfeed_provenance_progress AFTER INSERT ON playback_progress
+      FOR EACH ROW EXECUTE FUNCTION openfeed_note_provenance('watch');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'openfeed_provenance_events') THEN
+    CREATE TRIGGER openfeed_provenance_events AFTER INSERT ON user_video_events
+      FOR EACH ROW EXECUTE FUNCTION openfeed_note_provenance('event');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'openfeed_provenance_feedback') THEN
+    CREATE TRIGGER openfeed_provenance_feedback AFTER INSERT ON user_video_feedback
+      FOR EACH ROW EXECUTE FUNCTION openfeed_note_provenance('feedback');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'openfeed_provenance_downloads') THEN
+    CREATE TRIGGER openfeed_provenance_downloads AFTER INSERT ON downloads
+      FOR EACH ROW EXECUTE FUNCTION openfeed_note_provenance('download');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'openfeed_provenance_playlist_items') THEN
+    CREATE TRIGGER openfeed_provenance_playlist_items AFTER INSERT ON playlist_items
+      FOR EACH ROW EXECUTE FUNCTION openfeed_note_playlist_provenance();
+  END IF;
+END
+$$;

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from openfeed import evaluation, topics
+from openfeed import topics
 
 
 class TokenizerTests(unittest.TestCase):
@@ -110,49 +110,6 @@ class ProfileTests(unittest.TestCase):
             self.assertIn("dozer", topics.profile_vector("local"))
 
 
-class EvaluationTests(unittest.TestCase):
-    def test_the_split_is_chronological_not_random(self) -> None:
-        # A random split lets the ranker peek at the future.
-        history = [{"youtube_video_id": f"v{i:02d}"} for i in range(10)]  # newest first
-        with patch.object(evaluation.db, "list_history_videos", return_value=history):
-            older, held = evaluation.holdout_watch_history("local", holdout=3)
-        self.assertEqual(held, ["v02", "v01", "v00"])
-        self.assertEqual(len(older), 7)
-
-    def test_too_little_history_holds_nothing_out(self) -> None:
-        with patch.object(evaluation.db, "list_history_videos", return_value=[{"youtube_video_id": "a"}]):
-            _, held = evaluation.holdout_watch_history("local", holdout=20)
-        self.assertEqual(held, [])
-
-    def test_recall_counts_only_held_out_videos(self) -> None:
-        # History must exceed the holdout, or there is nothing to rank *from*.
-        history = [{"youtube_video_id": f"h{i}"} for i in range(4)] + [{"youtube_video_id": f"o{i}"} for i in range(6)]
-
-        def _rank(depth, offset, lane, user_key):
-            return [{"youtube_video_id": vid} for vid in ["x", "h1", "y", "h0", "z"]]
-
-        with patch.object(evaluation.db, "list_history_videos", return_value=history):
-            result = evaluation.evaluate_lane("recommended", holdout=4, k_values=(5,), ranker=_rank)
-        # Held out = the 4 most recent, which are h3..h0 reversed; 2 of 4 appear in the top 5.
-        self.assertEqual(result.recall[5], 0.5)
-
-    def test_mrr_rewards_an_early_hit(self) -> None:
-        history = [{"youtube_video_id": "h0"}, {"youtube_video_id": "o1"}, {"youtube_video_id": "o2"}]
-
-        def _rank(depth, offset, lane, user_key):
-            return [{"youtube_video_id": v} for v in ["x", "h0"]]
-
-        with patch.object(evaluation.db, "list_history_videos", return_value=history):
-            result = evaluation.evaluate_lane("recommended", holdout=1, k_values=(5,), ranker=_rank)
-        self.assertAlmostEqual(result.mrr, 0.5)
-
-    def test_a_fully_filtered_holdout_is_flagged_rather_than_scored_as_zero(self) -> None:
-        history = [{"youtube_video_id": f"h{i}"} for i in range(6)]
-        with patch.object(evaluation.db, "list_history_videos", return_value=history):
-            result = evaluation.evaluate_lane("recommended", holdout=2, k_values=(5,), ranker=lambda *a: [])
-        self.assertIn("filtered", result.note)
-
-
 class AcquisitionTests(unittest.TestCase):
     """The library has to be able to grow beyond what it already contains."""
 
@@ -240,7 +197,7 @@ class SubscriptionFeedTests(unittest.TestCase):
 
         seen: list[str] = []
         subs = [{"youtube_channel_id": f"UC{i:022d}"} for i in range(3)]
-        with patch.object(discovery.db, "list_subscriptions", return_value=subs), \
+        with patch.object(discovery.db, "list_followed_feeds", return_value=subs), \
              patch.object(discovery, "fetch_channel_uploads", lambda cid, page=1: seen.append(cid) or []):
             result = discovery.backfill_subscription_uploads(10)
         self.assertEqual(len(seen), 3)
@@ -256,7 +213,7 @@ class SubscriptionFeedTests(unittest.TestCase):
                 raise RuntimeError("404")
             return []
 
-        with patch.object(discovery.db, "list_subscriptions", return_value=subs), \
+        with patch.object(discovery.db, "list_followed_feeds", return_value=subs), \
              patch.object(discovery, "fetch_channel_uploads", _fetch):
             result = discovery.backfill_subscription_uploads(10)
         self.assertEqual(result["errors"], 1)

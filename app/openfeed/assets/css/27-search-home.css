@@ -1,0 +1,71 @@
+/* Search type-ahead and recents, In your playlists, Watch later on cards, the Not
+   interested list, pull to refresh and Back to top (assets/js/search-home.js). */
+
+/* ---------- type-ahead ----------
+   The header form clips its children (overflow: hidden), so the list is its sibling,
+   placed under it by the script. It is a menu panel: Overlay Ash, hairline, 14px. */
+.suggest-panel { position: absolute; z-index: 95; display: grid; gap: 1px; padding: 6px 0; max-height: min(480px, calc(100dvh - 90px)); overflow-y: auto; border: 1px solid var(--border); border-radius: var(--r-menu); background: var(--menu); box-shadow: var(--shadow); color: var(--text); }
+.suggest-panel[hidden] { display: none; }
+.suggest-row { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 14px; min-height: 36px; padding: 0 6px 0 16px; cursor: pointer; font-size: 14.5px; }
+.suggest-row > .icon { width: 18px; height: 18px; color: var(--muted); }
+.suggest-row:hover, .suggest-row[aria-selected="true"] { background: var(--surface-3); }
+.suggest-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.suggest-text b { font-weight: 650; }
+/* Your own searches read in Smoke beside the clock, the way YouTube marks history. */
+.suggest-row.is-recent .suggest-text { color: var(--muted); }
+.suggest-row.is-recent .suggest-text b { color: var(--text); }
+.suggest-remove { position: relative; display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 999px; background: none; color: var(--muted-2); cursor: pointer; font-size: 12.5px; transition: background var(--dur-press) ease, color var(--dur-press) ease; }
+.suggest-remove .icon { width: 15px; height: 15px; }
+.suggest-remove:hover { background: var(--surface-2); color: var(--text); }
+.suggest-remove:active { transform: scale(.96); }
+/* In the phone takeover the list is the sheet's body, flush like the recents it replaces. */
+.suggest-panel.is-inline { position: static; flex: 1; min-height: 0; max-height: none; align-content: start; padding: 8px 0 calc(16px + var(--safe-bottom)); border: 0; border-radius: 0; background: none; box-shadow: none; overscroll-behavior: contain; }
+.suggest-panel.is-inline .suggest-row { min-height: 48px; }
+.search-sheet-body[hidden] { display: none; }
+@media (pointer: coarse) {
+  .suggest-row { min-height: 44px; }
+  .suggest-remove { width: 44px; height: 44px; }
+}
+
+/* ---------- search: In your playlists, and section titles on list pages ---------- */
+.search-section-title { margin: 4px 0 8px; font-size: 14.5px; font-weight: 650; letter-spacing: -.005em; }
+.search-playlist-hits { max-width: 1080px; padding-bottom: 8px; margin-bottom: 12px; border-bottom: 1px solid var(--border-soft); }
+
+/* ---------- Watch later on a card ---------- */
+.card-quick-button[aria-pressed="true"] { background: var(--bone); border-color: var(--bone); color: var(--on-bone); }
+.card-quick-button[aria-pressed="true"]:hover { background: var(--bone-hover); }
+
+/* ---------- Not interested ---------- */
+.interest-section { margin-bottom: 20px; }
+.interest-section[hidden] { display: none; }
+.media-row.library-row.interest-channel { grid-template-columns: 40px minmax(0, 1fr) auto; }
+.interest-channel .avatar { width: 40px; height: 40px; }
+.interest-channel h2 { margin: 0; font-size: 14.5px; font-weight: 550; }
+
+/* ---------- pull to refresh ----------
+   A Graphite disc that follows the finger down under the header and turns as it comes.
+   It is the one turning element in the app, by request: the feed itself shows its
+   skeleton while it reloads. */
+html.has-pull-refresh, html.has-pull-refresh body { overscroll-behavior-y: contain; }
+.pull-refresh { --pull: 0px; --pull-turn: 0deg; position: fixed; top: var(--header); left: 50%; z-index: 70; pointer-events: none; opacity: 0; transform: translate(-50%, calc(var(--pull) - 44px)); transition: transform 200ms var(--ease-press), opacity 160ms ease; }
+.pull-refresh.is-pulling { opacity: 1; transition: none; }
+.pull-refresh.is-refreshing { opacity: 1; transition: transform 200ms var(--ease-press); }
+.pull-refresh-disc { display: grid; place-items: center; width: 36px; height: 36px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-3); color: var(--muted); box-shadow: var(--shadow); }
+.pull-refresh-disc .icon { width: 18px; height: 18px; transform: rotate(var(--pull-turn)); }
+.pull-refresh.is-armed .pull-refresh-disc { color: var(--text); }
+.pull-refresh.is-refreshing .pull-refresh-disc .icon { animation: pull-refresh-turn 800ms linear infinite; }
+@keyframes pull-refresh-turn { to { transform: rotate(360deg); } }
+
+/* ---------- Back to top ---------- */
+.back-to-top.btn { position: fixed; right: max(24px, var(--safe-right)); bottom: 24px; z-index: 70; display: inline-flex; align-items: center; gap: 6px; min-height: 36px; padding: 0 15px 0 11px; border-color: var(--border); background: var(--surface-3); box-shadow: var(--shadow); font-size: 13px; font-weight: 550; }
+.back-to-top.btn[hidden] { display: none; }
+.back-to-top.btn:active { transform: scale(.96); }
+@media (max-width: 900px) {
+  .back-to-top.btn { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .suggest-remove, .pull-refresh { transition: none; }
+  .suggest-remove:active, .back-to-top.btn:active { transform: none; }
+  .pull-refresh.is-refreshing .pull-refresh-disc .icon { animation: none; }
+}

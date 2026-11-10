@@ -396,8 +396,9 @@ class StreamProxyTests(unittest.TestCase):
         request = SimpleNamespace(headers={})
         with patch.object(main, "_login_required_redirect", return_value=None), \
              patch.object(main.ytdlp, "playback_stream", return_value={"stream_url": "https://x/1", "stream_type": "video/mp4"}), \
-             patch.object(main, "_invidious_client", return_value=_Client()), \
-             patch.object(main, "mark_source_result", lambda *a, **k: None):
+             patch.object(main.outbound, "media_client", return_value=_Client()), \
+             patch.object(main, "mark_source_result", lambda *a, **k: None), \
+             patch.object(main.netguard, "assert_public_url", lambda url, **k: url):
             main.api_ytdlp_stream(request, "vid1")
         # googlevideo answers with a 302 to another host; passing it through would send
         # the browser to Google directly and leak the address the proxy hides.
@@ -430,8 +431,9 @@ class StreamProxyTests(unittest.TestCase):
         request = SimpleNamespace(headers={"range": "bytes=0-9"})
         with patch.object(main, "_login_required_redirect", return_value=None), \
              patch.object(main.ytdlp, "playback_stream", return_value={"stream_url": "https://x/1", "stream_type": "video/mp4"}), \
-             patch.object(main, "_invidious_client", return_value=_Client()), \
-             patch.object(main, "mark_source_result", lambda *a, **k: None):
+             patch.object(main.outbound, "media_client", return_value=_Client()), \
+             patch.object(main, "mark_source_result", lambda *a, **k: None), \
+             patch.object(main.netguard, "assert_public_url", lambda url, **k: url):
             response = main.api_ytdlp_stream(request, "vid1")
         self.assertEqual(captured["headers"].get("range"), "bytes=0-9")
         self.assertEqual(response.status_code, 206)

@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime
 from unittest.mock import patch
 
-from openfeed import posts
+from openfeed import main, posts
 
 
 class ReadOnlyTests(unittest.TestCase):
@@ -159,3 +159,28 @@ class ChannelPostsTests(unittest.TestCase):
         with patch.object(posts, "channel_posts", _page):
             found = posts.subscription_posts(["UC" + "a" * 22, "UC" + "b" * 22])
         self.assertEqual(len(found), 1)
+
+
+class PollCardTests(unittest.TestCase):
+    """PRODUCT.md: poll results are simulated locally and must stay labelled so."""
+
+    POST = {"post_id": "UgkxAbc", "author": "A", "attachment": {"type": "poll", "choices": ["Yes", "No"], "total_votes": 10}}
+
+    def _card(self, vote: int | None = None) -> str:
+        return main._post_card(self.POST, vote)
+
+    def test_the_poll_says_it_is_simulated(self) -> None:
+        self.assertIn('<p class="poll-label">Simulated locally</p>', self._card())
+
+    def test_no_row_claims_a_share_of_the_vote(self) -> None:
+        self.assertNotIn("poll-bar", self._card(0))
+        self.assertNotIn("%", self._card(0))
+
+    def test_the_picked_row_is_marked(self) -> None:
+        self.assertIn("is-picked", self._card(1))
+        self.assertNotIn("is-picked", self._card(None))
+
+    def test_selection_is_inversion_not_ember(self) -> None:
+        css = main._home_styles()
+        self.assertIn(".poll-choice.is-picked, .poll-choice.is-picked:hover { background: var(--bone); color: var(--on-bone);", css)
+        self.assertNotIn(".poll-choice.is-picked { border-color: var(--accent); }", css)

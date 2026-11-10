@@ -11,6 +11,7 @@ readable output, which is formatted for people and changes between releases.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import secrets
@@ -66,6 +67,10 @@ class DownloadJob:
     # means it joins the library and is kept until the user deletes it.
     destination: str = "local"
     user_key: str = "local"
+    # A member's storage quota for kept downloads (0 = none), and the account it counts
+    # against: every profile of an account shares one quota.
+    quota_bytes: int = 0
+    quota_account: str = ""
     status: str = "queued"  # queued | downloading | merging | done | error | cancelled
     percent: float = 0.0
     downloaded_bytes: int = 0
@@ -134,6 +139,8 @@ class DownloadManager:
         title: str = "",
         destination: str = "local",
         user_key: str = "local",
+        quota_bytes: int = 0,
+        quota_account: str = "",
     ) -> DownloadJob:
         settings = get_settings()
         if self.active_count() >= max(1, settings.download_max_concurrent):
@@ -146,6 +153,8 @@ class DownloadManager:
             title=title,
             destination="server" if destination == "server" else "local",
             user_key=user_key,
+            quota_bytes=max(0, int(quota_bytes or 0)),
+            quota_account=quota_account or user_key.split(":p:", 1)[0],
         )
         with self._lock:
             self._jobs[job.id] = job
@@ -193,6 +202,43 @@ class DownloadManager:
             "--", ytdlp.watch_url(job.youtube_video_id),
         ]
 
+    def _stall_watchdog(self, job: DownloadJob) -> None:
+        """Terminate a download whose byte counter has stopped moving.
+
+        A stalled peer connection can park yt-dlp inside the reader loop forever: while
+        it waits on the socket it prints nothing, so `for line in process.stdout` never
+        returns and the job sits in `downloading` indefinitely. This watchdog runs the
+        other way around — it notices silence and ends the process. Merging counts as
+        progress-free by design, so it is not policed here.
+        """
+        grace = max(0, int(get_settings().download_stall_seconds))
+        if not grace:
+            return
+        last_bytes = -1
+        last_change = time.monotonic()
+        while True:
+            time.sleep(min(15, max(2, grace // 8)))
+            if job.status != "downloading":
+                return
+            if job.downloaded_bytes != last_bytes:
+                last_bytes = job.downloaded_bytes
+                last_change = time.monotonic()
+                continue
+            if time.monotonic() - last_change <= grace:
+                continue
+            process = job._process
+            if process and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except Exception:
+                    process.kill()
+            if job.status == "downloading":
+                job.status = "error"
+                job.error = f"Download stalled: no progress for {grace}s"
+                self._discard_file(job)
+            return
+
     def _apply_progress(self, job: DownloadJob, line: str) -> None:
         parts = line[len(_PROGRESS_PREFIX):].split("|")
         if len(parts) < 6:
@@ -231,6 +277,12 @@ class DownloadManager:
                 bufsize=1,
             )
             job._process = process
+            threading.Thread(
+                target=self._stall_watchdog,
+                args=(job,),
+                name=f"download-stall-{job.id}",
+                daemon=True,
+            ).start()
             tail: list[str] = []
             assert process.stdout is not None
             for line in process.stdout:
@@ -268,6 +320,25 @@ class DownloadManager:
             if job.destination == "server":
                 from . import db  # local import keeps this module importable without a database
 
+                if job.quota_bytes:
+                    used = account_usage_bytes(job.quota_account, (job.user_key, job.youtube_video_id))
+                    if used + job.total_bytes > job.quota_bytes:
+                        raise RuntimeError(
+                            "This would go over your storage quota on this server "
+                            f"({_size_text(used)} of {_size_text(job.quota_bytes)} used, this file is {_size_text(job.total_bytes)}). "
+                            "Delete some downloads, or download it to this device instead."
+                        )
+                # Identical bytes already kept for someone else share one file on disk.
+                # Each owner still has their own row (and is charged the full size), and
+                # deleting a row unlinks the file only once nothing references it.
+                shared = identical_kept_file(path, job.youtube_video_id)
+                if shared is not None:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                    path = shared
+                    job.path = str(path)
                 db.register_download(
                     job.youtube_video_id,
                     job.title or job.youtube_video_id,
@@ -375,17 +446,19 @@ def disk_usage() -> dict[str, Any]:
     """What the download directory is currently costing, for the status page."""
     directory = Path(get_settings().download_dir)
     if not directory.exists():
-        return {"files": 0, "bytes": 0, "path": str(directory), "free_bytes": None}
+        return {"files": 0, "bytes": 0, "path": str(directory), "free_bytes": None, "total_bytes": None}
     files = [path for path in directory.iterdir() if path.is_file()]
     try:
-        free = shutil.disk_usage(directory).free
+        disk = shutil.disk_usage(directory)
+        free, total = disk.free, disk.total
     except OSError:
-        free = None
+        free, total = None, None
     return {
         "files": len(files),
         "bytes": sum(path.stat().st_size for path in files),
         "path": str(directory),
         "free_bytes": free,
+        "total_bytes": total,
     }
 
 
@@ -417,6 +490,81 @@ def resolve_completed_path(job: DownloadJob) -> Path | None:
     return path if path.is_file() else None
 
 
+def account_usage_bytes(account_key: str, replacing: tuple[str, str] | None = None) -> int:
+    """Bytes of kept downloads charged to an account: its own rows and its profiles'.
+
+    replacing=(user_key, video id) leaves out the row a new download of that video will
+    replace (register_download keeps one row per owner and video)."""
+    from . import db
+
+    key = str(account_key or "local").split(":p:", 1)[0]
+    skip_owner, skip_video = replacing or ("", "")
+    with db.connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(size_bytes), 0) AS used FROM downloads
+                WHERE (user_key = %s OR user_key LIKE %s)
+                  AND NOT (user_key = %s AND youtube_video_id = %s)
+                """,
+                (key, db.escape_like_pattern(key) + ":p:%", skip_owner, skip_video),
+            )
+            row = cur.fetchone() or {}
+    return int(row.get("used") or 0)
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def identical_kept_file(path: Path, youtube_video_id: str) -> Path | None:
+    """A kept file of the same video with exactly these bytes, if one exists.
+
+    Candidates are other library rows for the video whose file is the same size; only
+    those are hashed. The answer never decides whether a download runs (that would tell
+    one user what another kept), only where its finished bytes are stored.
+    """
+    from . import db
+
+    try:
+        size = path.stat().st_size
+        directory = Path(get_settings().download_dir).resolve()
+        with db.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT path FROM downloads WHERE youtube_video_id = %s", (youtube_video_id,))
+                candidates = [str(row["path"]) for row in cur.fetchall() if row.get("path")]
+        own_digest = ""
+        for raw in candidates:
+            candidate = Path(raw).resolve()
+            if candidate == path.resolve() or not candidate.is_file():
+                continue
+            try:
+                candidate.relative_to(directory)
+            except ValueError:
+                continue
+            if candidate.stat().st_size != size:
+                continue
+            own_digest = own_digest or _file_digest(path)
+            if _file_digest(candidate) == own_digest:
+                return candidate
+    except Exception as exc:  # noqa: BLE001 - keeping a second copy is always safe
+        logger.info("could not compare a new download with kept files: %s", exc)
+    return None
+
+
+def _size_text(value: int) -> str:
+    size = float(max(0, int(value or 0)))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if size >= 10 or unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
 __all__ = [
     "DownloadJob",
     "DownloadManager",
@@ -425,4 +573,6 @@ __all__ = [
     "ffmpeg_version",
     "resolve_completed_path",
     "safe_filename",
+    "account_usage_bytes",
+    "identical_kept_file",
 ]

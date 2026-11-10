@@ -85,16 +85,21 @@ class AboutDialogTests(unittest.TestCase):
 
 
 class AboutInlineTests(unittest.TestCase):
-    """Expanding in place moved the avatar, so the inline copy stays one line."""
+    """Expanding in place moved the header, so the inline copy stays two clamped lines."""
 
     def test_the_inline_description_opens_the_dialog_rather_than_expanding(self) -> None:
         source = main._home_script()
         self.assertIn("data-ch-about-open", source)
         self.assertNotIn("data-ch-about-toggle", source)
 
-    def test_the_one_line_clamp_cannot_grow(self) -> None:
+    def test_the_two_line_clamp_cannot_grow_or_widen_the_page(self) -> None:
         css = main._home_styles()
-        self.assertIn(".ch-about-short { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }", css)
+        rule = css[css.index(".ch-about-short {"):]
+        rule = rule[:rule.index("}")]
+        self.assertIn("-webkit-line-clamp: 2", rule)
+        self.assertIn("overflow: hidden", rule)
+        # A nowrap here is what pushed the phone layout out to 505px.
+        self.assertNotIn("nowrap", rule)
 
     def test_clicking_the_backdrop_closes_it(self) -> None:
         self.assertIn("dialog.ch-about-dialog", main._home_script())
@@ -153,6 +158,61 @@ class ChannelSearchTests(unittest.TestCase):
     def test_it_survives_on_narrow_screens_instead_of_disappearing(self) -> None:
         css = main._home_styles()
         self.assertNotIn(".ch-search { display: none; }", css)
+
+
+class ChannelRowTests(unittest.TestCase):
+    """The manager row and the search result, which both show real state or none."""
+
+    def _row(self, **kwargs) -> str:
+        subscription = {"id": "s1", "title": "Chan", "youtube_channel_id": "UC1", "feed_url": "https://f", "video_count": 2}
+        subscription.update(kwargs.pop("subscription", {}))
+        return main._subscription_card(subscription, **kwargs)
+
+    def test_no_bell_unless_the_caller_read_the_setting(self) -> None:
+        self.assertNotIn("data-notify-menu", self._row())
+        self.assertIn("data-notify-menu", self._row(notify_level="none"))
+
+    def test_row_keeps_the_hooks_the_page_script_acts_on(self) -> None:
+        row = self._row()
+        for hook in ('data-subscription-card="s1"', 'data-channel-id="UC1"', "data-filter-item", "data-channel-collections", "data-unsubscribe-feed"):
+            self.assertIn(hook, row)
+
+    def test_collection_chips_name_two_and_count_the_rest(self) -> None:
+        row = self._row(collections=[("a", "One"), ("b", "Two"), ("c", "Three"), ("d", "Four")])
+        self.assertIn('href="/collection/a"', row)
+        self.assertNotIn('href="/collection/c"', row)
+        self.assertIn(">+2<", row)
+
+    def test_hostile_titles_stay_text(self) -> None:
+        evil = '"><script>alert(1)</script>'
+        self.assertNotIn(evil, self._row(subscription={"title": evil}, collections=[("a", evil)]))
+        self.assertNotIn(evil, main._channel_card({"youtube_channel_id": "UC1", "title": evil, "handle": evil}))
+
+    def test_a_scheme_other_than_http_never_becomes_a_link(self) -> None:
+        row = self._row(subscription={"youtube_channel_id": "", "html_url": "javascript:alert(1)", "feed_url": ""})
+        self.assertNotIn("javascript:", row)
+
+    def test_a_search_result_subscribe_is_not_a_second_primary(self) -> None:
+        css = main._home_styles()
+        self.assertIn(".channel-result .watch-subscribe:not(.subscribed) { background: var(--surface-2);", css)
+
+    def test_a_youtube_playlist_says_it_leaves_the_app_and_skips_google_images(self) -> None:
+        with patch.object(main, "get_settings", return_value=type("S", (), {"invidious_public_url": ""})()):
+            row = main._youtube_playlist_row({
+                "playlist_id": "PL1", "title": "P", "author": "A", "video_count": 3,
+                "thumbnail_url": "https://i.ytimg.com/pl_c/PL1/studio_square_thumbnail.jpg",
+            })
+        self.assertIn("Opens outside OpenFeed", row)
+        self.assertIn('target="_blank" rel="noopener noreferrer"', row)
+        self.assertNotIn("i.ytimg.com", row)
+
+    def test_a_real_youtube_playlist_opens_in_the_app(self) -> None:
+        row = main._youtube_playlist_row({
+            "playlist_id": "PL0vfts4VzfNgNVZIPX7VIS4w2dhuwCXbN", "title": "P", "author": "A", "video_count": 3,
+        })
+        self.assertIn('href="/playlist?list=PL0vfts4VzfNgNVZIPX7VIS4w2dhuwCXbN"', row)
+        self.assertNotIn("Opens outside OpenFeed", row)
+        self.assertNotIn('target="_blank"', row)
 
 
 class SubscriptionArtTests(unittest.TestCase):
@@ -252,7 +312,10 @@ class HeaderSpacingTests(unittest.TestCase):
     def test_the_actions_row_is_no_longer_two_pixels_apart(self) -> None:
         self.assertNotIn(".header-actions { display: flex; justify-content: flex-end; align-items: center; gap: 2px; }", main._home_styles())
 
-    def test_the_avatar_gets_extra_room_of_its_own(self) -> None:
-        # The bell is a 34px hit area around a 20px glyph; the avatar is a bare 28px
-        # circle, so an equal gap does not look equal.
-        self.assertIn(".header-actions .profile-menu { margin-left: 6px; }", main._home_styles())
+    def test_the_avatar_sits_in_the_same_hit_box_as_the_bell(self) -> None:
+        # The bell is a hit area around a 20px glyph. The avatar used to be a bare 28px
+        # circle, so an equal gap did not look equal. In the same box, one gap spaces both.
+        with patch.object(main, "_notification_items", return_value=([], 0)):
+            html = main._header_actions()
+        self.assertIn('<summary class="icon-button profile-trigger"', html)
+        self.assertNotIn(".header-actions .profile-menu { margin-left", main._home_styles())

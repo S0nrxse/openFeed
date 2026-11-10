@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from starlette.requests import Request
+from starlette.responses import Response
 
 from openfeed import db, main, playback
 
@@ -202,7 +206,7 @@ class SubscriptionStateTests(unittest.TestCase):
     """Subscription belongs to the channel, not to how a video happened to arrive."""
 
     def test_a_recommended_video_on_a_subscribed_channel_reads_as_subscribed(self) -> None:
-        # No freshrss_entries row, so only the channel-level column is populated. This is
+        # No feed_entries row, so only the channel-level column is populated. This is
         # the case that rendered "Subscribe" for an already-subscribed channel.
         video = {"channel_subscription_feed_url": "https://youtube.com/feeds/videos.xml?channel_id=UC1"}
         self.assertEqual(_feed(video), "https://youtube.com/feeds/videos.xml?channel_id=UC1")
@@ -224,34 +228,51 @@ class SubscriptionStateTests(unittest.TestCase):
         import inspect
 
         source = inspect.getsource(db.get_video_by_youtube_id)
-        self.assertIn("LEFT JOIN freshrss_subscriptions cs ON cs.youtube_channel_id = c.youtube_channel_id", source)
+        self.assertIn("LEFT JOIN {user_feeds_sql()} cs ON cs.youtube_channel_id = c.youtube_channel_id", source)
         self.assertIn("cs.feed_url AS channel_subscription_feed_url", source)
+
+    def test_subscription_columns_are_the_viewers_own(self) -> None:
+        from openfeed.tests.sqlcapture import _capture_sql
+
+        query, params = _capture_sql(lambda: db.get_video_by_youtube_id("vid", "alice"))
+        self.assertEqual(params, ("alice", "alice", "vid"))
+        self.assertEqual(query.count("us.user_key = %s"), 2)
+        # No viewer, no subscription: the join matches nobody's follows.
+        _, params = _capture_sql(lambda: db.get_video_by_youtube_id("vid"))
+        self.assertEqual(params, (None, None, "vid"))
 
 
 class SubscribeLocalTests(unittest.TestCase):
-    """Subscriptions are local rows: subscribing upserts, unsubscribing deletes the row only."""
+    """Subscribing upserts the shared feed and the caller's follow; unsubscribing removes
+    only the caller's follow."""
 
-    def _subscribe(self, **overrides) -> dict[str, object]:
+    _STORED = {"feed_id": "feed/x", "created": True}
+
+    def _subscribe(self, user_key: str = "u1", **overrides) -> dict[str, object]:
         params = {"youtube_channel_id": "UC1", "title": "Chan", "feed_url": "https://feed"}
         params.update(overrides)
         payload = main.SubscribeRequest(**params)
-        with patch.object(main.db, "upsert_subscription"), \
+        with patch.object(main, "_user_key", return_value=user_key), \
+             patch.object(main.db, "subscribe", return_value=self._STORED), \
              patch.object(main.db, "upsert_channel"), \
              patch.object(main, "_fetch_single_feed_best_effort"), \
              patch.object(main, "enrich_channel"):
-            return main.api_subscribe_freshrss(payload)
+            return main.api_subscribe(None, payload)
 
-    def test_subscribe_creates_a_local_row_and_succeeds(self) -> None:
-        with patch.object(main.db, "upsert_subscription") as upserted, \
+    def test_subscribe_creates_a_follow_for_the_caller_and_succeeds(self) -> None:
+        with patch.object(main, "_user_key", return_value="alice"), \
+             patch.object(main.db, "subscribe", return_value=self._STORED) as subscribed, \
              patch.object(main.db, "upsert_channel"), \
              patch.object(main, "_fetch_single_feed_best_effort"), \
              patch.object(main, "enrich_channel"):
-            result = main.api_subscribe_freshrss(
-                main.SubscribeRequest(youtube_channel_id="UC1", title="Chan", feed_url="https://feed")
+            result = main.api_subscribe(
+                None, main.SubscribeRequest(youtube_channel_id="UC1", title="Chan", feed_url="https://feed")
             )
         self.assertTrue(result["ok"])
         self.assertEqual(result["feed_url"], "https://feed")
-        upserted.assert_called_once()
+        self.assertEqual(set(result), {"ok", "feed_url", "youtube_channel_id", "title"})
+        subscribed.assert_called_once()
+        self.assertEqual(subscribed.call_args.args[0], "alice")
 
     def test_subscribing_twice_is_idempotent(self) -> None:
         self.assertTrue(self._subscribe()["ok"])
@@ -272,41 +293,50 @@ class SubscribeLocalTests(unittest.TestCase):
 
     def test_subscribe_canonicalizes_url_variants_to_one_row(self) -> None:
         channel = "UC" + "b" * 22
-        with patch.object(main.db, "upsert_subscription") as upserted, \
+        with patch.object(main, "_user_key", return_value="u1"), \
+             patch.object(main.db, "subscribe", return_value=self._STORED), \
              patch.object(main.db, "upsert_channel"), \
              patch.object(main, "_fetch_single_feed_best_effort"), \
              patch.object(main, "enrich_channel"):
-            first = main.api_subscribe_freshrss(
-                main.SubscribeRequest(youtube_channel_id=channel, title="C", feed_url="http://www.youtube.com/feeds/videos.xml?channel_id=" + channel + "/")
+            first = main.api_subscribe(
+                None, main.SubscribeRequest(youtube_channel_id=channel, title="C", feed_url="http://www.youtube.com/feeds/videos.xml?channel_id=" + channel + "/")
             )
-            second = main.api_subscribe_freshrss(
-                main.SubscribeRequest(youtube_channel_id="", title="C", feed_url="https://www.youtube.com/feeds/videos.xml?channel_id=" + channel)
+            second = main.api_subscribe(
+                None, main.SubscribeRequest(youtube_channel_id="", title="C", feed_url="https://www.youtube.com/feeds/videos.xml?channel_id=" + channel)
             )
         self.assertEqual(first["feed_url"], second["feed_url"])
         self.assertEqual(
             first["feed_url"], f"https://www.youtube.com/feeds/videos.xml?channel_id={channel}"
         )
 
-    def test_unsubscribe_removes_only_the_local_row(self) -> None:
+    def test_unsubscribe_removes_only_the_callers_follow(self) -> None:
         payload = main.SubscribeRequest(youtube_channel_id="UC1", title="Chan", feed_url="https://feed")
-        with patch.object(main.db, "remove_subscription", return_value=True) as removed:
-            result = main.api_unsubscribe_freshrss(payload)
-        removed.assert_called_once_with("https://feed", "UC1")
+        with patch.object(main, "_user_key", return_value="bob"), \
+             patch.object(main.db, "remove_subscription", return_value=1) as removed:
+            result = main.api_unsubscribe(None, payload)
+        removed.assert_called_once_with("https://feed", "UC1", user_key="bob")
         self.assertTrue(result["ok"])
         self.assertTrue(result["removed_local"])
 
     def test_unsubscribe_without_a_feed_or_channel_is_a_400(self) -> None:
         payload = main.SubscribeRequest(youtube_channel_id="", title="", feed_url="")
-        with self.assertRaises(main.HTTPException) as caught:
-            main.api_unsubscribe_freshrss(payload)
+        with patch.object(main, "_user_key", return_value="u1"), self.assertRaises(main.HTTPException) as caught:
+            main.api_unsubscribe(None, payload)
         self.assertEqual(caught.exception.status_code, 400)
 
     def test_unsubscribe_of_a_missing_row_is_a_404(self) -> None:
         payload = main.SubscribeRequest(youtube_channel_id="UC1", title="Chan", feed_url="https://feed")
-        with patch.object(main.db, "remove_subscription", return_value=0):
+        with patch.object(main, "_user_key", return_value="u1"), \
+             patch.object(main.db, "remove_subscription", return_value=0):
             with self.assertRaises(main.HTTPException) as caught:
-                main.api_unsubscribe_freshrss(payload)
+                main.api_unsubscribe(None, payload)
         self.assertEqual(caught.exception.status_code, 404)
+
+    def test_the_routes_are_the_plain_subscriptions_path(self) -> None:
+        routes = {(method, route.path) for route in main.app.routes for method in getattr(route, "methods", set())}
+        for method in ("GET", "POST", "DELETE"):
+            self.assertIn((method, "/api/subscriptions"), routes)
+        self.assertFalse(any(path.startswith("/api/subscriptions/") and path != "/api/subscriptions/bulk" for _, path in routes))
 
 
 class WatchOptionsMenuTests(unittest.TestCase):
@@ -481,12 +511,197 @@ class EmbedChromeTests(unittest.TestCase):
         script = main._player_script()
         self.assertIn(".player-dimensions.vjs-fluid, .video-js.vjs-fluid { padding-top: 56.25% !important; }", script)
 
-    def test_hover_chrome_is_gradients_not_a_dim(self) -> None:
-        # A solid bar and title card fading in read as the video dimming; faint
-        # gradients keep the controls readable without that.
+    def test_the_chrome_is_a_flat_scrim(self) -> None:
+        # OpenFeed's chrome is one flat scrim. A gradient behind the controls is out of
+        # system, and the solid stock bar read as the whole video dimming.
         script = main._player_script()
-        self.assertIn(".video-js .vjs-control-bar { background: linear-gradient(transparent, rgba(0, 0, 0, .65)) !important; }", script)
-        self.assertIn(".video-js .vjs-overlay { background: linear-gradient(rgba(0, 0, 0, .55), transparent) !important;", script)
+        self.assertIn(".video-js .vjs-control-bar { background: var(--of-scrim) !important;", script)
+        self.assertIn(".video-js .vjs-overlay { background: var(--of-scrim) !important;", script)
+        self.assertNotIn("linear-gradient(transparent", script)
+
+    def test_the_scrubber_is_ember_over_dry_slate(self) -> None:
+        css = main._player_chrome_css()
+        self.assertIn("background: var(--of-ember) !important;", css)
+        self.assertIn("background: var(--of-slate) !important;", css)
+        self.assertIn(".vjs-progress-control:hover .vjs-progress-holder", css)
+
+    def test_the_big_play_button_is_centred_and_not_a_colour_fill(self) -> None:
+        # video.js parks it top left, which is the grey box testers kept reporting.
+        css = main._player_chrome_css()
+        self.assertIn("top: 50%; left: 50%; width: 64px; height: 64px;", css)
+        self.assertIn(".video-js .vjs-big-play-button, .video-js:hover .vjs-big-play-button { background-color: var(--of-scrim) !important; }", css)
+
+    def test_the_chrome_survives_being_spliced_into_a_template_literal(self) -> None:
+        # _player_script() pastes this into a JavaScript template literal.
+        css = main._player_chrome_css()
+        for forbidden in ("`", "\\", "${"):
+            self.assertNotIn(forbidden, css)
+        self.assertNotIn("__OPENFEED_PLAYER_CHROME__", main._player_script())
+
+    def test_stock_video_js_never_shows_while_the_style_is_on_its_way(self) -> None:
+        script = main._player_script()
+        self.assertIn("tipify(doc);", script)
+        self.assertIn("data-tip", main._native_player_page("/x", "Downloaded", True).body.decode())
+
+
+class NativePlayerTests(unittest.TestCase):
+    """/local and /ytdlp wear the same chrome, without needing Invidious to be up."""
+
+    def _page(self, autoplay: bool = True) -> str:
+        return main._native_player_page("/api/ytdlp/stream/abc#t=0", "Direct stream &middot; 720p", autoplay).body.decode()
+
+    def test_it_uses_the_shared_stylesheet(self) -> None:
+        self.assertIn(main._player_chrome_css(), self._page())
+
+    def test_it_borrows_nothing_from_behind_invidious(self) -> None:
+        self.assertNotIn("/videojs/", self._page())
+
+    def test_native_controls_stay_until_the_script_replaces_them(self) -> None:
+        self.assertIn("<video controls playsinline", self._page())
+        self.assertIn("video.controls = false;", self._page())
+
+    def test_autoplay_is_only_set_when_asked_for(self) -> None:
+        self.assertIn(" autoplay src=", self._page(True))
+        self.assertNotIn(" autoplay src=", self._page(False))
+
+    def test_the_style_guard_is_already_satisfied(self) -> None:
+        # The shell injects the chrome unless this id is present, so it is never doubled.
+        self.assertIn('<style id="openfeed-embed-style">', self._page())
+
+
+class PlayerCspTests(unittest.TestCase):
+    """Part of the security hardening: only the embed gets its two extra sources."""
+
+    BASE = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'self'; "
+        "frame-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; "
+        "form-action 'self'; frame-ancestors 'self'"
+    )
+
+    def _csp(self, path: str) -> str:
+        scope = {"type": "http", "method": "GET", "path": path, "query_string": b"", "headers": [],
+                 "scheme": "http", "server": ("testserver", 80)}
+
+        async def call_next(_request: Request) -> Response:
+            return Response()
+
+        response = asyncio.run(main.harden_http(Request(scope), call_next))
+        return response.headers["Content-Security-Policy"]
+
+    def test_the_embed_gets_exactly_the_font_and_worker_it_needs(self) -> None:
+        expected = self.BASE.replace("font-src 'self';", "font-src 'self' data:;").replace("worker-src 'self';", "worker-src 'self' blob:;")
+        self.assertEqual(self._csp("/embed/abc"), expected)
+
+    def test_every_other_page_keeps_the_base_policy(self) -> None:
+        for path in ("/", "/watch/abc", "/watch/abc/player", "/watch/abc/local", "/watch/abc/ytdlp", "/shorts", "/embed"):
+            self.assertEqual(self._csp(path), self.BASE, path)
+
+    def test_the_api_stays_unframeable(self) -> None:
+        self.assertEqual(self._csp("/api/playback/sources"), "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+
+
+class PlaybackFailureCardTests(unittest.TestCase):
+    """Fail loudly and name the cause: the card is built from the ladder and the walk."""
+
+    def test_a_blocked_frame_is_a_failure_not_a_healthy_start(self) -> None:
+        script = main._player_script()
+        self.assertIn("securitypolicyviolation", script)
+        self.assertIn("reported.delete(`${source.id}:true`)", script)
+
+    def test_an_unreadable_same_origin_frame_moves_on(self) -> None:
+        self.assertIn("if (!watchSameOrigin()) next('frame error');", main._player_script())
+
+    def test_the_cause_comes_from_the_real_diagnosis(self) -> None:
+        script = main._player_script()
+        self.assertIn("/api/playback/diagnose?video_id=", script)
+        self.assertIn("diagnosis.headline", script)
+
+    def test_every_action_is_wired(self) -> None:
+        script = main._player_script()
+        for name in ("retry", "next", "diagnostics", "copy"):
+            self.assertIn(f"part('{name}').addEventListener", script)
+
+    def test_a_recovering_player_is_not_reported_as_failed(self) -> None:
+        # Invidious's dash player retries by itself; only a lasting error opens the card.
+        self.assertIn("RECOVERY_GRACE", main._player_script())
+
+    def test_the_report_text_keeps_its_newline_escape(self) -> None:
+        # A bare newline here is a syntax error in the shipped script, and the player dies.
+        self.assertIn("lines.join('\\n')", main._player_script())
+
+
+class ChapterTests(unittest.TestCase):
+    LIST = "Intro\n0:00 Start\n1:23 Middle part\n12:34 - The end\nThanks for watching 99:99"
+
+    def test_a_plain_list_parses(self) -> None:
+        self.assertEqual(
+            [(c["start"], c["title"]) for c in main._parse_chapters(self.LIST)],
+            [(0, "Start"), (83, "Middle part"), (754, "The end")],
+        )
+
+    def test_the_range_form_parses(self) -> None:
+        text = "00:00:00-00:17:13 Eagles\n00:17:14-00:26:22 Jayden Reed\n00:26:23-00:41:33 Breaking"
+        chapters = main._parse_chapters(text)
+        self.assertEqual([c["start"] for c in chapters], [0, 1034, 1583])
+        self.assertEqual(chapters[1]["title"], "Jayden Reed")
+
+    def test_timestamps_in_prose_are_not_chapters(self) -> None:
+        self.assertEqual(main._parse_chapters("We air live at 4:00 pm\nand again at 11:15 pm"), [])
+
+    def test_a_list_must_start_at_zero(self) -> None:
+        self.assertEqual(main._parse_chapters("1:00 One\n2:00 Two\n3:00 Three"), [])
+
+    def test_two_entries_are_not_chapters(self) -> None:
+        self.assertEqual(main._parse_chapters("0:00 One\n2:00 Two"), [])
+
+    def test_entries_closer_than_ten_seconds_are_dropped(self) -> None:
+        chapters = main._parse_chapters("0:00 One\n0:05 Too soon\n1:00 Two\n2:00 Three")
+        self.assertEqual([c["title"] for c in chapters], ["One", "Two", "Three"])
+
+    def test_entries_past_the_end_of_the_video_are_dropped(self) -> None:
+        chapters = main._parse_chapters("0:00 One\n1:00 Two\n2:00 Three\n9:00 Four", 300)
+        self.assertEqual(len(chapters), 3)
+
+    def test_titles_are_escaped_in_the_panel(self) -> None:
+        html = main._chapter_card([{"start": 0, "label": "0:00", "title": "<img src=x onerror=alert(1)>"}])
+        self.assertNotIn("<img", html)
+        self.assertIn("&lt;img", html)
+
+    def test_no_chapters_means_no_card(self) -> None:
+        self.assertEqual(main._chapter_card([]), "")
+
+    def test_rows_use_the_shared_seek_hook(self) -> None:
+        html = main._chapter_card([{"start": 83, "label": "1:23", "title": "Middle"}])
+        self.assertIn('data-seek="83"', html)
+        self.assertIn('data-chapter-start="83"', html)
+
+
+class CommentSortTests(unittest.TestCase):
+    def test_newest_is_the_sources_own_sort(self) -> None:
+        source = inspect.getsource(main.api_comments)
+        self.assertIn('params["sort_by"] = "new"', source)
+        self.assertIn('if sort == "new":', source)
+
+    def test_timed_says_it_only_covers_what_has_loaded(self) -> None:
+        self.assertIn("loaded comments name a time in the video", main._home_script())
+
+    def test_there_is_no_composer(self) -> None:
+        source = inspect.getsource(main.watch_video)
+        self.assertNotIn("<textarea", source)
+
+
+class WatchActionRowTests(unittest.TestCase):
+    def test_the_theater_row_has_a_clean_name(self) -> None:
+        # The shortcut hint is its own span, so the accessible name read "Theater modet".
+        html = main._watch_options_menu("vid1", "", "https://yt")
+        self.assertIn('aria-label="Theater mode"', html)
+        self.assertIn('aria-keyshortcuts="t"', html)
+
+    def test_icon_only_actions_are_labelled(self) -> None:
+        source = inspect.getsource(main.watch_video)
+        self.assertIn('data-share-open aria-haspopup="dialog" aria-label="Share" data-tip="Share"', source)
+        self.assertIn('aria-label="Save to playlist" data-tip="Save"', source)
 
 
 class CommentVoteSpacingTests(unittest.TestCase):
@@ -593,13 +808,16 @@ class VideoDetailsPaneTests(unittest.TestCase):
 
 
 class StatusPageTests(unittest.TestCase):
-    def test_status_lives_in_settings_now(self) -> None:
+    def test_status_is_a_settings_pane_and_a_shareable_page(self) -> None:
         import inspect
 
-        # It was a sidebar entry pointing at a standalone page; it is a Settings pane.
         from openfeed.tests.support import offline_db
 
-        self.assertIn("RedirectResponse", inspect.getsource(main.admin_status))
+        # /admin/status stays on its own URL instead of redirecting to a dialog over the
+        # feed, and both surfaces load the same panel.
+        source = inspect.getsource(main.admin_status)
+        self.assertNotIn("RedirectResponse", source)
+        self.assertIn("data-status-autoload", source)
         with offline_db():
             self.assertIn('data-settings-pane="status"', main._settings_dialog(user={"authenticated": False}))
 
@@ -607,7 +825,43 @@ class StatusPageTests(unittest.TestCase):
         from openfeed.tests.support import offline_db
 
         with offline_db():
-            self.assertIn("Service health", main._status_page_html("local"))
+            html = main._status_page_html("local")
+        for section in ("status-verdict", "status-counters", "Source ladder", "Hop walk", "Services", "Raw status output"):
+            self.assertIn(section, html)
+
+    def test_the_verdict_names_the_cause_and_comes_only_from_measurements(self) -> None:
+        healthy = {"ok": True}
+        status = {"checks": {key: dict(healthy) for key in main._STATUS_CHECK_LABELS}}
+        source = {"id": "invidious", "label": "Invidious", "enabled": True, "cooling": False, "failing": False, "health": {"status": "healthy"}}
+        fallback = {"id": "youtube", "label": "YouTube", "enabled": True, "cooling": False, "failing": False, "health": {"status": "unknown"}}
+
+        self.assertEqual(main._status_verdict(status, [source, fallback])[:2], ("ok", "Playback healthy via Invidious"))
+        # Never tried: it must not claim health nobody observed.
+        tone, headline, detail = main._status_verdict(status, [dict(source, health={"status": "unknown"})])
+        self.assertEqual(tone, "ok")
+        self.assertNotIn("healthy", headline)
+        self.assertIn("not played", detail)
+
+        tone, headline, _ = main._status_verdict(status, [dict(source, cooling=True), fallback])
+        self.assertEqual((tone, headline), ("warn", "Playback degraded: Invidious is paused, using YouTube"))
+        self.assertEqual(main._status_verdict(status, [dict(source, enabled=False)])[0], "bad")
+        self.assertEqual(main._status_verdict(status, [dict(source, cooling=True)])[0], "bad")
+
+        status["checks"]["database"] = {"ok": False, "error": "connection refused"}
+        self.assertEqual(main._status_verdict(status, [source])[:2], ("bad", "Postgres is failing: connection refused"))
+
+    def test_the_ladder_inverts_the_source_a_play_would_use_and_shows_the_cooldown(self) -> None:
+        cooling = {"id": "a", "label": "First", "enabled": True, "cooling": True, "failing": False, "health": {"cooldown_seconds": 29, "failures": 2}}
+        ready = {"id": "b", "label": "Second", "enabled": True, "cooling": False, "failing": False, "health": {"status": "healthy", "last_ok": 4}}
+        html = main._status_ladder([cooling, ready])
+        self.assertIn('data-cooldown="29"', html)
+        self.assertIn("2 recent failures", html)
+        self.assertLess(html.index("Second"), html.index("Active"))
+        self.assertEqual(html.count("Active"), 1)
+
+    def test_status_loading_is_a_skeleton_not_text(self) -> None:
+        self.assertIn("skeleton", main._status_skeleton())
+        self.assertNotIn("Loading status&hellip;", main._home_script())
 
     def test_status_tables_scroll_in_their_own_box(self) -> None:
         # A long error message must not be able to widen the whole page.
@@ -822,7 +1076,8 @@ class SearchHtmlTests(unittest.TestCase):
 class SearchPageTests(unittest.TestCase):
     """The search hero names the query; the counts line is gone."""
 
-    def _content(self, q: str, remote: list | None = None, error: bool = False) -> str:
+    def _content(self, q: str, remote: list | None = None, error: bool = False, channels: list | None = None,
+                 suggestions: list | None = None, **filters: str) -> str:
         from openfeed import discovery
 
         rows = remote if remote is not None else [{"youtube_video_id": "new1", "title": "new1"}]
@@ -834,15 +1089,18 @@ class SearchPageTests(unittest.TestCase):
              patch.object(db, "list_recent_videos", return_value=[]), \
              patch.object(discovery, "search_youtube", return_value=rows, side_effect=None if not error else search), \
              patch.object(db, "store_search_results", return_value=0), \
+             patch.object(main, "_search_channels", return_value=(channels or [], "", False)), \
+             patch.object(main, "_search_suggestions", return_value=suggestions or []), \
+             patch.object(main, "_notification_levels", return_value={}), \
+             patch.object(main, "_user_key", return_value="local"), \
              patch.object(main, "_media_row", return_value='<article data-video-id="new1"></article>'), \
              patch.object(main, "_app_shell", return_value="") as shell:
-            main.search_page(None, q=q)
+            main.search_page(None, q=q, **filters)
         return shell.call_args[0][2]
 
-    def test_heading_stays_but_the_counts_line_is_gone(self) -> None:
+    def test_heading_counts_and_quotes_the_query(self) -> None:
         content = self._content(" derezzed ")
-        self.assertIn("Results for", content)
-        self.assertIn("derezzed", content)
+        self.assertIn("1+ result for &quot;derezzed&quot;", content)
         self.assertNotIn("from your library", content)
         self.assertNotIn("from YouTube", content)
 
@@ -863,6 +1121,126 @@ class SearchPageTests(unittest.TestCase):
     def test_recent_videos_have_no_sentinel(self) -> None:
         content = self._content("")
         self.assertNotIn("data-search-sentinel", content)
+
+    def test_type_chips_are_plain_links_that_mark_the_active_type(self) -> None:
+        content = self._content("synth", type="videos")
+        self.assertIn('href="/search?q=synth&amp;type=channels"', content)
+        self.assertIn('class="ch-chip active" href="/search?q=synth&amp;type=videos" aria-current="page"', content)
+
+    def test_filters_survive_into_the_scroll_hooks(self) -> None:
+        content = self._content("synth", sort="view_count", date="week", duration="long")
+        self.assertIn('data-sort="view_count"', content)
+        self.assertIn('data-date="week"', content)
+        self.assertIn('data-duration="long"', content)
+        self.assertIn("Clear filters", content)
+
+    def test_filter_values_outside_the_tables_are_dropped(self) -> None:
+        content = self._content("synth", sort="drop table", date="<script>", duration="forever", type="nope")
+        self.assertIn('data-type="all"', content)
+        self.assertIn('data-sort="relevance"', content)
+        self.assertIn('data-date=""', content)
+        self.assertNotIn("<script>", content)
+
+    def test_shorts_and_playlists_only_offer_filters_that_apply(self) -> None:
+        self.assertNotIn(">Length<", self._content("synth", type="shorts"))
+        with patch.object(main, "_search_playlists", return_value=("", 0, "", False)):
+            self.assertNotIn("filter-menu", self._content("synth", type="playlists"))
+
+    def test_channels_lead_all_and_are_escaped(self) -> None:
+        evil = '"><script>alert(1)</script>'
+        content = self._content("synth", channels=[{"youtube_channel_id": "UCa", "title": evil}])
+        self.assertLess(content.index("search-channels"), content.index("data-search-list"))
+        self.assertNotIn(evil, content)
+        self.assertIn('data-subscribe-feed', content)
+
+    def test_a_filtered_search_has_no_channel_block(self) -> None:
+        content = self._content("synth", channels=[{"youtube_channel_id": "UCa", "title": "A"}], date="week")
+        self.assertNotIn("search-channels", content)
+
+    def test_no_results_offers_suggestions_as_links(self) -> None:
+        content = self._content("two words", remote=[], suggestions=["two"])
+        self.assertIn("empty-state", content)
+        self.assertIn('href="/search?q=two"', content)
+        self.assertNotIn("data-search-sentinel", content)
+
+    def test_suggestions_come_from_the_query(self) -> None:
+        with patch.object(db, "list_subscriptions", return_value=[{"title": "Veritasium"}]):
+            self.assertEqual(main._search_suggestions("a long query"), ["a long", "long query", "query", "long"])
+            self.assertEqual(main._search_suggestions("veritasiumm", "u1"), ["Veritasium"])
+            # Without a user there is no subscription list to suggest from.
+            self.assertEqual(main._search_suggestions("veritasiumm"), [])
+
+    def test_channels_found_on_youtube_are_stored_before_they_are_linked(self) -> None:
+        from openfeed import discovery
+
+        local = {"youtube_channel_id": "UCa", "title": "Mine"}
+        found = [{"youtube_channel_id": "UCa", "title": "Mine"}, {"youtube_channel_id": "UCb", "title": "New"}]
+        stored = [{"youtube_channel_id": "UCb", "title": "New"}]
+        with patch.object(db, "search_channels", return_value=[local]), \
+             patch.object(discovery, "search_youtube_channels", return_value=found), \
+             patch.object(db, "store_search_channels", return_value=stored) as store:
+            rows, error, more = main._search_channels("q", 5, 1, "u1")
+        store.assert_called_once_with([found[1]], user_key="u1")
+        self.assertEqual([row["youtube_channel_id"] for row in rows], ["UCa", "UCb"])
+        self.assertEqual(error, "")
+        self.assertTrue(more)
+
+
+class SearchBackendTests(unittest.TestCase):
+    """What the filters actually send, to Invidious and to the database."""
+
+    def test_sort_uses_the_parameter_invidious_reads(self) -> None:
+        from openfeed import discovery
+
+        class Response:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> list:
+                return []
+
+        class Client:
+            sent: dict = {}
+
+            def __init__(self, **kwargs) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args) -> None:
+                pass
+
+            def get(self, url: str, params: dict) -> Response:
+                Client.sent = params
+                return Response()
+
+        settings = SimpleNamespace(invidious_base_url="http://inv", enrichment_timeout_seconds=5)
+        with patch.object(discovery, "get_settings", return_value=settings), \
+             patch.object(discovery.httpx, "Client", Client):
+            discovery.search_youtube("q", sort="view_count", date="week", duration="long")
+        self.assertEqual(Client.sent["sort"], "views")
+        self.assertNotIn("sort_by", Client.sent)
+        self.assertEqual(Client.sent["date"], "week")
+        self.assertEqual(Client.sent["duration"], "long")
+
+    def test_a_short_result_is_kept_or_dropped_by_type(self) -> None:
+        from openfeed import discovery
+
+        rows = [{"youtube_video_id": "a", "duration_seconds": 40}, {"youtube_video_id": "b", "duration_seconds": 400}]
+        with patch.object(discovery, "search_youtube", return_value=rows) as search:
+            shorts, scanned = main._search_youtube_videos("q", 1, main._search_filters("shorts", "relevance", "", ""))
+            videos, _ = main._search_youtube_videos("q", 1, main._search_filters("videos", "relevance", "", ""))
+        self.assertEqual([row["youtube_video_id"] for row in shorts], ["a"])
+        self.assertEqual([row["youtube_video_id"] for row in videos], ["b"])
+        self.assertEqual(scanned, 2)
+        self.assertEqual(search.call_args_list[0].kwargs["duration"], "short")
+
+    def test_filter_sql_only_ever_comes_from_the_tables(self) -> None:
+        clause = db._search_filter_sql("shorts", "week", "medium")
+        self.assertIn("interval '7 days'", clause)
+        self.assertIn("v.duration_seconds >= 240", clause)
+        self.assertEqual(db._search_filter_sql("", "'; drop table videos;--", "nope"), "")
 
 
 class CommentAvatarResolverTests(unittest.TestCase):

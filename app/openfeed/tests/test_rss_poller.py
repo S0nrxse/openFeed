@@ -84,8 +84,6 @@ EXPECTED_ENTRY_KEYS = {
     "author",
     "summary",
     "published_at",
-    "is_read",
-    "is_starred",
     "raw",
 }
 
@@ -96,6 +94,12 @@ class _FakeResponse:
         self.text = text
         self.headers = headers or {}
 
+    def close(self) -> None:
+        pass
+
+    def iter_bytes(self):
+        yield self.text.encode("utf-8")
+
 
 class _FakeHttpxClient:
     """Stands in for httpx.Client; handler decides the response per call."""
@@ -104,8 +108,8 @@ class _FakeHttpxClient:
         self._handler = handler
         self.calls: list[dict] = []
 
-    def get(self, url, headers=None, timeout=None):
-        call = {"url": url, "headers": dict(headers or {}), "timeout": timeout}
+    def get(self, url, headers=None, timeout=None, follow_redirects=False):
+        call = {"url": url, "headers": dict(headers or {}), "timeout": timeout, "follow_redirects": follow_redirects}
         self.calls.append(call)
         return self._handler(call)
 
@@ -130,8 +134,9 @@ class ParseChannelFeedTests(unittest.TestCase):
         self.assertEqual(first["author"], "Some Channel")
         self.assertEqual(first["summary"], "First video description here.")
         self.assertEqual(first["published_at"], datetime(2025, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
-        self.assertFalse(first["is_read"])
-        self.assertFalse(first["is_starred"])
+        # The old reader's read/starred flags are gone (they were install-wide).
+        self.assertNotIn("is_read", first)
+        self.assertNotIn("is_starred", first)
 
         self.assertEqual(second["youtube_video_id"], "9bZkp7q19f0")
         self.assertEqual(second["url"], "https://www.youtube.com/watch?v=9bZkp7q19f0")
@@ -284,6 +289,7 @@ class SyncRssOnceTests(unittest.TestCase):
         upsert_channel = stack.enter_context(patch.object(rss.db, "upsert_channel", create=True, return_value=7))
         upsert_video = stack.enter_context(patch.object(rss.db, "upsert_video", create=True, return_value=11))
         upsert_entry = stack.enter_context(patch.object(rss.db, "upsert_entry", create=True))
+        stack.enter_context(patch.object(rss.db, "refresh_feed_title", create=True))
         return list_due, record, sub_for_channel, create_run, finish_run, upsert_channel, upsert_video, upsert_entry
 
     def _patched_fetch(self, stack: contextlib.ExitStack, mapping: dict):

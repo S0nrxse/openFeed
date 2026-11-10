@@ -121,12 +121,14 @@ class ThumbnailProxyTests(unittest.TestCase):
     def test_a_missing_thumbnail_still_resolves_from_the_video_id(self) -> None:
         self.assertEqual(main._thumbnail_for({"youtube_video_id": "abc12345678"}), "/vi/abc12345678/hqdefault.jpg")
 
-    def test_an_unrelated_host_is_left_alone(self) -> None:
+    def test_an_unrelated_host_is_never_handed_to_the_browser(self) -> None:
+        # Any other host would see the viewer's IP, so the proxied thumbnail replaces it.
         video = {"youtube_video_id": "abc12345678", "thumbnail_url": "https://cdn.example.com/custom.png"}
-        self.assertEqual(main._thumbnail_for(video), "https://cdn.example.com/custom.png")
+        self.assertEqual(main._thumbnail_for(video), "/vi/abc12345678/hqdefault.jpg")
 
-    def test_no_video_id_means_nothing_to_rebuild_from(self) -> None:
-        self.assertEqual(main._thumbnail_for({"thumbnail_url": "https://i.ytimg.com/vi/x/hq.jpg"}), "https://i.ytimg.com/vi/x/hq.jpg")
+    def test_no_video_id_still_comes_back_same_origin(self) -> None:
+        self.assertEqual(main._thumbnail_for({"thumbnail_url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hq.jpg"}), "/vi/dQw4w9WgXcQ/hq.jpg")
+        self.assertEqual(main._thumbnail_for({"thumbnail_url": "https://cdn.example.com/custom.png"}), "")
 
 
 if __name__ == "__main__":
@@ -163,7 +165,7 @@ class DescriptionFormattingTests(unittest.TestCase):
 
     def test_urls_become_links_without_swallowing_trailing_punctuation(self) -> None:
         html = main._rich_text("see https://example.com/a?b=1&c=2.")
-        self.assertIn('href="https://example.com/a?b=1&c=2"', html)
+        self.assertIn('href="https://example.com/a?b=1&amp;c=2"', html)
         self.assertTrue(html.endswith("."))
 
     def test_markup_in_the_description_cannot_become_markup(self) -> None:
@@ -217,7 +219,7 @@ class CommentVoteWeightTests(unittest.TestCase):
 
         from openfeed import db
 
-        source = inspect.getsource(db.list_recommended_videos)
+        source = inspect.getsource(db._list_recommended_videos_classic)
         self.assertIn("WHEN event_type = 'comment_like' THEN 1", source)
         self.assertIn("WHEN event_type = 'comment_dislike' THEN -1.5", source)
         # The video's own rating stays the dominant signal.
@@ -232,7 +234,7 @@ class WatchedExclusionTests(unittest.TestCase):
 
         from openfeed import db
 
-        source = inspect.getsource(db.list_recommended_videos)
+        source = inspect.getsource(db._list_recommended_videos_classic)
         # An open counts as a watch: the page records watch_page_open on render.
         self.assertIn("COALESCE(er.open_count, 0) = 0", source)
         # ...as does any playback evidence, timed or not.
@@ -244,7 +246,7 @@ class WatchedExclusionTests(unittest.TestCase):
 
         from openfeed import db
 
-        source = inspect.getsource(db.list_recommended_videos)
+        source = inspect.getsource(db._list_recommended_videos_classic)
         # The resume lane bypasses the watched exclusion; it selects partials by
         # progress instead, so excluding them here would empty the shelf.
         self.assertIn("continue-watching", source)

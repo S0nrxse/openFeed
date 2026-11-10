@@ -1,0 +1,5 @@
+/* Settings -> Your data -> Import OPML: a file input dressed as a button. The input stays
+   in the tab order (visually hidden, not display:none), so the label shows its focus. */
+.opml-import { position: relative; cursor: pointer; }
+.opml-import:focus-within { box-shadow: var(--focus); }
+.opml-import[aria-busy="true"] { opacity: .6; pointer-events: none; }
