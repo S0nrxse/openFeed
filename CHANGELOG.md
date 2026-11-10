@@ -2,7 +2,7 @@
 
 OpenFeed is alpha software. Back up `OPENFEED_DATA_DIR` before every upgrade.
 
-## 0.2.0-alpha — unreleased
+## 0.2.0-alpha — 2026-11-10
 
 The first version published as an open-source repository. Upgrading from 0.1.0-alpha is
 automatic on the first start; see [Upgrading](README.md#upgrading-feeds-and-per-user-subscriptions).
