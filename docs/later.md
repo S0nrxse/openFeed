@@ -171,7 +171,7 @@ endpoint. Neither exposes individual users, only the install's combined list.
 
 Priority: next, now that the old feed reader is gone and subscriptions are per user.
 
-## Retire the old feed reader (2026-11-09) — DONE in the repo, deploy pending
+## Retire the old feed reader (2026-11-09) — deployed
 
 Done (feeds track, 2026-11-09):
 - No trace of the old reader is left in code, SQL, tests or docs, except the startup
@@ -190,20 +190,22 @@ Done (feeds track, 2026-11-09):
   caption fetches (seen on the dev Invidious: transcript API 500, direct caption file a
   Google "Sorry" page, companion file fine).
 
-Still to do (deploy, proposal):
-1. The rest of the production-source diff (`/opt/NOAH/UserApps/Media/OpenFeed` against the
-   repo); only the transcript module and its endpoint were ported here.
-2. NOAH's `myyt_subscribe` / `myyt_unsubscribe` actions call the old subscribe path; point
-   them at `POST`/`DELETE /api/subscriptions` (same JSON body) in the same change as the
-   deploy. `myyt_subscriptions` (`GET /api/subscriptions`) keeps working and now lists the
-   token owner's own subscriptions. The `noah-openfeed` skill says "at most three requests"
-   for a transcript fetch; it is now at most four (track list, transcript, embed page,
-   caption file).
-3. Deploy, then remove the old containers and env vars after backing up their volume.
+Deployed 2026-11-09 (2026-11-10 UTC):
+- Reviewed and preserved the production-only transcript route and worker SIGINT setting.
+- App and worker use the same private accounts release image. All 81 subscriptions
+  survived migration, and the RSS poller completed a successful production run.
+- Updated NOAH's subscription, sync, and ranker evaluation contracts. Its transcript
+  guidance now allows four requests (track list, transcript, embed page, caption file).
+- Backed up the databases and reader files, removed the retired reader containers and
+  active environment settings, and changed its old hostnames to return HTTP 410.
+- Kept Authentik and private network access. Password and passkey sign-in are enabled,
+  registration is closed, and third-party browser playback remains disabled.
+- Canonical operational and recovery notes are in
+  [OpenFeed (myYT)](https://outline.noahbox.dev/doc/dKqOSMb1nn).
 
 ## Many users and pluggable sign-in (2026-11-09)
 
-**Status (2026-11-09): phase 1 built** (docs/accounts.md). Done: `accounts` with roles and a
+**Status (2026-11-09): phases 1 and 2 deployed** (docs/accounts.md). Done: `accounts` with roles and a
 disabled flag, `account_identities` (one account, several methods), Argon2id passwords, TOTP
 with single-use codes and recovery codes, server-side sessions with a device list and sign
 out everywhere, CSRF and re-authentication, Redis rate limits keyed by a hash of the client,
@@ -217,8 +219,8 @@ admin-only install-wide settings (Admin → Server) and per-user download quotas
 (2026-11-09). The plan as written before the build follows.
 
 
-Facts:
-- Sign-in is `OPENFEED_AUTH_MODE=disabled` or `authentik_oidc`. That mode is generic OIDC
+Historical baseline before this implementation:
+- Sign-in was `OPENFEED_AUTH_MODE=disabled` or `authentik_oidc`. That mode is generic OIDC
   with one provider.
 - `users` is keyed by `authentik_sub`. About 16 tables key their rows by `user_key`, and
   profiles (`local:p:*`) sit under each account.
