@@ -298,6 +298,8 @@ class DesignTokenTests(unittest.TestCase):
     def test_no_copy_of_an_old_value_survives(self) -> None:
         files = [APP / "main.py", *ASSETS.glob("css/*.css"), *ASSETS.glob("js/*.js"), *(path for path in ASSETS.glob("player/**/*") if path.is_file()),
                  APP.parents[1] / "DESIGN.md", APP.parents[1] / ".impeccable" / "design.json"]
+        # DESIGN.md and design.json live at the repository root, outside the image.
+        files = [path for path in files if path.is_file()]
         for path in files:
             text = path.read_text(encoding="utf-8").lower()
             with self.subTest(path=path.name):

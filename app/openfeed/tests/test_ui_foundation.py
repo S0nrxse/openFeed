@@ -35,7 +35,10 @@ class StylesheetFileTests(unittest.TestCase):
         self.assertGreater(css.index("/* ---------- responsive ---------- */"), css.index("/* ---------- theater mode ---------- */"))
 
     def test_the_css_files_are_shipped_by_the_image(self) -> None:
-        dockerfile = (Path(main.__file__).parents[1] / "Dockerfile").read_text(encoding="utf-8")
+        path = Path(main.__file__).parents[1] / "Dockerfile"
+        if not path.is_file():
+            self.skipTest("the Dockerfile is not inside the image; run from a checkout to check it")
+        dockerfile = path.read_text(encoding="utf-8")
         self.assertIn("COPY openfeed ./openfeed", dockerfile)
 
 

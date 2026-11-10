@@ -156,8 +156,8 @@ Rules if built:
 - Only one callback path. Accept only topics we subscribed to, answer verification only
   for pending subscriptions, and rate-limit it.
 - Keep polling as a backstop (every few hours), because delivery isn't guaranteed.
-- On noahbox, the callback needs a Cloudflare Access bypass for that one path, which
-  makes it public.
+- Behind an access proxy (Cloudflare Access, Authentik forward auth), the callback needs
+  a bypass for that one path, which makes it public.
 
 Privacy: no worse than polling. Google already learns the install's channel list and the
 server's IP from the polls. WebSub adds a stable callback URL and an inbound public
@@ -190,18 +190,8 @@ Done (feeds track, 2026-11-09):
   caption fetches (seen on the dev Invidious: transcript API 500, direct caption file a
   Google "Sorry" page, companion file fine).
 
-Deployed 2026-11-09 (2026-11-10 UTC):
-- Reviewed and preserved the production-only transcript route and worker SIGINT setting.
-- App and worker use the same private accounts release image. All 81 subscriptions
-  survived migration, and the RSS poller completed a successful production run.
-- Updated NOAH's subscription, sync, and ranker evaluation contracts. Its transcript
-  guidance now allows four requests (track list, transcript, embed page, caption file).
-- Backed up the databases and reader files, removed the retired reader containers and
-  active environment settings, and changed its old hostnames to return HTTP 410.
-- Kept Authentik and private network access. Password and passkey sign-in are enabled,
-  registration is closed, and third-party browser playback remains disabled.
-- Canonical operational and recovery notes are in
-  [OpenFeed (myYT)](https://outline.noahbox.dev/doc/dKqOSMb1nn).
+Deployed 2026-11-09 on the maintainer's instance: all subscriptions survived the
+migration and the RSS poller completed a successful run on the new tables.
 
 ## Many users and pluggable sign-in (2026-11-09)
 

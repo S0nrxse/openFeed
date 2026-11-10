@@ -33,11 +33,15 @@ class SettingsDialogTests(unittest.TestCase):
         self.assertIn('data-settings-view="list"', html)
 
     def test_settings_rows_use_the_shared_controls(self) -> None:
-        html = _settings_html()
         # Five switches, Help tune recommendations, DeArrow's master and thumbnails switches,
         # Playback's Autoplay and Always show captions, and Privacy's mirrors of SponsorBlock,
         # DeArrow and RYD (the YouTube and public-instance players are off on this server).
+        # Live chat adds a fourteenth only where yt-dlp is installed, as it is in the image.
+        with patch.object(main.ytdlp, "available", return_value=False):
+            html = _settings_html()
         self.assertEqual(html.count('class="switch"'), 13)
+        with patch.object(main.ytdlp, "available", return_value=True):
+            self.assertEqual(_settings_html().count('class="switch"'), 14)
         for hook in ("data-setting-shorts", "data-setting-comments", "data-setting-posts", "data-setting-ryd", "data-setting-sponsorblock", "data-setting-explore", "data-setting-dearrow", "data-setting-dearrow-thumbnails"):
             self.assertIn(hook, html)
 

@@ -43,7 +43,7 @@ the user's own machine.
 Success is a feed good enough to use daily in place of YouTube — not a
 demonstration that self-hosting is possible.
 
-Status is **0.1.0-alpha**: early, under active development, with the README
+Status is **0.2.0-alpha**: early, under active development, with the README
 explicitly warning users to back up `OPENFEED_DATA_DIR` before upgrading and never
 to treat an instance as the only copy of anything.
 

@@ -588,12 +588,27 @@ openssl rand -hex 32
 
 ### 3. Start
 
+Either use a prebuilt release image (amd64 and arm64): add this line to `.env`, with the
+version you want from the [releases](https://github.com/S0nrxse/openFeed/releases),
+
+```bash
+OPENFEED_IMAGE=ghcr.io/s0nrxse/openfeed:0.2.0-alpha
+```
+
+and start the stack:
+
+```bash
+./deploy.sh --profile worker up -d
+```
+
+Or build the image from your checkout instead (leave `OPENFEED_IMAGE` unset):
+
 ```bash
 ./deploy.sh --profile worker up -d --build
 ```
 
-The first run builds the app image and pulls roughly 700 MB of containers, so give it a
-few minutes. Later starts take seconds.
+The first run pulls roughly 700 MB of containers (and builds the app image if you chose
+to), so give it a few minutes. Later starts take seconds.
 
 ### 4. Open it
 
@@ -625,11 +640,23 @@ from outside the machine by default.
 ./deploy.sh down                     # stop everything
 ```
 
-To update to the latest code:
+To update, back up `OPENFEED_DATA_DIR`, read the [changelog](CHANGELOG.md), then either
+change `OPENFEED_IMAGE` to the new release and run
+
+```bash
+git pull && ./deploy.sh --profile worker up -d
+```
+
+or, when building from source:
 
 ```bash
 git pull && ./deploy.sh --profile worker up -d --build
 ```
+
+The Invidious, companion and Qdrant images are pinned in `compose.yml` to versions tested
+with this release. YouTube changes often break older Invidious builds; if playback or
+search stops working before the next OpenFeed release, pin newer tags in
+`compose.local.yml` (see [Local Overrides](#local-overrides)).
 
 `openfeed-app` and `openfeed-worker` share one image, so a rebuild has to recreate both —
 the command above does.
@@ -983,6 +1010,9 @@ Then run it:
 ```bash
 docker run --rm openfeed-app:test python -m unittest discover -s openfeed/tests -v
 ```
+
+[CI](.github/workflows/ci.yml) runs the same suite, with the PostgreSQL tests below, on every
+push and pull request.
 
 A few tests also run against PostgreSQL when `OPENFEED_TEST_DATABASE_URL` names a database
 they may use: each creates and drops its own schema there (the startup migration on an old

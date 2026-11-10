@@ -1,7 +1,7 @@
 # OpenFeed ranker: forensic diagnosis (measured, dev copy of production, 2026-11-06)
 
 Code: $S/wt/alg/app. Real user (R). Empty user = "diag-empty-user-0000" (N). Scripts: $S/alg/diag/ (run_all.sh,
-raw output in dNN.out). S=/tmp/claude-1000/-home-peyton-app-lab-projects-openFeed/b2720c98-0a1e-4338-968f-b34b3b443505/scratchpad
+raw output in dNN.out). S = the experiment scratch directory (not kept in the repository)
 Corpus is 82,041 videos (brief said 81k): 80,104 discovery, 1,937 subscription; 81 subscriptions.
 
 ## 0. Brief corrections

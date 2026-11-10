@@ -1,6 +1,6 @@
 # Track B: user modelling under sparse history, and page re-ranking (DEV only)
 
-S=/tmp/claude-1000/-home-peyton-app-lab-projects-openFeed/b2720c98-0a1e-4338-968f-b34b3b443505/scratchpad. Track dir `$S/alg/exp/B`.
+S = the experiment scratch directory (not kept in the repository). Track dir `$S/alg/exp/B`.
 Code: `systems_B.py` (all systems), `run_B.py` (nested CV), `run_base_B.py` (missing baselines), `run_rerank.py` (Q3),
 `run_transfer.py` (H4 transfer), `run_t1_B.py` / `run_t1_fixed.py` (T1), `analyze.py` (stats). Per-unit results:
 `results/t2_n{5,10,20}/*.parquet` (+ `.json` with nested-chosen configs), `results/base/`, `results/t1/`.
