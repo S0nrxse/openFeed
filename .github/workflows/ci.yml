@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      # Throwaway database for the opt-in PostgreSQL tests. Each test makes and drops its own schema.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: openfeed
+          POSTGRES_PASSWORD: openfeed-ci
+          POSTGRES_DB: openfeed_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openfeed -d openfeed_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Compose configuration
+        run: |
+          cp .env.example .env
+          ./deploy.sh config --quiet
+          ./deploy.sh --profile worker --profile vectors --profile search config --quiet
+
+      - name: Build the app image
+        run: docker build -t openfeed-app:test app
+
+      - name: Run the test suite
+        run: |
+          docker run --rm --network host \
+            -e OPENFEED_TEST_DATABASE_URL=postgresql://openfeed:openfeed-ci@127.0.0.1:5432/openfeed_test \
+            openfeed-app:test python -m unittest discover -s openfeed/tests

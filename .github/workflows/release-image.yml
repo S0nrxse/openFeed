@@ -1,0 +1,61 @@
+name: Release image
+
+# Publishes ghcr.io/<owner>/openfeed for each version tag (v0.2.0-alpha -> :0.2.0-alpha).
+# Pull requests that touch the image build it for both architectures without pushing.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "app/Dockerfile"
+      - "app/requirements.txt"
+      - ".github/workflows/release-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Image name
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/openfeed" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ steps.name.outputs.image }}
+          # Prereleases (-alpha, -beta) get only their own tag; a plain vX.Y.Z also moves :latest.
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=OpenFeed
+            org.opencontainers.image.description=Self-hosted personalized YouTube interface
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: app
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
