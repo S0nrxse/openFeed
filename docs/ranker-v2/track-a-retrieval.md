@@ -1,6 +1,6 @@
 # Track A report: candidate retrieval and score fusion (ranker v2, DEV only)
 
-S = /tmp/claude-1000/-home-peyton-app-lab-projects-openFeed/b2720c98-0a1e-4338-968f-b34b3b443505/scratchpad
+S = the experiment scratch directory (not kept in the repository)
 Code: $S/alg/exp/A/systems_A.py (systems), run_A.py / run_fixed.py (nested CV runs), compare.py (stats),
 diag_t1.py / diag_head.py / diag2_t1.py (diagnostics, no tuning), ref_A.py (production reference), parity_ref.py.
 Per-unit results: $S/alg/exp/A/results/{t1,t2_n10}/*.parquet; chosen configs are in the matching *.json; full tables are in

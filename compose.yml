@@ -67,7 +67,7 @@ services:
   openfeed-app:
     build:
       context: ./app
-    image: openfeed-app:local
+    image: ${OPENFEED_IMAGE:-openfeed-app:local}
     restart: unless-stopped
     # Match the uid of the bind-mounted ./data/downloads owner (set OPENFEED_UID
     # for host setups). The image's own openfeed user is uid 10000 otherwise.
@@ -143,7 +143,7 @@ services:
       - openfeed_net
 
   openfeed-worker:
-    image: openfeed-app:local
+    image: ${OPENFEED_IMAGE:-openfeed-app:local}
     restart: unless-stopped
     stop_signal: SIGINT
     profiles: ["worker"]
@@ -189,7 +189,7 @@ services:
       - openfeed_net
 
   openfeed-invidious:
-    image: quay.io/invidious/invidious:latest
+    image: quay.io/invidious/invidious:2.20261103.0
     restart: unless-stopped
     depends_on:
       openfeed-invidious-db:
@@ -225,7 +225,7 @@ services:
       - openfeed_net
 
   openfeed-invidious-companion:
-    image: quay.io/invidious/invidious-companion:latest
+    image: quay.io/invidious/invidious-companion:2026.11.07-07ae73c
     restart: unless-stopped
     environment:
       SERVER_SECRET_KEY: ${INVIDIOUS_COMPANION_KEY:?set INVIDIOUS_COMPANION_KEY in .env}
@@ -257,7 +257,7 @@ services:
       - openfeed_net
 
   openfeed-qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.17.0
     restart: unless-stopped
     profiles: ["vectors"]
     volumes:
