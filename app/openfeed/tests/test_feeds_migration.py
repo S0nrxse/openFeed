@@ -252,6 +252,9 @@ class MigrationDatabaseTests(unittest.TestCase):
         no per-user table, and some data."""
         db.init_db()
         with self.connect() as conn:
+            # Recreate the shared flags removed by the current schema before seeding
+            # legacy stars. A fresh current install no longer has these columns.
+            conn.execute("ALTER TABLE feed_entries ADD COLUMN is_read BOOLEAN NOT NULL DEFAULT false, ADD COLUMN is_starred BOOLEAN NOT NULL DEFAULT false")
             conn.execute("DROP TABLE user_subscriptions")
             conn.execute("DROP INDEX idx_feeds_youtube_channel")
             for table, old, new in migrations.CONSTRAINT_RENAMES:
@@ -299,7 +302,8 @@ class MigrationDatabaseTests(unittest.TestCase):
         before = self._catalog()
         snapshot = self._fetch("SELECT user_key, feed_id, created_at FROM user_subscriptions ORDER BY 1, 2")
         second = db.init_db()
-        self.assertEqual(second, {"renamed": [], "seeded_users": 0, "seeded_rows": 0, "stars_moved": 0})
+        self.assertEqual(second, {"renamed": [], "seeded_users": 0, "seeded_rows": 0, "stars_moved": 0,
+                                  "catalog_scope": {"shared": {"changed": False}}})
         self.assertEqual(self._catalog(), before)
         self.assertEqual(self._fetch("SELECT user_key, feed_id, created_at FROM user_subscriptions ORDER BY 1, 2"), snapshot)
 
