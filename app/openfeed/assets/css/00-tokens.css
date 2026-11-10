@@ -1,0 +1,175 @@
+/* Design tokens. Every value used more than once lives here; DESIGN.md explains them. */
+:root {
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, system-ui, sans-serif;
+
+  /* The tonal ramp. */
+  --bg: #0a0a0b;
+  --surface: #121214;
+  --surface-2: #1a1a1d;
+  --surface-3: #232327;
+  --menu: #151517;
+  --border: rgba(255,255,255,.09);
+  --border-soft: rgba(255,255,255,.055);
+  --text: #ededef;
+  --muted: #9a9aa3;
+  --muted-2: #84848d;
+
+  /* Inversion: how the system marks "selected" and the one primary action in a view. */
+  --bone: #ededef;
+  --bone-hover: #fff;
+  --on-bone: #0a0a0b;
+
+  /* Signal. Ember is a light, Ember Text is the same light set in words. */
+  --accent: #e5484d;
+  --accent-soft: rgba(229,72,77,.12);
+  --ember-text: #f2686c;
+  --accent-text: #e5484d; /* red text on the page background (4.5:1 in light) */
+  --accent-solid: #d92d33; /* red fill under small white text: 4.8:1 */
+  --link: #6ea8ff;
+  --link-hover: #9cc4ff;
+  --live: #3fb950;
+  --live-text: #7ee2a8;
+  --hold: #d29922;
+
+  /* Layout. --header includes the top inset, so everything offset by it stays correct. */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --sidebar: 244px;
+  --header: calc(56px + var(--safe-top));
+  --tabbar: 56px;
+  --grid-min: 260px;
+  --hit: 32px;
+
+  /* Shape and depth. */
+  --r-thumb: 12px;
+  --r-panel: 14px;
+  --r-menu: 14px;
+  --r-control: 8px;
+  --focus: 0 0 0 2px rgba(255,255,255,.5);
+  --shadow: 0 12px 32px rgba(0,0,0,.55);
+  --shadow-dialog: 0 24px 64px rgba(0,0,0,.7);
+  --scrim: rgba(0,0,0,.6);
+  --badge: rgba(0,0,0,.82);
+
+  /* Motion. */
+  --ease-press: cubic-bezier(.2,.8,.3,1);
+  --dur-press: 140ms;
+  --dur-fade: 160ms;
+  --shimmer: linear-gradient(90deg, var(--surface-2), var(--surface-3) 40%, var(--surface-2));
+
+  /* Theme-dependent values that used to be written inline. The light set overrides them. */
+  --ink: 255,255,255;
+  --header-glass: rgba(10,10,11,.86);
+  --bar-glass: rgba(10,10,11,.94);
+  --border-strong: rgba(255,255,255,.22);
+  --wash: rgba(255,255,255,.028);
+  --focus-ink: rgba(255,255,255,.5);
+  --thumb-bed: #000;
+  --scrollbar: #2a2a2e;
+  --scrollbar-hover: #35353a;
+  --avatar-l: 20%;
+  --avatar-ink: #d6d6da;
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239a9aa3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+
+  /* Over video and thumbnails. Never themed: a frame is dark in both themes, as on YouTube. */
+  --over-video-bone: #ededef;
+  --over-video-on-bone: #0a0a0b;
+  --over-video-hover: #232327;
+}
+
+/* Light theme. YouTube light is the reference: white page, near-white raised steps, near-black
+   text, the same Ember. Inversion still marks selection (near-black fill, white text), borders
+   are black at low alpha and the focus ring is dark. Two copies, one per way of asking for it;
+   test_theme keeps them identical. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --surface: #f8f8f9;
+  --surface-2: #f1f1f3;
+  --surface-3: #e6e6e9;
+  --menu: #ffffff;
+  --border: rgba(0,0,0,.12);
+  --border-soft: rgba(0,0,0,.08);
+  --text: #0f0f10;
+  --muted: #5c5c63;
+  --muted-2: #686870;
+  --bone: #0f0f10;
+  --bone-hover: #000;
+  --on-bone: #ffffff;
+  --accent: #e5484d;
+  --accent-soft: rgba(229,72,77,.1);
+  --ember-text: #c92a2f;
+  --accent-text: #c92a2f; /* red text on the page background (4.5:1 in light) */
+  --accent-solid: #d92d33; /* red fill under small white text: 4.8:1 */
+  --link: #065fd4;
+  --link-hover: #0b4aa8;
+  --live: #2da44e;
+  --live-text: #1a7f37;
+  --hold: #946200;
+  --focus: 0 0 0 2px rgba(0,0,0,.6);
+  --shadow: 0 4px 28px rgba(0,0,0,.14), 0 1px 3px rgba(0,0,0,.06);
+  --shadow-dialog: 0 24px 64px rgba(0,0,0,.24);
+  --scrim: rgba(0,0,0,.5);
+  --ink: 0,0,0;
+  --header-glass: rgba(255,255,255,.92);
+  --bar-glass: rgba(255,255,255,.96);
+  --border-strong: rgba(0,0,0,.3);
+  --wash: rgba(0,0,0,.035);
+  --focus-ink: rgba(0,0,0,.6);
+  --thumb-bed: #e6e6e9;
+  --scrollbar: #c8c8cd;
+  --scrollbar-hover: #a8a8ae;
+  --avatar-l: 88%;
+  --avatar-ink: #3a3a40;
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%235c5c63' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+}
+@media (prefers-color-scheme: light) {
+  :root[data-theme="system"] {
+    color-scheme: light;
+    --bg: #ffffff;
+    --surface: #f8f8f9;
+    --surface-2: #f1f1f3;
+    --surface-3: #e6e6e9;
+    --menu: #ffffff;
+    --border: rgba(0,0,0,.12);
+    --border-soft: rgba(0,0,0,.08);
+    --text: #0f0f10;
+    --muted: #5c5c63;
+    --muted-2: #686870;
+    --bone: #0f0f10;
+    --bone-hover: #000;
+    --on-bone: #ffffff;
+    --accent: #e5484d;
+    --accent-soft: rgba(229,72,77,.1);
+    --ember-text: #c92a2f;
+    --accent-text: #c92a2f; /* red text on the page background (4.5:1 in light) */
+    --accent-solid: #d92d33; /* red fill under small white text: 4.8:1 */
+    --link: #065fd4;
+    --link-hover: #0b4aa8;
+    --live: #2da44e;
+    --live-text: #1a7f37;
+    --hold: #946200;
+    --focus: 0 0 0 2px rgba(0,0,0,.6);
+    --shadow: 0 4px 28px rgba(0,0,0,.14), 0 1px 3px rgba(0,0,0,.06);
+    --shadow-dialog: 0 24px 64px rgba(0,0,0,.24);
+    --scrim: rgba(0,0,0,.5);
+    --ink: 0,0,0;
+    --header-glass: rgba(255,255,255,.92);
+    --bar-glass: rgba(255,255,255,.96);
+    --border-strong: rgba(0,0,0,.3);
+    --wash: rgba(0,0,0,.035);
+    --focus-ink: rgba(0,0,0,.6);
+    --thumb-bed: #e6e6e9;
+    --scrollbar: #c8c8cd;
+    --scrollbar-hover: #a8a8ae;
+    --avatar-l: 88%;
+    --avatar-ink: #3a3a40;
+    --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%235c5c63' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  }
+}
+@media (pointer: coarse) {
+  :root { --hit: 44px; }
+}

@@ -20,7 +20,7 @@ there is no formal SLA beyond that.
 
 - Keep `.env` readable only by the deployment user.
 - Bind ports to loopback unless a trusted reverse proxy provides TLS and access control.
-- Enable OIDC login before exposing OpenFeed outside a trusted network.
+- Turn sign-in on (`OPENFEED_AUTH_MODE=accounts` or `authentik_oidc`) before exposing OpenFeed outside a trusted network.
 - Do not publish database, Redis, Qdrant, or Typesense ports.
 - Use independent random credentials for every service.
 - Keep Docker images and host packages updated.

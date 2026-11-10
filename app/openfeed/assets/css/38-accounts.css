@@ -1,0 +1,125 @@
+/* Accounts: the signed-out pages (sign in, two-step, setup, invites, reset), Account &
+   security, and Admin, Users (account_pages.py). Built from the settings grammar: groups,
+   panels and rows from 35-settings.css, fields and buttons from 30-components.css. */
+
+/* Signed-out frame: one card in the middle, the brand where the app shell puts it. */
+.auth-body { min-height: 100dvh; margin: 0; background: var(--bg); color: var(--text); }
+.auth-shell { display: grid; place-items: center; min-height: 100dvh; padding: calc(64px + var(--safe-top)) 16px calc(32px + var(--safe-bottom)); box-sizing: border-box; }
+.auth-brand { position: absolute; top: calc(14px + var(--safe-top)); left: calc(16px + var(--safe-left)); }
+.auth-card { display: grid; gap: 16px; width: min(400px, 100%); padding: 24px; border: 1px solid var(--border); border-radius: var(--r-panel); background: var(--surface); box-sizing: border-box; }
+.auth-card > * { margin: 0; min-width: 0; }
+.auth-card h1 { font-size: 22px; font-weight: 650; line-height: 1.25; letter-spacing: -.02em; overflow-wrap: anywhere; }
+.auth-lede { margin-top: -8px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.auth-form { display: grid; gap: 14px; }
+.auth-submit { width: 100%; margin-top: 2px; }
+.auth-divider { display: flex; align-items: center; gap: 10px; color: var(--muted-2); font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; }
+.auth-divider::before, .auth-divider::after { content: ""; flex: 1 1 auto; height: 1px; background: var(--border-soft); }
+.auth-methods { display: grid; gap: 8px; }
+.auth-method { width: 100%; gap: 8px; }
+.auth-method .icon { width: 16px; height: 16px; }
+.auth-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.auth-actions form { display: contents; }
+.auth-foot { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.auth-foot a { color: var(--text); text-decoration: underline; text-decoration-color: var(--border-strong); text-underline-offset: 3px; }
+.auth-foot a:hover { text-decoration-color: currentColor; }
+.auth-foot code, .acct-hint code { font-size: 11.5px; }
+
+/* Fields: the shared text field with a hint under it. */
+.acct-field { gap: 6px; }
+.acct-hint { color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.acct-field input.acct-code, .acct-code { font-size: 17px; letter-spacing: .18em; font-variant-numeric: tabular-nums; }
+
+/* Notices: a line of text with an icon. Red only for refusals, as everywhere. */
+.acct-notice { display: flex; align-items: flex-start; gap: 8px; margin: 0; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: var(--r-control); background: var(--surface-2); color: var(--text); font-size: 12.5px; line-height: 1.45; }
+.acct-notice .icon { flex: 0 0 auto; width: 16px; height: 16px; margin-top: 1px; color: var(--muted); }
+.acct-notice.is-error { border-color: rgba(229,72,77,.28); background: var(--accent-soft); color: var(--ember-text); }
+.acct-notice.is-error .icon { color: var(--ember-text); }
+
+/* Account & security and Users pages. */
+.acct-page { display: grid; gap: 22px; width: min(760px, 100%); min-width: 0; }
+.acct-page > .page-head { margin-bottom: -6px; }
+.acct-lock, .acct-unlocked { display: flex; align-items: center; gap: 12px; margin: 0; padding: 12px 14px; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); }
+.acct-lock > .icon, .acct-unlocked > .icon { flex: 0 0 auto; width: 18px; height: 18px; color: var(--muted); }
+.acct-lock > div { display: grid; gap: 2px; flex: 1 1 auto; min-width: 0; }
+.acct-lock strong { font-size: 13px; font-weight: 550; }
+.acct-lock small, .acct-unlocked span { color: var(--muted); font-size: 12px; line-height: 1.45; }
+.acct-row.set-row { grid-template-columns: auto minmax(0, 1fr) auto; }
+.acct-icon { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 999px; background: var(--surface-2); color: var(--muted); }
+.acct-icon .icon { width: 15px; height: 15px; }
+.acct-badge { display: inline-flex; align-items: center; margin-left: 6px; padding: 1px 8px; border-radius: 999px; background: var(--surface-3); color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .02em; vertical-align: 1px; white-space: nowrap; }
+.acct-badge.is-on { background: var(--bone); color: var(--on-bone); }
+.acct-badge.is-warn { background: var(--accent-soft); color: var(--ember-text); }
+.set-control .acct-badge { margin-left: 0; }
+.acct-code-text { font-size: 12.5px; }
+.acct-foot-form { display: flex; flex-wrap: wrap; gap: 8px; }
+.acct-inline { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
+.acct-inline-input { width: 200px; max-width: 100%; }
+.acct-form { display: grid; gap: 14px; padding: 14px; min-width: 0; }
+.set-panel > .acct-form .text-field { max-width: 360px; }
+.acct-form-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.acct-form-note { margin: 0; max-width: 62ch; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+.acct-create { grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: end; }
+.acct-create .acct-form-note, .acct-create .acct-form-actions { grid-column: 1 / -1; }
+.acct-create select.select { height: 36px; width: 100%; }
+.acct-trap { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+/* Users: "Manage" opens an action panel under the row, not a floating menu, so it works
+   the same with a keyboard, a mouse and a thumb. */
+.acct-user { align-items: start; }
+.acct-user > .profile-dot { margin-top: 2px; }
+.acct-manage { position: static; }
+.acct-manage > summary, .acct-delete > summary { list-style: none; }
+.acct-manage > summary::-webkit-details-marker, .acct-delete > summary::-webkit-details-marker { display: none; }
+.acct-manage[open] > summary { background: var(--surface-3); border-color: var(--border); }
+/* Open, the controls take a row of their own under the name, so the name keeps its width. */
+.acct-user:has(> .set-control .acct-manage[open]) > .set-control { grid-column: 2 / -1; justify-content: flex-start; }
+.acct-manage[open] { width: 100%; text-align: left; }
+.acct-manage-panel { display: flex; flex-wrap: wrap; justify-content: flex-start; gap: 8px; margin-top: 10px; }
+.acct-manage-panel > form { display: contents; }
+.acct-delete { display: contents; }
+.acct-delete[open] > form { flex: 1 0 100%; margin-top: 2px; padding: 12px; border: 1px solid var(--border-soft); border-radius: var(--r-control); background: var(--bg); text-align: left; }
+.acct-reveal { display: grid; gap: 8px; padding: 14px; border: 1px solid var(--border-strong); border-radius: var(--r-panel); background: var(--surface); }
+.acct-reveal strong { font-size: 13px; font-weight: 550; }
+.acct-reveal small { color: var(--muted); font-size: 12px; }
+.acct-secret { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.acct-secret code { flex: 1 1 auto; min-width: 0; padding: 8px 10px; border: 1px solid var(--border-soft); border-radius: var(--r-control); background: var(--bg); color: var(--text); font-size: 12.5px; overflow-wrap: anywhere; user-select: all; }
+.acct-secret .set-label { flex: 1 0 100%; }
+
+/* Two-step setup: QR left, steps right; stacked on phones. The QR stays dark on white in
+   both themes, because that is what a camera reads. */
+.acct-totp { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 20px; align-items: start; padding: 16px; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); }
+.acct-qr { display: grid; gap: 8px; margin: 0; }
+.acct-qr svg { display: block; width: 100%; height: auto; border-radius: var(--r-control); background: #fff; }
+.acct-qr figcaption { color: var(--muted); font-size: 11.5px; line-height: 1.45; }
+.acct-totp-steps { display: grid; gap: 14px; min-width: 0; }
+.acct-totp-steps .acct-form { padding: 0; }
+.acct-steps { display: grid; gap: 4px; margin: 0; padding-left: 18px; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+/* Recovery codes: two columns, 1-5 then 6-10, numbers right-aligned in their own gutter
+   so the monospace codes line up. */
+.acct-codes { display: grid; grid-auto-flow: column; grid-template-rows: repeat(var(--code-rows, 5), auto); grid-template-columns: repeat(2, max-content); justify-content: start; gap: 10px 48px; margin: 0; padding: 18px 20px; list-style: none; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); }
+.acct-codes li { display: grid; grid-template-columns: 3ch max-content; align-items: baseline; gap: 12px; margin: 0; padding: 0; }
+.acct-code-num { color: var(--muted-2); font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
+.acct-codes code { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 15px; letter-spacing: .04em; white-space: nowrap; }
+
+/* A refusal under the field it is about (a wrong current password). */
+.acct-field-error { display: flex; align-items: flex-start; gap: 6px; color: var(--ember-text); font-size: 12.5px; line-height: 1.45; }
+.acct-field-error .icon { flex: 0 0 auto; width: 14px; height: 14px; margin-top: 2px; }
+.acct-field.has-error .field-input { border-color: var(--ember-text); }
+
+/* Devices: a short tag that is the same on every device's list. */
+.acct-session-tag { margin-left: 4px; padding: 1px 6px; border: 1px solid var(--border-soft); border-radius: 999px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 500; letter-spacing: .04em; vertical-align: 1px; }
+
+@media (max-width: 600px) {
+  .auth-card { padding: 20px 16px; }
+  .acct-row.set-row { grid-template-columns: auto minmax(0, 1fr); }
+  .acct-row .set-control { grid-column: 1 / -1; justify-content: flex-start; }
+  .acct-inline { justify-content: flex-start; width: 100%; }
+  .acct-inline-input { flex: 1 1 160px; width: auto; }
+  .acct-create { grid-template-columns: minmax(0, 1fr); }
+  .acct-totp { grid-template-columns: minmax(0, 1fr); }
+  .acct-qr { max-width: 240px; }
+  .acct-codes { gap: 10px 20px; padding: 14px 12px; }
+  .acct-codes li { grid-template-columns: 2.5ch max-content; gap: 8px; }
+  .acct-codes code { font-size: 14px; letter-spacing: 0; }
+  .acct-lock { flex-wrap: wrap; }
+}

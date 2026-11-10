@@ -1,0 +1,242 @@
+/* ---------- menus ---------- */
+.yt-menu { position: relative; min-width: 0; }
+.yt-menu > summary { list-style: none; cursor: pointer; }
+.yt-menu > summary::-webkit-details-marker { display: none; }
+.yt-menu > summary:focus-visible { box-shadow: var(--focus); }
+.card-menu { justify-self: end; }
+/* The layout box stays 22x26 so card grids keep their column: min-width/height
+   (this stylesheet is border-box, so padding alone cannot grow the box) reach
+   --hit, and the negative margin pulls the footprint back to 22x26. */
+.menu-trigger { width: 22px; height: 26px; min-width: var(--hit); min-height: var(--hit); margin: calc((26px - var(--hit)) / 2) calc((22px - var(--hit)) / 2); border-radius: 6px; display: grid; place-items: center; color: var(--muted); }
+.menu-trigger .icon { width: 16px; height: 16px; }
+.menu-trigger:hover, .yt-menu[open] > .menu-trigger, .header-menu[open] > summary, .watch-menu[open] > summary { background: var(--surface-3); color: var(--text); }
+.header-menu { display: grid; place-items: center; }
+.header-menu > summary.icon-button, .profile-menu > summary.profile-dot { display: grid; place-items: center; }
+.profile-menu > summary.profile-dot { cursor: pointer; }
+.watch-menu { display: inline-flex; }
+.watch-menu .menu-panel { left: 0; right: auto; top: 38px; }
+.yt-menu.drop-up .menu-panel { top: auto; bottom: 34px; }
+.watch-menu.drop-up .menu-panel { top: auto; bottom: 38px; }
+.menu-panel { position: absolute; right: 0; top: 32px; z-index: 90; width: min(268px, calc(100vw - 24px)); max-height: min(var(--menu-max-height, 620px), calc(100dvh - 90px)); overflow: auto; padding: 5px; border: 1px solid var(--border); border-radius: var(--r-menu); background: var(--menu); box-shadow: var(--shadow); display: grid; gap: 1px; color: var(--text); scrollbar-width: thin; }
+.menu-panel-wide { width: min(320px, calc(100vw - 24px)); }
+.account-panel { width: min(268px, calc(100vw - 24px)); }
+.account-nav { display: none; }
+.menu-heading { padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--border-soft); margin-bottom: 4px; }
+.menu-heading span { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.menu-heading small { color: var(--muted-2); font-size: 11px; }
+.menu-row { min-height: 36px; width: 100%; border: 0; border-radius: 8px; background: transparent; color: var(--text); display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 11px; padding: 0 10px; text-align: left; cursor: pointer; font-size: 13px; }
+.menu-row:hover, .menu-row:focus-visible { background: var(--surface-3); }
+.menu-row.danger .menu-icon, .menu-row.danger .menu-label { color: var(--ember-text); }
+.menu-row.disabled { cursor: default; color: var(--muted-2); }
+.menu-row.disabled:hover { background: transparent; }
+.menu-icon { display: grid; place-items: center; color: var(--muted); }
+.menu-icon .icon { width: 16px; height: 16px; }
+.menu-copy { min-width: 0; display: block; }
+.menu-label { display: block; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-sub { display: none; }
+.menu-row.stacked { min-height: 44px; padding: 6px 10px; }
+.menu-row.stacked .menu-sub { display: block; color: var(--muted-2); font-size: 11.5px; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* "Why this video": the reason is the content, so it wraps instead of clipping. */
+.menu-row[data-why-video] .menu-sub { white-space: normal; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; max-width: 260px; }
+.menu-trailing { color: var(--muted-2); font-size: 11.5px; }
+.menu-separator { height: 1px; margin: 5px 0; background: var(--border-soft); }
+.account-summary { display: flex; align-items: center; gap: 10px; padding: 8px 10px; }
+.account-summary strong { display: block; font-size: 13px; font-weight: 600; }
+.account-summary small { color: var(--muted-2); font-size: 11.5px; }
+.notifications-panel .menu-row { min-height: 46px; }
+
+/* ---------- feed loading ---------- */
+.empty-panel, .empty-copy { color: var(--muted); }
+.feed-loading { margin-top: 34px; }
+.feed-retry { min-height: 48px; margin: 32px auto 0; color: var(--muted); display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 12.5px; }
+.feed-loading[hidden], .feed-retry[hidden] { display: none; }
+.feed-retry button { height: 30px; border: 1px solid var(--border); border-radius: var(--r-control); background: transparent; color: var(--text); padding: 0 12px; cursor: pointer; }
+.feed-sentinel { height: 1px; }
+
+/* ---------- dialogs ---------- */
+.feed-dialog { width: min(680px, calc(100vw - 32px)); border: 1px solid var(--border); border-radius: var(--r-panel); background: var(--menu); color: var(--text); padding: 0; box-shadow: var(--shadow-dialog); }
+.feed-dialog::backdrop { background: var(--scrim); }
+.dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 18px 20px; border-bottom: 1px solid var(--border-soft); }
+.dialog-head h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.dialog-head p { margin: 6px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+.dialog-body { padding: 18px 20px; display: grid; gap: 14px; }
+.dialog-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+.dialog-card { border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-2); padding: 14px; }
+.dialog-card:nth-child(3) { grid-column: 1 / -1; }
+.range-row, .text-field { display: grid; gap: 8px; color: var(--text); font-size: 12.5px; }
+.range-row span { display: grid; gap: 4px; }
+.range-row strong { font-size: 13px; font-weight: 550; }
+.range-row small, .dialog-note { color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+.range-row input[type=range] { width: 100%; accent-color: var(--accent); }
+.text-field input, .field-input { width: 100%; min-height: 36px; border: 1px solid var(--border); border-radius: var(--r-control); background: var(--bg); color: var(--text); padding: 0 11px; outline: none; font-size: 13px; }
+.text-field input:focus-visible, .field-input:focus-visible { box-shadow: var(--focus); }
+.signal-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.signal-list span { min-height: 26px; display: inline-flex; align-items: center; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--muted); padding: 0 9px; font-size: 11.5px; }
+
+/* ---------- buttons ----------
+   .btn is the family; the older names stay as aliases until every surface has moved.
+   Sizes: 36px default, 32px .btn-sm. At most one .btn-primary per view. */
+.btn, .pill-action, .text-action, .primary-action, .subscribe-pill { position: relative; min-height: 36px; border: 1px solid transparent; border-radius: 999px; background: var(--surface-2); color: var(--text);
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 0 15px; cursor: pointer; white-space: nowrap;
+  font-size: 13px; font-weight: 550; letter-spacing: -.005em; list-style: none;
+  transition: background var(--dur-press) ease, border-color var(--dur-press) ease, color var(--dur-press) ease, transform var(--dur-press) var(--ease-press); }
+.btn .icon, .pill-action .icon { width: 17px; height: 17px; }
+.btn:hover, .pill-action:hover, .text-action:hover, .subscribe-pill:hover { background: var(--surface-3); border-color: var(--border-soft); }
+.btn:active, .pill-action:active, .text-action:active, .primary-action:active, .subscribe-pill:active { transform: scale(.96); }
+.btn:disabled, .pill-action:disabled, .text-action:disabled, .primary-action:disabled, .subscribe-pill:disabled,
+.btn[aria-disabled="true"] { cursor: default; opacity: .55; pointer-events: none; }
+.btn-sm, .text-action, .primary-action, .subscribe-pill { min-height: 32px; gap: 7px; padding: 0 14px; }
+.btn-sm .icon, .text-action .icon, .subscribe-pill .icon { width: 15px; height: 15px; }
+.btn-primary, .primary-action { background: var(--bone); color: var(--on-bone); font-weight: 600; }
+.btn-primary:hover, .primary-action:hover { background: var(--bone-hover); border-color: transparent; }
+.btn-ghost { background: transparent; color: var(--muted); }
+.btn-ghost:hover { background: var(--surface-2); border-color: transparent; color: var(--text); }
+.btn-danger, .pill-action.danger, .text-action.danger { color: var(--ember-text); }
+/* The one Ember fill in the product: the confirm of an irreversible wipe, inside a dialog. */
+.btn-danger-fill { background: var(--accent); color: var(--on-bone); font-weight: 600; }
+.btn-danger-fill:hover { background: var(--ember-text); border-color: transparent; }
+.btn-icon, .pill-icon { width: 36px; padding: 0; gap: 0; }
+.btn-sm.btn-icon { width: 32px; }
+.icon-button, .topic-chip, .ch-chip, .tab { transition: background var(--dur-press) ease, color var(--dur-press) ease, transform var(--dur-press) var(--ease-press); }
+.icon-button:active, .topic-chip:active, .ch-chip:active, .tab:active { transform: scale(.96); }
+
+/* ---------- segmented control ---------- */
+.segmented { display: inline-flex; align-items: center; gap: 2px; padding: 2px; border-radius: 999px; background: var(--surface-2); max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+.segmented::-webkit-scrollbar { display: none; }
+.segment { position: relative; flex: 0 0 auto; min-height: 30px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 0 12px; cursor: pointer; white-space: nowrap; font-size: 12.5px; font-weight: 550;
+  transition: background var(--dur-press) ease, color var(--dur-press) ease, transform var(--dur-press) var(--ease-press); }
+.segment:hover { color: var(--text); }
+.segment:active { transform: scale(.96); }
+.segment.active, .segment[aria-pressed="true"], .segment[aria-current], .segment:has(> input:checked) { background: var(--bone); color: var(--on-bone); }
+.segment:has(> input:focus-visible) { box-shadow: var(--focus); }
+.segment .icon { width: 15px; height: 15px; }
+
+/* ---------- switch ----------
+   A real checkbox underneath. ON is inversion, never green or Ember. */
+:is(.switch, .toggle-row input[type=checkbox], .source-row input[type=checkbox]) { appearance: none; -webkit-appearance: none; position: relative; width: 34px; height: 20px; flex: 0 0 auto; margin: 0; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); cursor: pointer; transition: background var(--dur-press) ease, border-color var(--dur-press) ease; }
+:is(.switch, .toggle-row input[type=checkbox], .source-row input[type=checkbox])::after { content: ''; position: absolute; top: 1px; left: 1px; width: 16px; height: 16px; border-radius: 999px; background: var(--muted); transition: transform var(--dur-press) var(--ease-press), background var(--dur-press) ease; }
+:is(.switch, .toggle-row input[type=checkbox], .source-row input[type=checkbox]):checked { background: var(--bone); border-color: transparent; }
+:is(.switch, .toggle-row input[type=checkbox], .source-row input[type=checkbox]):checked::after { transform: translateX(14px); background: var(--on-bone); }
+:is(.switch, .toggle-row input[type=checkbox], .source-row input[type=checkbox]):active::after { transform: scale(.96); }
+:is(.switch, .toggle-row input[type=checkbox], .source-row input[type=checkbox]):checked:active::after { transform: translateX(14px) scale(.96); }
+:is(.switch, .toggle-row input[type=checkbox], .source-row input[type=checkbox]):disabled { cursor: default; opacity: .55; }
+
+/* ---------- select ----------
+   The native control, restyled. The popup stays the platform's own, dark. */
+:is(.select, select.field-input, .sb-row select, .collection-form select) { appearance: none; -webkit-appearance: none; height: 32px; padding: 0 28px 0 10px; border: 1px solid var(--border); border-radius: var(--r-control); background: var(--bg) var(--select-chevron) no-repeat right 9px center / 13px; color: var(--text); font-size: 12.5px; cursor: pointer; }
+:is(.select, select.field-input, .sb-row select, .collection-form select):disabled { cursor: default; opacity: .55; }
+
+/* ---------- range ----------
+   Ember fill is one of the allowed uses. The ui script keeps --fill and the <output> current. */
+.range, .fc-slider { width: 100%; height: 4px; margin: 12px 0 6px; appearance: none; -webkit-appearance: none; border-radius: 999px;
+  background: linear-gradient(to right, var(--accent) var(--fill, 35%), var(--surface-3) var(--fill, 35%)); cursor: pointer; }
+.range::-webkit-slider-thumb, .fc-slider::-webkit-slider-thumb { appearance: none; -webkit-appearance: none; width: 16px; height: 16px; border: 0; border-radius: 999px; background: var(--bone); cursor: grab; }
+.range::-moz-range-thumb, .fc-slider::-moz-range-thumb { width: 16px; height: 16px; border: 0; border-radius: 999px; background: var(--bone); cursor: grab; }
+.range-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 2px 12px; }
+.range-field-label { color: var(--text); font-size: 13px; font-weight: 550; }
+.range-output { color: var(--text); font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; min-width: 4ch; }
+.range-field .range { grid-column: 1 / -1; }
+.range-scale { grid-column: 1 / -1; display: flex; justify-content: space-between; color: var(--muted-2); font-size: 11px; }
+
+/* ---------- page header ----------
+   One line: title, count or meta, actions on the right. A .toolbar may follow it. */
+.page-head { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; min-height: 36px; margin-bottom: 16px; }
+.page-head h1 { margin: 0; font-size: 22px; font-weight: 650; line-height: 1.25; letter-spacing: -.02em; }
+.page-meta { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.page-head .page-actions { margin-left: auto; }
+
+/* ---------- empty state ----------
+   Says how things get here. Left-aligned in flow, one action, no illustration. */
+.empty-state { display: grid; justify-items: start; gap: 6px; padding: 28px 0; max-width: 52ch; color: var(--muted); font-size: 13px; line-height: 1.55; }
+.empty-state > .icon { width: 22px; height: 22px; margin-bottom: 4px; color: var(--muted-2); }
+.empty-state h2 { margin: 0; color: var(--text); font-size: 14.5px; font-weight: 600; line-height: 1.4; letter-spacing: -.008em; }
+.empty-state p { margin: 0; }
+.empty-state-action { margin-top: 8px; }
+:is(.channel-grid, .video-grid, .timeline, .playlist-grid, .collection-grid) > .empty-state { grid-column: 1 / -1; }
+
+/* ---------- skeletons and image loading ----------
+   Placeholders use the real card classes, so they cannot drift from the layout. */
+@keyframes of-shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+.skeleton { display: block; border-radius: 6px; background: var(--surface-2) var(--shimmer) 0 0 / 200% 100%; animation: of-shimmer 1.6s ease-in-out infinite; }
+.skeleton.thumb { border-radius: var(--r-thumb); border-color: transparent; }
+.skeleton-avatar { width: 32px; height: 32px; border-radius: 999px; }
+.skeleton-line { height: 14px; margin-top: 7px; }
+.skeleton-line:first-child { margin-top: 2px; }
+.skeleton-line.is-meta { height: 12px; }
+.w-92 { width: 92%; }
+.w-64 { width: 64%; }
+.w-40 { width: 40%; }
+.skeleton-row:hover { background: none; }
+/* Text placeholders hide while an image element exists, so "OpenFeed" and a channel's
+   initials appear only once the image has failed and removed itself. CSS rather than a
+   class set by script: there is no moment, however slow the proxy, when they can flash. */
+:is(.thumb, .short-thumb):has(> img) > .thumb-fallback { display: none; }
+.avatar.has-image .avatar-initials { visibility: hidden; }
+/* html.of-ready is set by the ui script in the same task that marks images already
+   decoded, so a cached image never fades, and no script at all means plain images. */
+:is(.thumb, .short-thumb, .playlist-cover, .notification-thumb, .post-video-thumb):has(> img:not(.is-loaded)) { background-color: var(--surface-2); }
+html.of-ready :is(.thumb, .short-thumb, .playlist-cover, .notification-thumb, .post-video-thumb, .avatar):has(> img:not(.is-loaded, .is-failed)) { background-image: var(--shimmer); background-size: 200% 100%; animation: of-shimmer 1.6s ease-in-out infinite; }
+html.of-ready :is(.thumb, .short-thumb, .playlist-cover, .notification-thumb, .post-video-thumb, .avatar) > img:not(.is-loaded) { opacity: 0; }
+:is(.thumb, .short-thumb, .playlist-cover, .notification-thumb, .post-video-thumb, .avatar) > img { transition: opacity var(--dur-fade) ease; }
+
+/* ---------- toast ----------
+   The region is a manual popover so it can sit above an open dialog or sheet. */
+.toast-stack { position: fixed; inset: auto auto 20px 20px; z-index: 120; margin: 0; padding: 0; border: 0; background: none; color: var(--text); overflow: visible; width: min(380px, calc(100vw - 32px)); height: auto; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+.toast { pointer-events: auto; display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 7px 8px 7px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--menu); box-shadow: var(--shadow); font-size: 13px; line-height: 1.4; animation: toast-in var(--dur-fade) var(--ease-press); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.toast-dot { display: none; flex: 0 0 auto; width: 8px; height: 8px; border-radius: 999px; }
+.toast[data-kind="success"] .toast-dot, .toast[data-kind="error"] .toast-dot { display: block; }
+.toast[data-kind="success"] .toast-dot { background: var(--live); }
+.toast[data-kind="error"] .toast-dot { background: var(--accent); }
+.toast-message { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; padding-right: 6px; }
+.toast-action, .toast-close { flex: 0 0 auto; position: relative; min-height: 28px; border: 0; border-radius: 6px; background: transparent; color: var(--text); padding: 0 8px; cursor: pointer; font-size: 13px; font-weight: 600; }
+.toast-close { display: grid; place-items: center; width: 28px; padding: 0; color: var(--muted); }
+.toast-close .icon { width: 15px; height: 15px; }
+.toast-action:hover, .toast-close:hover { background: var(--surface-3); color: var(--text); }
+
+/* ---------- confirm ---------- */
+.confirm-dialog { width: min(400px, calc(100vw - 32px)); }
+.confirm-form { display: grid; gap: 10px; padding: 20px; }
+.confirm-form h2 { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; letter-spacing: -.014em; }
+.confirm-form p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.confirm-typed { display: grid; gap: 8px; color: var(--muted); font-size: 12.5px; }
+.confirm-typed[hidden] { display: none; }
+.confirm-typed code { color: var(--text); font: 600 12.5px/1 ui-monospace, monospace; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+
+/* ---------- keyboard shortcuts ---------- */
+.shortcuts-dialog { width: min(460px, calc(100vw - 32px)); }
+.shortcuts-dialog .dialog-head { align-items: center; padding: 14px 12px 12px 20px; }
+.shortcuts-body { display: grid; gap: 18px; max-height: min(70dvh, 560px); overflow-y: auto; padding: 16px 20px 20px; }
+.shortcut-group h3 { margin: 0 0 8px; color: var(--muted-2); font-size: 11px; font-weight: 600; line-height: 1.2; letter-spacing: .07em; text-transform: uppercase; }
+.shortcut-note { margin: -2px 0 8px; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+.shortcut-list { display: grid; gap: 2px; margin: 0; }
+.shortcut-list > div { display: grid; grid-template-columns: minmax(96px, auto) minmax(0, 1fr); align-items: center; gap: 14px; min-height: 32px; }
+.shortcut-list dt { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.shortcut-list dd { margin: 0; color: var(--text); font-size: 13px; line-height: 1.4; }
+.shortcut-list kbd { display: inline-grid; place-items: center; min-width: 22px; height: 22px; padding: 0 6px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 6px; background: var(--surface-2); color: var(--text); font: 600 11.5px/1 ui-monospace, monospace; }
+
+/* ---------- bottom sheet ----------
+   The handle is injected by the ui script and only exists as a box at phone width.
+   The layout itself lives in 90-responsive so it comes after every panel variant. */
+.sheet-handle { display: none; }
+html.of-sheet-open, html.of-sheet-open body { overflow: hidden; }
+@keyframes sheet-in { from { transform: translateY(100%); } to { transform: none; } }
+
+/* ---------- touch ----------
+   The box keeps its designed size and an invisible child of it takes the touch. */
+@media (pointer: coarse) {
+  :is(.btn, .pill-action, .text-action, .primary-action, .subscribe-pill, .topic-chip, .ch-chip, .segment, .toast-action, .toast-close)::after { content: ""; position: absolute; left: min(0px, calc(50% - var(--hit) / 2)); right: min(0px, calc(50% - var(--hit) / 2)); top: min(0px, calc(50% - var(--hit) / 2)); bottom: min(0px, calc(50% - var(--hit) / 2)); }
+  :is(.switch, .toggle-row input[type=checkbox], .source-row input[type=checkbox])::before { content: ""; position: absolute; inset: -12px -5px; }
+  .tab { min-height: var(--hit); }
+  .menu-row { min-height: var(--hit); }
+  .range, .fc-slider { height: var(--hit); margin-block: -8px -12px; border-block: 20px solid transparent; background-clip: padding-box; }
+  .search-form input, .field-input, .text-field input, .toolbar-search input, .page-search input { font-size: 16px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn, .pill-action, .text-action, .primary-action, .subscribe-pill, .icon-button, .topic-chip, .ch-chip, .tab, .segment { transition: none; }
+  .btn:active, .pill-action:active, .text-action:active, .primary-action:active, .subscribe-pill:active, .icon-button:active, .topic-chip:active, .ch-chip:active, .tab:active, .segment:active { transform: none; }
+  .skeleton, html.of-ready :is(.thumb, .short-thumb, .playlist-cover, .notification-thumb, .post-video-thumb, .avatar):has(> img:not(.is-loaded, .is-failed)) { animation: none; }
+  .toast { animation: none; }
+}

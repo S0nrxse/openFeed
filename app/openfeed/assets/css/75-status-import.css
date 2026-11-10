@@ -1,0 +1,188 @@
+/* ---------- sponsorblock ---------- */
+.sb-categories { display: grid; }
+.sb-categories[hidden] { display: none; }
+/* The timeline markers and the manual skip button are NOT styled here. They are
+   created inside the player embed, which is a separate document that never loads
+   this stylesheet — their rules live in EMBED_CSS in the player shell, and putting
+   copies here only makes it look like they are covered. The skip notice reuses the
+   shared toast. */
+
+/* ---------- status ---------- */
+.status-page { max-width: 960px; }
+.status-view { display: grid; gap: 20px; min-width: 0; }
+.status-dot { display: block; width: 8px; height: 8px; flex: 0 0 auto; border-radius: 999px; background: var(--muted-2); font-style: normal; }
+.status-dot.is-ok { background: var(--live); box-shadow: 0 0 8px rgba(63,185,80,.45); }
+.status-dot.is-warn, .status-dot.is-hold { background: var(--hold); box-shadow: 0 0 8px rgba(210,153,34,.4); }
+.status-dot.is-bad { background: var(--accent); box-shadow: 0 0 8px rgba(229,72,77,.4); }
+.status-verdict { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 8px 12px; min-width: 0; }
+.status-verdict > .status-dot { margin-top: 7px; }
+.status-verdict-copy { flex: 1 1 280px; display: grid; gap: 2px; min-width: 0; }
+.status-verdict-copy h2 { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; letter-spacing: -.014em; overflow-wrap: anywhere; }
+.status-verdict-copy p { margin: 0; color: var(--muted); font-size: 12.5px; }
+.status-verdict-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.status-counters { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); overflow: hidden; }
+.status-cell { display: grid; gap: 2px; align-content: start; padding: 10px 14px; box-shadow: 1px 0 0 var(--border-soft), 0 1px 0 var(--border-soft); }
+.status-cell strong { font-size: 17px; font-weight: 600; letter-spacing: -.014em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.stat-label { color: var(--muted-2); font-size: 11px; font-weight: 600; line-height: 1.2; letter-spacing: .07em; text-transform: uppercase; }
+.status-block { display: grid; gap: 8px; min-width: 0; }
+.status-head { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 6px 12px; }
+.status-head h3 { margin: 0; font-size: 13.5px; font-weight: 600; }
+.status-head p { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
+.status-skeleton-row { padding: 12px 14px; }
+.status-skeleton-row + .status-skeleton-row { border-top: 1px solid var(--border-soft); }
+.status-view.is-loading > div { display: grid; gap: 20px; }
+.status-view.is-loading .status-dot { width: 8px; height: 8px; border-radius: 999px; }
+
+/* The source ladder: a stepper down a 1px rail, the source in use inverted. */
+.ladder { margin: 0; padding: 0; list-style: none; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); overflow: hidden; }
+.ladder-step { position: relative; display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 12px; align-items: center; min-height: 52px; padding: 8px 14px; }
+.ladder-step + .ladder-step::before { content: ""; position: absolute; left: 26px; top: -13px; height: 26px; width: 1px; background: var(--border); }
+.ladder-node { position: relative; z-index: 1; display: grid; place-items: center; width: 24px; height: 24px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ladder-step[aria-current] .ladder-node { border-color: transparent; background: var(--bone); color: var(--on-bone); font-weight: 600; }
+.ladder-step.is-off .ladder-copy { opacity: .6; }
+.ladder-copy { display: flex; align-items: center; flex-wrap: wrap; gap: 2px 8px; min-width: 0; }
+.ladder-copy strong { font-size: 13px; font-weight: 550; overflow-wrap: anywhere; }
+.ladder-chip { padding: 1px 7px; border-radius: 999px; background: var(--bone); color: var(--on-bone); font-size: 11px; font-weight: 600; }
+.ladder-state { flex: 1 1 100%; display: flex; align-items: center; flex-wrap: wrap; gap: 2px 8px; color: var(--muted); font-size: 12px; }
+.ladder-state [data-cooldown] { color: var(--hold); font-variant-numeric: tabular-nums; }
+
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); overflow: hidden; }
+.stat-tile { display: grid; gap: 2px; align-content: start; padding: 10px 14px; box-shadow: 1px 0 0 var(--border-soft), 0 1px 0 var(--border-soft); }
+.stat-value { font-size: 14.5px; font-weight: 600; letter-spacing: -.008em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.stat-tile small { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.status-fold { min-width: 0; border-top: 1px solid var(--border-soft); padding-top: 8px; }
+.status-fold summary { display: flex; align-items: center; gap: 8px; min-height: var(--hit); color: var(--text); font-size: 13px; font-weight: 550; cursor: pointer; }
+.status-fold[open] summary { margin-bottom: 8px; }
+/* Tables scroll inside their own box so a long message can never widen the page. */
+.status-scroll { overflow-x: auto; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); }
+.status-scroll table { width: 100%; border-collapse: collapse; font-size: 12.5px; min-width: 560px; }
+.status-scroll th, .status-scroll td { padding: 8px 14px; text-align: left; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+.status-scroll th { color: var(--muted-2); font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; }
+.status-scroll tr:last-child td { border-bottom: 0; }
+.status-scroll .bad-text { color: var(--ember-text); }
+
+/* ---------- takeout import ---------- */
+.stages { display: flex; align-items: center; gap: 8px; margin: 0; padding: 0; list-style: none; min-width: 0; color: var(--muted-2); font-size: 12.5px; }
+.stage { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 550; }
+.stage + .stage::before { content: ""; flex: 0 1 40px; width: 40px; min-width: 8px; height: 1px; background: var(--border); }
+.stage-node { display: grid; place-items: center; flex: 0 0 auto; width: 22px; height: 22px; border: 1px solid var(--border); border-radius: 999px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.stage-node .icon { display: none; width: 13px; height: 13px; }
+.stage.is-current { color: var(--text); }
+.stage.is-current .stage-node { border-color: transparent; background: var(--bone); color: var(--on-bone); font-weight: 600; }
+.stage.is-done { color: var(--muted); }
+.stage.is-done .stage-number { display: none; }
+.stage.is-done .stage-node .icon { display: block; }
+.import-status { display: grid; gap: 12px; min-width: 0; }
+.import-status .set-label-row { min-height: 0; }
+.import-top { display: grid; margin: 0; padding: 0; list-style: none; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); overflow: hidden; }
+.import-top li { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 8px 14px; font-size: 13px; }
+.import-top li + li { border-top: 1px solid var(--border-soft); }
+.import-top span { min-width: 0; overflow-wrap: anywhere; }
+.import-top b { color: var(--muted); font-size: 12.5px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.import-note { display: flex; gap: 8px; align-items: flex-start; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.import-note .icon { width: 15px; height: 15px; flex: 0 0 auto; margin-top: 2px; color: var(--muted); }
+.import-note strong { color: var(--text); font-weight: 550; }
+.link-action { border: 0; background: none; padding: 0; color: var(--text); font: inherit; cursor: pointer; text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 2px; }
+.link-action:hover { text-decoration-color: currentColor; }
+.import-guide { min-width: 0; }
+.import-guide summary { display: inline-flex; align-items: center; min-height: var(--hit); color: var(--text); font-size: 13px; font-weight: 550; cursor: pointer; }
+.import-steps { margin: 8px 0 0; padding: 0 0 0 20px; display: grid; gap: 12px; }
+.import-steps li { padding-left: 4px; color: var(--muted-2); font-size: 12.5px; }
+.import-steps h3 { margin: 0 0 2px; color: var(--text); font-size: 13px; font-weight: 550; }
+.import-steps p { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.55; max-width: 66ch; }
+.import-steps strong { color: var(--text); font-weight: 550; }
+.import-steps a { color: var(--text); text-underline-offset: 2px; }
+.import-panel { display: grid; gap: 8px; min-width: 0; }
+.import-drop { display: grid; place-items: center; gap: 4px; min-height: 148px; padding: 20px; cursor: pointer;
+  border: 1px dashed var(--border); border-radius: var(--r-panel); background: var(--surface); text-align: center; transition: background var(--dur-press) ease; }
+.import-drop[hidden] { display: none; }
+.import-drop:hover, .import-drop.is-over { background: var(--surface-2); border-color: var(--border-strong); }
+.import-drop:focus-visible { outline: none; box-shadow: var(--focus); }
+.import-drop .icon { width: 22px; height: 22px; color: var(--muted); }
+.import-drop strong { font-size: 13.5px; font-weight: 550; }
+.import-drop small { color: var(--muted); font-size: 12.5px; }
+.import-chosen { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px 16px; min-height: 56px; padding: 10px 14px; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); }
+.import-chosen[hidden], .import-progress[hidden], .import-result[hidden] { display: none; }
+.import-progress { display: grid; gap: 8px; padding: 12px 14px; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); }
+.import-result { padding: 10px 14px; border-radius: var(--r-panel); background: var(--accent-soft); color: var(--text); font-size: 12.5px; line-height: 1.55; overflow-wrap: anywhere; }
+.setup-card { margin: 0 0 24px; max-width: 640px; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); overflow: hidden; }
+.setup-head { display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 8px 10px 8px 14px; }
+.setup-head h2 { margin: 0; font-size: 14.5px; font-weight: 600; letter-spacing: -.008em; }
+.setup-head .btn { margin-left: auto; }
+.setup-list { margin: 0; padding: 0; list-style: none; }
+.setup-list li { border-top: 1px solid var(--border-soft); }
+.setup-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) 16px; align-items: center; gap: 10px; width: 100%; min-height: 52px; padding: 8px 14px; border: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer; transition: background var(--dur-press) ease; }
+.setup-row:hover { background: var(--surface-2); }
+.setup-row:focus-visible { outline: none; box-shadow: inset var(--focus); }
+.setup-row > .icon { width: 15px; height: 15px; color: var(--muted-2); }
+.setup-mark { display: grid; place-items: center; width: 20px; height: 20px; border: 1px solid var(--border); border-radius: 999px; }
+.setup-mark .icon { display: none; width: 13px; height: 13px; }
+.is-done .setup-mark { border-color: transparent; background: var(--bone); color: var(--on-bone); }
+.is-done .setup-mark .icon { display: block; }
+.setup-copy { display: grid; gap: 1px; min-width: 0; }
+.setup-copy strong { font-size: 13px; font-weight: 550; }
+.is-done .setup-copy strong { color: var(--muted); }
+.setup-copy small { color: var(--muted); font-size: 12px; }
+
+.download-destination { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
+.download-destination[hidden] { display: none; }
+.destination-option { display: grid; gap: 3px; text-align: left; padding: 10px 12px; border: 1px solid var(--border);
+  border-radius: 10px; background: var(--surface-2); color: var(--text); cursor: pointer; }
+.destination-option:hover { background: var(--surface-3); }
+.destination-option.active { border-color: var(--bone); background: var(--surface-3); }
+.destination-option strong { font-size: 13px; font-weight: 600; }
+.destination-option small { color: var(--muted); font-size: 11.5px; line-height: 1.4; }
+@media (max-width: 560px) { .download-destination { grid-template-columns: 1fr; } }
+
+.video-card { position: relative; }
+
+/* ---------- downloads page ---------- */
+.storage-strip { display: grid; gap: 8px; max-width: 1072px; margin-bottom: 20px; }
+.storage-strip p { margin: 0; color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.storage-bar { display: flex; gap: 1px; height: 6px; overflow: hidden; border-radius: 999px; background: var(--surface-2); }
+.storage-bar .is-downloads { background: var(--bone); }
+.storage-bar .is-other { background: var(--surface-3); }
+.downloads-section { max-width: 1072px; margin-bottom: 24px; }
+.downloads-section[hidden] { display: none; }
+.downloads-list { max-width: 1080px; }
+.job-row h2 { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-row .row-byline { display: block; overflow: hidden; text-overflow: ellipsis; }
+.job-row .download-bar { height: 3px; margin-top: 3px; }
+.failed-list { display: grid; gap: 8px; }
+.failed-job { display: flex; align-items: center; gap: 12px 16px; padding: 12px 14px; border-radius: var(--r-panel); background: var(--accent-soft); }
+.failed-job-copy { flex: 1; min-width: 0; display: grid; gap: 3px; }
+.failed-job h3 { margin: 0; overflow: hidden; color: var(--text); font-size: 13.5px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
+.failed-job p { margin: 0; color: var(--ember-text); font-size: 12.5px; line-height: 1.45; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.failed-job-actions { flex: 0 0 auto; display: flex; gap: 8px; }
+.quality-chip { position: absolute; left: 6px; bottom: 6px; z-index: 2; border-radius: 4px; background: var(--badge); color: #fff; font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums; line-height: 1; padding: 3px 5px; }
+
+/* ---------- download dialog ---------- */
+.download-dialog { width: min(440px, calc(100vw - 32px)); }
+.download-dialog .dialog-actions[hidden] { display: none; }
+.download-dialog .download-options { gap: 2px; max-height: min(300px, 44dvh); overflow-y: auto; overscroll-behavior: contain; }
+.download-dialog .download-options[hidden] { display: none; }
+.download-option { grid-template-columns: 18px minmax(0, 1fr) auto; min-height: 48px; padding: 7px 12px; border-color: transparent; background: transparent; cursor: pointer; }
+.download-option:has(input:checked) { background: var(--surface-3); }
+.download-option:has(input:focus-visible) { box-shadow: var(--focus); }
+.download-radio { display: grid; place-items: center; width: 18px; height: 18px; border: 1px solid var(--muted-2); border-radius: 999px; transition: background var(--dur-press) ease, border-color var(--dur-press) ease; }
+.download-radio::after { content: ""; width: 8px; height: 8px; border-radius: 999px; background: transparent; }
+.download-option:has(input:checked) .download-radio { background: var(--bone); border-color: var(--bone); }
+.download-option:has(input:checked) .download-radio::after { background: var(--on-bone); }
+.download-option-copy { min-width: 0; }
+.download-option-skeleton { display: block; height: 48px; margin-bottom: 2px; border-radius: 10px; }
+.download-warning { margin: 0; color: var(--hold); font-size: 12.5px; line-height: 1.45; }
+.download-warning[hidden] { display: none; }
+
+.download-progress { display: grid; gap: 10px; }
+.download-progress[hidden] { display: none; }
+.download-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.download-progress-head strong { font-size: 13.5px; font-weight: 600; }
+.download-bar { height: 6px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
+.download-bar span { display: block; height: 100%; width: 0; border-radius: 999px; background: var(--accent);
+  transition: width .3s ease; }
+.download-bar.is-indeterminate span { width: 40%; animation: download-sweep 1.1s ease-in-out infinite; }
+@keyframes download-sweep { 0% { transform: translateX(-100%); } 100% { transform: translateX(250%); } }
+@media (prefers-reduced-motion: reduce) {
+  .download-bar span { transition: none; }
+  .download-bar.is-indeterminate span { animation: none; width: 100%; opacity: .5; }
+}

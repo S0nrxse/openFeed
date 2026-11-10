@@ -13,8 +13,11 @@ x-openfeed-common-env: &openfeed-common-env
   DISCOVER_RELATED_PER_VIDEO: ${DISCOVER_RELATED_PER_VIDEO:-6}
   INVIDIOUS_BASE_URL: ${INVIDIOUS_BASE_URL:-http://openfeed-invidious:3000}
   INVIDIOUS_PUBLIC_URL: ${INVIDIOUS_PUBLIC_URL:-http://localhost:8061}
-  OPENFEED_PLAYBACK_FALLBACK: ${OPENFEED_PLAYBACK_FALLBACK:-youtube}
+  OPENFEED_PLAYBACK_FALLBACK: ${OPENFEED_PLAYBACK_FALLBACK:-off}
   OPENFEED_INVIDIOUS_FALLBACKS: ${OPENFEED_INVIDIOUS_FALLBACKS:-}
+  OPENFEED_ALLOW_PUBLIC_INSTANCES: ${OPENFEED_ALLOW_PUBLIC_INSTANCES:-false}
+  OPENFEED_OUTBOUND_PROXY: ${OPENFEED_OUTBOUND_PROXY:-}
+  OPENFEED_LOG_CLIENT_DETAILS: ${OPENFEED_LOG_CLIENT_DETAILS:-false}
   OPENFEED_PLAYBACK_PROBE_TIMEOUT: ${OPENFEED_PLAYBACK_PROBE_TIMEOUT:-4}
   OPENFEED_YTDLP_ENABLED: ${OPENFEED_YTDLP_ENABLED:-true}
   OPENFEED_YTDLP_PLAYBACK: ${OPENFEED_YTDLP_PLAYBACK:-true}
@@ -26,6 +29,7 @@ x-openfeed-common-env: &openfeed-common-env
   OPENFEED_DOWNLOAD_RETENTION: ${OPENFEED_DOWNLOAD_RETENTION:-21600}
   OPENFEED_DOWNLOAD_CONCURRENCY: ${OPENFEED_DOWNLOAD_CONCURRENCY:-2}
   OPENFEED_DOWNLOAD_MAX_HEIGHT: ${OPENFEED_DOWNLOAD_MAX_HEIGHT:-2160}
+  OPENFEED_DEARROW_ENABLED: ${OPENFEED_DEARROW_ENABLED:-true}
 
 services:
   openfeed-postgres:
@@ -65,6 +69,17 @@ services:
       context: ./app
     image: openfeed-app:local
     restart: unless-stopped
+    # Match the uid of the bind-mounted ./data/downloads owner (set OPENFEED_UID
+    # for host setups). The image's own openfeed user is uid 10000 otherwise.
+    user: "${OPENFEED_UID:-10000}:${OPENFEED_GID:-10000}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # A runaway 4K remux or a fork bomb inside the container should not be able to
+    # starve the database on the shared host.
+    mem_limit: ${OPENFEED_APP_MEM_LIMIT:-4g}
+    pids_limit: ${OPENFEED_APP_PIDS_LIMIT:-256}
     depends_on:
       openfeed-postgres:
         condition: service_healthy
@@ -72,6 +87,10 @@ services:
         condition: service_healthy
       openfeed-invidious:
         condition: service_started
+    # Further OIDC providers' settings (OPENFEED_OIDC_<NAME>_*, docs/accounts.md).
+    env_file:
+      - path: ./signin.env
+        required: false
     environment:
       <<: *openfeed-common-env
       TZ: ${TZ:-UTC}
@@ -92,6 +111,20 @@ services:
       OPENFEED_OIDC_CLIENT_SECRET: ${OPENFEED_OIDC_CLIENT_SECRET:-}
       OPENFEED_OIDC_REDIRECT_URI: ${OPENFEED_OIDC_REDIRECT_URI:-}
       OPENFEED_OIDC_SCOPE: ${OPENFEED_OIDC_SCOPE:-openid email profile}
+      OPENFEED_OIDC_NAME: ${OPENFEED_OIDC_NAME:-Authentik}
+      OPENFEED_PASSWORD_SIGNIN: ${OPENFEED_PASSWORD_SIGNIN:-auto}
+      OPENFEED_TRUSTED_PROXIES: ${OPENFEED_TRUSTED_PROXIES:-}
+      # Phase 2 sign-in methods (docs/accounts.md). Per-provider OPENFEED_OIDC_<NAME>_*
+      # settings go in signin.env next to this file (read by env_file above, if it exists).
+      OPENFEED_PASSKEYS: ${OPENFEED_PASSKEYS:-auto}
+      OPENFEED_OIDC_PROVIDERS: ${OPENFEED_OIDC_PROVIDERS:-}
+      OPENFEED_TRUSTED_HEADER: ${OPENFEED_TRUSTED_HEADER:-}
+      OPENFEED_TRUSTED_HEADER_GROUPS: ${OPENFEED_TRUSTED_HEADER_GROUPS:-}
+      OPENFEED_TRUSTED_HEADER_NAME: ${OPENFEED_TRUSTED_HEADER_NAME:-}
+      OPENFEED_TRUSTED_HEADER_LABEL: ${OPENFEED_TRUSTED_HEADER_LABEL:-your sign-in proxy}
+      OPENFEED_TRUSTED_HEADER_CREATE_ACCOUNTS: ${OPENFEED_TRUSTED_HEADER_CREATE_ACCOUNTS:-registration}
+      OPENFEED_TRUSTED_HEADER_ADMIN_GROUPS: ${OPENFEED_TRUSTED_HEADER_ADMIN_GROUPS:-}
+      OPENFEED_TRUSTED_HEADER_LOGOUT_URL: ${OPENFEED_TRUSTED_HEADER_LOGOUT_URL:-}
       DATABASE_URL: postgresql://${POSTGRES_USER:-openfeed}:${POSTGRES_PASSWORD}@openfeed-postgres:5432/${POSTGRES_DB:-openfeed}
       REDIS_URL: ${REDIS_URL:-redis://openfeed-redis:6379/0}
     ports:
@@ -112,7 +145,14 @@ services:
   openfeed-worker:
     image: openfeed-app:local
     restart: unless-stopped
+    stop_signal: SIGINT
     profiles: ["worker"]
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${OPENFEED_WORKER_MEM_LIMIT:-1g}
+    pids_limit: ${OPENFEED_WORKER_PIDS_LIMIT:-128}
     depends_on:
       openfeed-postgres:
         condition: service_healthy

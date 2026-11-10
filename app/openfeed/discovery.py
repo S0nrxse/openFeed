@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import httpx
 
-from . import db
+from . import catalog_scope, db, enrichment
 from .config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -140,7 +141,94 @@ def discover_related_videos(seed_limit: int = 3, per_seed: int = 6) -> dict[str,
     }
 
 
-def search_youtube(query: str, page: int = 1, sort: str = "relevance") -> list[dict[str, Any]]:
+# Invidious names its search parameter `sort` and its values differently from the words
+# used here. `sort_by` is silently ignored, which returns relevance order. YouTube no longer
+# honours `date` or `rating` (checked against a live instance on 2026-11-08: both come back
+# in relevance order), so the search page orders what comes back itself and says so; see
+# main._order_search_page. `views` does work upstream.
+_SEARCH_SORT_PARAMS = {"relevance": "relevance", "rating": "rating", "upload_date": "date", "view_count": "views"}
+SEARCH_DATES = ("hour", "today", "week", "month", "year")
+SEARCH_DURATIONS = ("short", "medium", "long")
+# Invidious `features`, each verified to narrow results on a live instance. "location" and
+# "purchased" are accepted upstream but return nothing, so they are not offered.
+SEARCH_FEATURES = ("live", "4k", "hd", "subtitles", "creative_commons", "360", "vr180", "3d", "hdr")
+
+
+def _search_listing(query: str, kind: str, page: int) -> list[dict[str, Any]]:
+    """One page of channel or playlist results, as Invidious returned them."""
+    cleaned = (query or "").strip()
+    if not cleaned:
+        return []
+    settings = get_settings()
+    if not settings.invidious_base_url:
+        raise DiscoveryError("Invidious is not configured")
+    timeout = max(4, settings.enrichment_timeout_seconds)
+    params = {"q": cleaned, "page": max(1, min(int(page or 1), 5)), "type": kind}
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        response = client.get(f"{settings.invidious_base_url}/api/v1/search", params=params)
+        response.raise_for_status()
+        payload = response.json()
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict) and item.get("type") == kind]
+
+
+def _normalize_playlist(item: dict[str, Any]) -> dict[str, Any] | None:
+    playlist_id = item.get("playlistId")
+    if not playlist_id:
+        return None
+    return {
+        "playlist_id": playlist_id,
+        "title": item.get("title") or playlist_id,
+        "author": item.get("author"),
+        "video_count": _int_or_none(item.get("videoCount")),
+        "thumbnail_url": item.get("playlistThumbnail"),
+    }
+
+
+def search_youtube_channels(query: str, page: int = 1) -> list[dict[str, Any]]:
+    """Channels matching a search. Store them before linking: /channel/ needs a row."""
+    results: list[dict[str, Any]] = []
+    for item in _search_listing(query, "channel", page):
+        channel_id = item.get("authorId")
+        if not channel_id or not item.get("author"):
+            continue
+        thumbnails = item.get("authorThumbnails") or []
+        avatar = enrichment._proxied_ggpht(enrichment._pick_image(thumbnails, 176)) if isinstance(thumbnails, list) else None
+        results.append({
+            "youtube_channel_id": channel_id,
+            "title": item.get("author"),
+            "avatar_url": avatar,
+            "handle": item.get("channelHandle"),
+            "subscriber_count": _int_or_none(item.get("subCount")),
+            "verified": bool(item.get("authorVerified")),
+        })
+    return results
+
+
+def search_youtube_playlists(query: str, page: int = 1) -> list[dict[str, Any]]:
+    return [playlist for playlist in map(_normalize_playlist, _search_listing(query, "playlist", page)) if playlist]
+
+
+def fetch_channel_playlists(youtube_channel_id: str) -> list[dict[str, Any]]:
+    """The first page of a channel's public playlists."""
+    if not youtube_channel_id:
+        return []
+    settings = get_settings()
+    if not settings.invidious_base_url:
+        raise DiscoveryError("Invidious is not configured")
+    timeout = max(4, settings.enrichment_timeout_seconds)
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        response = client.get(f"{settings.invidious_base_url}/api/v1/channels/{youtube_channel_id}/playlists")
+        response.raise_for_status()
+        payload = response.json()
+    items = payload.get("playlists") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return []
+    return [playlist for playlist in (_normalize_playlist(item) for item in items if isinstance(item, dict)) if playlist]
+
+
+def search_youtube(query: str, page: int = 1, sort: str = "relevance", date: str = "", duration: str = "", features: str = "") -> list[dict[str, Any]]:
     """Search YouTube through Invidious.
 
     The local library only ever contained what had already been synced or discovered, so
@@ -158,8 +246,14 @@ def search_youtube(query: str, page: int = 1, sort: str = "relevance") -> list[d
         "q": cleaned,
         "page": max(1, min(int(page or 1), 5)),
         "type": "video",
-        "sort_by": sort if sort in {"relevance", "rating", "upload_date", "view_count"} else "relevance",
+        "sort": _SEARCH_SORT_PARAMS.get(sort, "relevance"),
     }
+    if date in SEARCH_DATES:
+        params["date"] = date
+    if duration in SEARCH_DURATIONS:
+        params["duration"] = duration
+    if features in SEARCH_FEATURES:
+        params["features"] = features
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
         response = client.get(f"{settings.invidious_base_url}/api/v1/search", params=params)
         response.raise_for_status()
@@ -179,45 +273,87 @@ def search_youtube(query: str, page: int = 1, sort: str = "relevance") -> list[d
     return results
 
 
+# Invidious ignores `page` on /channels/{id}/videos and always answers with the newest 60;
+# deeper uploads are reached only by following `continuation`. Each page is kept briefly
+# with the token for the next one, so page N costs one request once N-1 has been seen and
+# re-opening a channel within the window costs none.
+_UPLOAD_PAGE_TTL_SECONDS = 600.0
+_UPLOAD_PAGE_CACHE_MAX = 400
+_upload_pages: dict[tuple[str, str, int], tuple[float, list[dict[str, Any]], str]] = {}
+
+
+def _upload_page_cached(key: tuple[str, str, int]) -> tuple[list[dict[str, Any]], str] | None:
+    hit = _upload_pages.get(key)
+    if not hit or time.monotonic() - hit[0] > _UPLOAD_PAGE_TTL_SECONDS:
+        return None
+    return hit[1], hit[2]
+
+
+def _remember_upload_page(key: tuple[str, str, int], items: list[dict[str, Any]], continuation: str) -> None:
+    if len(_upload_pages) >= _UPLOAD_PAGE_CACHE_MAX:
+        # Oldest first; a crude bound, the entries are small and short-lived anyway.
+        for stale in sorted(_upload_pages, key=lambda k: _upload_pages[k][0])[: _UPLOAD_PAGE_CACHE_MAX // 4]:
+            _upload_pages.pop(stale, None)
+    _upload_pages[key] = (time.monotonic(), items, continuation)
+
+
 def fetch_channel_uploads(youtube_channel_id: str, page: int = 1, sort_by: str = "newest") -> list[dict[str, Any]]:
     """A page of a channel's uploads from Invidious.
 
     The RSS feed a subscription is built on only carries the most recent 15 videos, which
     is why a channel page otherwise shows a fraction of what the channel has published.
+    Pages past the first follow the continuation chain (see _upload_pages); asking for a
+    page past the end returns [].
     """
     if not youtube_channel_id:
         return []
     settings = get_settings()
     if not settings.invidious_base_url:
         raise DiscoveryError("Invidious is not configured")
+    target = max(1, min(int(page or 1), 20))
+    # Resume from the deepest page already in hand at or before the target.
+    current, continuation, items = 1, "", []
+    for known in range(target, 0, -1):
+        cached = _upload_page_cached((youtube_channel_id, sort_by, known))
+        if cached is not None:
+            if known == target:
+                return cached[0]
+            current, continuation = known + 1, cached[1]
+            if not continuation:
+                return []
+            break
     timeout = max(4, settings.enrichment_timeout_seconds)
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        response = client.get(
-            f"{settings.invidious_base_url}/api/v1/channels/{youtube_channel_id}/videos",
-            params={"page": max(1, min(int(page or 1), 20)), "sort_by": sort_by},
-        )
-        response.raise_for_status()
-        payload = response.json()
-    items = payload.get("videos") if isinstance(payload, dict) else payload
-    if not isinstance(items, list):
-        return []
-    results: list[dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        video = _normalize_related(item)
-        if video:
-            video.setdefault("youtube_channel_id", youtube_channel_id)
-            results.append(video)
-    return results
+        while current <= target:
+            params = {"sort_by": sort_by}
+            if continuation:
+                params["continuation"] = continuation
+            response = client.get(f"{settings.invidious_base_url}/api/v1/channels/{youtube_channel_id}/videos", params=params)
+            response.raise_for_status()
+            payload = response.json()
+            raw = payload.get("videos") if isinstance(payload, dict) else payload
+            items = []
+            for item in raw if isinstance(raw, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                video = _normalize_related(item)
+                if video:
+                    video.setdefault("youtube_channel_id", youtube_channel_id)
+                    items.append(video)
+            continuation = str(payload.get("continuation") or "") if isinstance(payload, dict) else ""
+            _remember_upload_page((youtube_channel_id, sort_by, current), items, continuation)
+            if current < target and not continuation:
+                return []
+            current += 1
+    return items
 
 
 def seed_from_takeout(user_key: str = "local", channels: int = 40, per_channel: int = 1) -> dict[str, Any]:
     """Pull recent uploads from the channels an imported history says you watch.
 
     Importing a watch history tells the ranker *what* you like but hands it nothing new to
-    rank: the library only ever contained videos reached through your FreshRSS
-    subscriptions and discovery from those. So a history full of tech and comedy would
+    rank: the library only ever contained videos reached through your subscriptions
+    and discovery from those. So a history full of tech and comedy would
     still produce a feed of whatever the six original subscriptions happened to be about,
     and it would look like the import did nothing.
 
@@ -235,6 +371,7 @@ def seed_from_takeout(user_key: str = "local", channels: int = 40, per_channel: 
     stored = 0
     touched = 0
     errors = 0
+    found: list[int] = []
     for row in ranked:
         if touched >= channels:
             break
@@ -250,8 +387,12 @@ def seed_from_takeout(user_key: str = "local", channels: int = 40, per_channel: 
             errors += 1
             continue
         for item in (items[: max(1, per_channel)] if per_channel else items):
-            if db.upsert_discovered_video(item, None, "takeout", "imported watch history"):
+            video_id = db.upsert_discovered_video(item, None, "takeout", "imported watch history")
+            if video_id:
                 stored += 1
+                found.append(video_id)
+    # Seeded from this person's own history, so what it found is theirs (catalog_scope.py).
+    catalog_scope.record_video_ids(user_key, found, "discovery")
     return {"ok": True, "channels": touched, "stored": stored, "errors": errors}
 
 
@@ -296,6 +437,7 @@ def seed_from_topics(user_key: str = "local", terms: int = 6, per_term: int = 8)
 
     stored = 0
     used = 0
+    found: list[int] = []
     for query in queries:
         for sort_by in ("relevance", "upload_date"):
             try:
@@ -305,12 +447,16 @@ def seed_from_topics(user_key: str = "local", terms: int = 6, per_term: int = 8)
                 continue
             used += 1
             for item in results[:per_term]:
-                if db.upsert_discovered_video(item, None, "topic-search", f"topic: {query}"):
+                video_id = db.upsert_discovered_video(item, None, "topic-search", f"topic: {query}")
+                if video_id:
                     stored += 1
+                    found.append(video_id)
+    # Searched from this person's own interests, so what it found is theirs.
+    catalog_scope.record_video_ids(user_key, found, "discovery")
     return {"ok": True, "queries": used, "stored": stored}
 
 
-def seed_trending(region: str = "US", categories: Iterable[str] = ("", "Music", "Gaming")) -> dict[str, Any]:
+def seed_trending(region: str = "US", categories: Iterable[str] = ("", "Music", "Gaming"), user_key: str | None = None) -> dict[str, Any]:
     """A little of what everyone is watching, so the feed is not purely a mirror.
 
     Deliberately small. Trending is the least personalised thing here and exists to keep
@@ -320,6 +466,7 @@ def seed_trending(region: str = "US", categories: Iterable[str] = ("", "Music", 
 
     stored = 0
     used = 0
+    found: list[int] = []
     for category in categories:
         try:
             items = fetch_trending(region, category)
@@ -328,8 +475,13 @@ def seed_trending(region: str = "US", categories: Iterable[str] = ("", "Music", 
             continue
         used += 1
         for item in items[:10]:
-            if db.upsert_discovered_video(item, None, "trending", f"trending: {category or 'all'}"):
+            video_id = db.upsert_discovered_video(item, None, "trending", f"trending: {category or 'all'}")
+            if video_id:
                 stored += 1
+                found.append(video_id)
+    # Part of a growth run somebody started: theirs. The worker's own run (user_key "local"
+    # with sign-in on) belongs to nobody and reaches people only through their scope.
+    catalog_scope.record_video_ids(user_key, found, "discovery")
     return {"ok": True, "categories": used, "stored": stored}
 
 
@@ -352,7 +504,7 @@ def grow_library(user_key: str = "local", include_trending: bool = True) -> dict
             report[name] = {"ok": False, "error": str(exc)[:160]}
     if include_trending:
         try:
-            report["trending"] = seed_trending()
+            report["trending"] = seed_trending(user_key=user_key)
         except Exception as exc:  # noqa: BLE001
             report["trending"] = {"ok": False, "error": str(exc)[:160]}
     report["stored_total"] = sum(int((r or {}).get("stored") or 0) for r in report.values() if isinstance(r, dict))
@@ -360,17 +512,17 @@ def grow_library(user_key: str = "local", include_trending: bool = True) -> dict
 
 
 def backfill_subscription_uploads(limit: int = 200, per_channel_pages: int = 2) -> dict[str, Any]:
-    """Fetch recent uploads for every subscribed channel.
+    """Fetch recent uploads for every channel somebody on this install follows.
 
     The subscription feed is ordered by publish date, which only works if the videos are
-    actually there. FreshRSS feeds carry roughly the last fifteen uploads per channel and
+    actually there. Channel RSS feeds carry roughly the last fifteen uploads per channel and
     only from the moment you subscribe, so a freshly imported subscription list produces a
     feed with most of its channels missing entirely — which reads as "the order is wrong"
     rather than "half the data is absent".
     """
     from . import db
 
-    subscriptions = db.list_subscriptions(limit)
+    subscriptions = db.list_followed_feeds(limit)
     stored = 0
     touched = 0
     errors = 0

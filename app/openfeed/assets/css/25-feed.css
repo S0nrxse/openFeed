@@ -1,0 +1,114 @@
+/* ---------- sections ---------- */
+.section-block { margin-top: 40px; }
+.section-block:first-child { margin-top: 0; }
+.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+.section-heading h2 { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; letter-spacing: -.014em; }
+.skeleton-heading { width: 180px; height: 22px; }
+.section-heading-copy { display: grid; gap: 3px; min-width: 0; }
+.section-eyebrow { margin: 0; font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted-2); }
+[data-section-kind="catch-up"] .section-eyebrow { color: var(--accent-text); }
+.eyebrow { display: none; }
+.is-removing { opacity: 0; transform: scale(.97); transition: opacity .2s ease, transform .2s ease; pointer-events: none; }
+@media (prefers-reduced-motion: reduce) { .is-removing { transition: none; } }
+
+/* ---------- shelf ---------- */
+.shelf { position: relative; min-width: 0; }
+.shelf-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+.shelf-head h2 { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; letter-spacing: -.014em; }
+.shelf-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; min-height: 32px; }
+.view-all { position: relative; display: inline-flex; align-items: center; gap: 2px; color: var(--muted); font-size: 12.5px; white-space: nowrap; border-radius: 6px; transition: color var(--dur-press) ease; }
+.view-all:hover { color: var(--text); }
+.view-all .icon { width: 14px; height: 14px; }
+@media (pointer: coarse) {
+  .view-all::after { content: ""; position: absolute; inset: -12px -8px; }
+}
+.shelf-viewport { position: relative; }
+/* Narrow enough that the next card shows, which is what the end fade lands on. */
+.shelf-track { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(248px, calc((100% - 4 * 16px) / 4.35)); gap: 16px; overflow-x: auto; scroll-behavior: smooth; scroll-snap-type: x proximity; overscroll-behavior-x: contain; scrollbar-width: none; }
+.shelf-track > *, .shorts-row > * { scroll-snap-align: start; }
+.shorts-row { scroll-behavior: smooth; scroll-snap-type: x proximity; overscroll-behavior-x: contain; }
+[data-shelf-track] { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 44px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 44px), transparent); }
+/* A mask clips everything inside it, including a menu pinned to the viewport. */
+.shelf.at-end [data-shelf-track], [data-shelf-track]:has(.yt-menu[open]) { -webkit-mask-image: none; mask-image: none; }
+.shelf-nav { display: none; place-items: center; width: 32px; height: 32px; padding: 0; border: 1px solid transparent; border-radius: 999px; background: var(--surface-2); color: var(--text); cursor: pointer; opacity: 0; transition: opacity var(--dur-press) ease, background var(--dur-press) ease; }
+.shelf-nav:hover:not(:disabled) { background: var(--surface-3); }
+.shelf-nav:active:not(:disabled) { transform: scale(.96); }
+.shelf-nav:disabled { cursor: default; color: var(--muted-2); }
+.shelf-dismiss { opacity: 0; transition: opacity var(--dur-press) ease, background var(--dur-press) ease, color var(--dur-press) ease; }
+@media (hover: hover) and (pointer: fine) {
+  .shelf-nav { display: grid; }
+  .shelf:is(:hover, :focus-within) :is(.shelf-nav, .shelf-dismiss) { opacity: 1; }
+  .shelf.fits .shelf-nav { display: none; }
+}
+@media (hover: none), (pointer: coarse) {
+  .shelf-dismiss { opacity: 1; }
+}
+
+.shelf-nav .icon { width: 16px; height: 16px; }
+
+/* ---------- video cards ---------- */
+/* Four across at 1440: more real content per screen. Every video grid shares --grid-min. */
+.video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--grid-min), 1fr));
+  gap: 28px 20px; align-items: start; }
+.video-card { position: relative; min-width: 0; color: var(--text); }
+.thumb { position: relative; display: grid; place-items: center; aspect-ratio: 16 / 9; overflow: hidden; border-radius: var(--r-thumb); background: var(--thumb-bed); border: 1px solid var(--border-soft); color: #fff; }
+.thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transition: opacity var(--dur-fade) ease, filter var(--dur-press) ease; }
+.thumb-fallback { display: grid; place-items: center; width: 42px; height: 26px; border-radius: 6px; background: var(--surface-3); color: var(--muted); font-weight: 600; font-size: 10px; }
+.duration { position: absolute; right: 6px; bottom: 6px; z-index: 2; border-radius: 6px; background: rgba(0,0,0,.78); color: #fff; font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1; padding: 3px 6px; }
+.progress-rail { position: absolute; left: 0; right: 0; bottom: 0; z-index: 2; height: 3px; background: rgba(255,255,255,.22); transition: height var(--dur-press) ease; }
+.progress-rail span { display: block; height: 100%; background: var(--accent); }
+/* Watched: the check replaces the bar and the artwork steps back. */
+.watched-mark { position: absolute; left: 6px; bottom: 6px; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; border-radius: 999px; background: var(--bone); color: var(--on-bone); }
+.watched-mark .icon { width: 13px; height: 13px; stroke-width: 2.5; }
+.video-card.is-watched .thumb img { opacity: .62; }
+.video-info { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 10px; padding: 10px 0 0; }
+.card-copy { min-width: 0; }
+.title-row { display: grid; grid-template-columns: minmax(0, 1fr) 22px; gap: 8px; align-items: start; }
+.video-card h3 { margin: 0; font-size: 14.5px; line-height: 1.4; font-weight: 550; letter-spacing: -.008em; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.channel-line, .metadata { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.channel-line { display: flex; align-items: center; gap: 4px; }
+.channel-line a { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.channel-line a:hover { color: var(--text); }
+.verified { width: 12px; height: 12px; flex: 0 0 auto; color: var(--muted-2); }
+.metadata { margin-top: 1px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.card-badges { display: none; }
+
+.video-card-mini { display: grid; grid-template-columns: minmax(110px, 160px) minmax(0, 1fr) 22px; gap: 10px; align-items: start; }
+.video-card-mini .thumb { border-radius: 8px; }
+.video-card-mini h3 { font-size: 13px; }
+.video-card-mini p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- card actions ----------
+   With a mouse the overflow moves onto the thumbnail and the title takes its column.
+   Everywhere else it stays in the title row at --hit, and the quick actions do not
+   exist, so nothing on a phone depends on hover. The menu is positioned against the
+   card, so no extra wrapper sits around the thumbnail link. */
+.card-quick { display: none; }
+.card-quick-button { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 1px solid var(--border-soft); border-radius: 999px; background: var(--badge); color: #fff; cursor: pointer; transition: background var(--dur-press) ease; }
+.card-quick-button:hover { background: var(--over-video-hover); }
+.card-quick-button:active { transform: scale(.96); }
+.card-quick-button .icon { width: 16px; height: 16px; }
+@media (hover: hover) and (pointer: fine) {
+  .thumb:hover img { filter: brightness(1.06); }
+  .thumb:hover .progress-rail, .video-card:hover .progress-rail { height: 4px; }
+
+  .video-card .title-row { grid-template-columns: minmax(0, 1fr); }
+  .video-card .video-info .card-menu { position: absolute; top: 8px; right: 8px; z-index: 3; opacity: 0; transition: opacity var(--dur-press) ease; }
+  .video-card .video-info .menu-trigger { width: 32px; height: 32px; min-width: 0; min-height: 0; margin: 0; border: 1px solid var(--border-soft); border-radius: 999px; background: var(--badge); color: #fff; }
+  .video-card .video-info .menu-trigger:hover, .video-card .video-info .yt-menu[open] > .menu-trigger { background: var(--over-video-hover); }
+  .video-card .video-info .menu-panel { top: 38px; }
+  .video-card .video-info .yt-menu.drop-up .menu-panel { top: auto; bottom: 38px; }
+  .video-card .card-quick { position: absolute; top: 8px; right: 46px; z-index: 3; display: flex; gap: 6px; opacity: 0; transition: opacity var(--dur-press) ease; }
+  .video-card:hover :is(.card-quick, .card-menu), .video-card:has(:focus-visible) :is(.card-quick, .card-menu), .video-card:has(.yt-menu[open]) :is(.card-quick, .card-menu) { opacity: 1; }
+  /* Above the next card's controls, or their hidden buttons would take a menu row's click. */
+  .video-card .video-info .card-menu[open] { z-index: 30; }
+
+  .media-row { position: relative; }
+  .media-row > .card-menu { opacity: 0; transition: opacity var(--dur-press) ease; }
+  .media-row > .card-quick { position: absolute; right: 44px; bottom: 8px; z-index: 3; display: flex; gap: 6px; opacity: 0; transition: opacity var(--dur-press) ease; }
+  .media-row:is(:hover, :has(:focus-visible), :has(.yt-menu[open])) > :is(.card-menu, .card-quick) { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .thumb:hover img { filter: none; }
+  .card-quick-button:active, .shelf-nav:active:not(:disabled) { transform: none; }
+}

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import time
+import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,13 +89,30 @@ def _tune_ranking_cursor(cur: Any) -> None:
     cur.execute("SET LOCAL work_mem = '32MB'")
 
 
-def init_db() -> None:
+def init_db() -> dict[str, Any]:
+    """Create or upgrade the schema in one transaction. Safe to run on every start.
+
+    migrations.before_schema renames old tables first (schema.sql would otherwise create
+    empty ones under the new names); after_schema fills tables schema.sql just created.
+    Returns what the migrations did, for the startup log and the tests.
+    """
+    from . import catalog_scope, migrations
+
     schema = SCHEMA_PATH.read_text(encoding="utf-8")
     with connect() as conn:
         with conn.cursor() as cur:
+            state = migrations.before_schema(cur)
+            provenance_created = not migrations._exists(cur, "video_provenance")
             cur.execute(schema)
             _ensure_api_token_schema(cur)
+            # Accounts, sign-in methods and sessions (accounts.py).
+            cur.execute(SCHEMA_PATH.with_name("accounts.sql").read_text(encoding="utf-8"))
+            result = migrations.after_schema(cur, state)
+            # Who may be shown which part of the shared catalog: the one-time provenance
+            # backfill, and whether this install now hosts more than one person.
+            result["catalog_scope"] = catalog_scope.at_startup(cur, provenance_created)
         conn.commit()
+    return result
 
 
 TAG_MAX_LENGTH = 34
@@ -136,35 +155,72 @@ def _tags_from_metadata(metadata: dict[str, Any]) -> list[str]:
 # strpos rather than LIKE: a literal % in the SQL would collide with psycopg placeholders.
 SHORT_VIDEO_SQL = "(strpos(COALESCE(v.url, ''), '/shorts/') > 0 OR (v.duration_seconds > 0 AND v.duration_seconds <= 90))"
 
-# Videos keep their rows after an unsubscribe, so subscription surfaces have to ask
-# whether the channel is *still* subscribed instead of trusting videos.source_kind.
-# The first branch keeps installs that have never synced FreshRSS from showing an
-# empty subscription feed.
-ACTIVE_SUBSCRIPTION_SQL = """(
-  NOT EXISTS (SELECT 1 FROM freshrss_subscriptions WHERE youtube_channel_id IS NOT NULL)
-  OR EXISTS (
-    SELECT 1 FROM freshrss_subscriptions fs
-    WHERE fs.youtube_channel_id IS NOT NULL AND fs.youtube_channel_id = c.youtube_channel_id
-  )
-)"""
+# Subscriptions are per person (user_subscriptions, keyed by user_key, so per household
+# profile too) while feeds are shared and fetched once. Every "is this subscribed?" in a
+# query therefore names whose subscriptions it means, through the fragments below. Each
+# carries exactly one placeholder for the user_key; pass "%(u)s" as `param` in queries
+# that use named parameters.
 
-# freshrss_entries.video_id carries only a plain index, so a video syndicated in
+
+def user_feeds_sql(param: str = "%s") -> str:
+    """A derived table of the feeds one user follows: every feeds column plus
+    `subscribed_at` (when this user subscribed). Use as `{user_feeds_sql()} fs`."""
+    return (
+        "(SELECT f.*, us.created_at AS subscribed_at FROM feeds f "
+        f"JOIN user_subscriptions us ON us.feed_id = f.id WHERE us.user_key = {param})"
+    )
+
+
+def subscribed_channel_sql(param: str = "%s", column: str = "c.youtube_channel_id") -> str:
+    """True when `column` is a channel this user follows, never NULL.
+
+    Uncorrelated IN, so Postgres evaluates the user's channel list once and probes a hash
+    of it per row: ranking queries call this for every video in the library.
+    """
+    return (
+        f"COALESCE({column} IN (SELECT f.youtube_channel_id FROM feeds f "
+        "JOIN user_subscriptions us ON us.feed_id = f.id "
+        f"WHERE us.user_key = {param} AND f.youtube_channel_id IS NOT NULL), false)"
+    )
+
+
+# Videos keep their rows after an unsubscribe, so subscription surfaces have to ask
+# whether the channel is *still* subscribed, by this user, instead of trusting
+# videos.source_kind (which only says the video once arrived through some feed). One
+# placeholder: the user_key.
+ACTIVE_SUBSCRIPTION_SQL = subscribed_channel_sql()
+
+def _catalog_scope(user_key: str | None, column: str = "v.id") -> tuple[str, tuple[Any, ...]]:
+    """(" AND ...", params) keeping a per-person listing inside `user_key`'s part of the
+    shared catalog (catalog_scope.py), or ("", ()) when nothing needs keeping apart. None
+    means a server-side read with no person behind it (a playback probe, a storage check)."""
+    if user_key is None:
+        return "", ()
+    from . import catalog_scope
+
+    return catalog_scope.video_filter_sql(user_key, column)
+
+
+# A feed somebody still follows. Background work (polling, artwork) runs for these only.
+FOLLOWED_FEED_SQL = "EXISTS (SELECT 1 FROM user_subscriptions us WHERE us.feed_id = fs.id)"
+
+# feed_entries.video_id carries only a plain index, so a video syndicated in
 # two feeds has two rows here and a plain LEFT JOIN fans out: one video renders
 # as N rows and LIMITs count duplicates instead of videos. The dedup subquery
 # below keeps one row per video (DISTINCT ON, newest updated_at wins) so the
-# read/starred state reflects the most recent sync. A LATERAL ... LIMIT 1 probe
+# subscription a video arrived through reflects the most recent sync. A LATERAL ... LIMIT 1 probe
 # did the same job but cost a subquery per video row, which made full-scan
 # ranking queries ~14x slower; the dedup pass scans the small entries table
-# once and hash-joins. Exposes every fe.* column the video queries use (is_read /
-# is_starred for state, subscription_id for the subscription join,
+# once and hash-joins. Exposes every fe.* column the video queries use (subscription_id
+# for the subscription join,
 # published_at / created_at for ordering). Every query that uses this aliases
 # the videos table `v`. Interpolated as a constant only -- never build it from
 # user input.
-_FRESHRSS_LATEST_JOIN = """LEFT JOIN (
+_FEED_ENTRY_LATEST_JOIN = """LEFT JOIN (
                     SELECT DISTINCT ON (fe_dedup.video_id) fe_dedup.video_id,
-                           fe_dedup.is_read, fe_dedup.is_starred, fe_dedup.subscription_id,
+                           fe_dedup.subscription_id,
                            fe_dedup.published_at, fe_dedup.created_at
-                    FROM freshrss_entries fe_dedup
+                    FROM feed_entries fe_dedup
                     ORDER BY fe_dedup.video_id, fe_dedup.updated_at DESC
                 ) fe ON fe.video_id = v.id"""
 
@@ -172,18 +228,18 @@ _FRESHRSS_LATEST_JOIN = """LEFT JOIN (
 # mis-estimates the filtered row count (~1 row instead of ~20k) and turns the
 # derived table into a nested loop, re-running the DISTINCT ON sort once per
 # video row. As a MATERIALIZED CTE the dedup scans the small entries table
-# once and hash-joins, which is what the comment on _FRESHRSS_LATEST_JOIN
+# once and hash-joins, which is what the comment on _FEED_ENTRY_LATEST_JOIN
 # always intended. Only the ranking queries use this; single-row and
 # channel-filtered lookups keep the plain join, where the nested loop is the
 # right plan. Every query that uses this aliases the videos table `v`.
-_FRESHRSS_LATEST_CTE = """fe_latest AS MATERIALIZED (
+_FEED_ENTRY_LATEST_CTE = """fe_latest AS MATERIALIZED (
                     SELECT DISTINCT ON (fe_dedup.video_id) fe_dedup.video_id,
-                           fe_dedup.is_read, fe_dedup.is_starred, fe_dedup.subscription_id,
+                           fe_dedup.subscription_id,
                            fe_dedup.published_at, fe_dedup.created_at
-                    FROM freshrss_entries fe_dedup
+                    FROM feed_entries fe_dedup
                     ORDER BY fe_dedup.video_id, fe_dedup.updated_at DESC
                 )"""
-_FRESHRSS_LATEST_JOIN_CTE = "LEFT JOIN fe_latest fe ON fe.video_id = v.id"
+_FEED_ENTRY_LATEST_JOIN_CTE = "LEFT JOIN fe_latest fe ON fe.video_id = v.id"
 
 
 def is_short_video(row: dict[str, Any]) -> bool:
@@ -197,7 +253,23 @@ def is_short_video(row: dict[str, Any]) -> bool:
     return 0 < duration <= 90
 
 
+def list_ranked_short_videos(limit: int = 14, user_key: str = "local", offset: int = 0) -> list[dict[str, Any]]:
+    """The Home Shorts shelf: Shorts ranked by ranker v2's walk (its "shorts" lane), with the
+    lanes' exclusions. Falls back to the newest-first list when v2 cannot serve."""
+    from . import ranker
+
+    try:
+        rows = ranker.recommended_rows(max(1, min(int(limit or 14), 60)), max(0, int(offset or 0)), "shorts", user_key)
+    except Exception as exc:  # noqa: BLE001 - the newest-first list is the fallback
+        ranker.note_fallback(f"{type(exc).__name__}: {exc}")
+        rows = None
+    if rows is not None:
+        return rows
+    return list_short_videos(limit, user_key, offset)
+
+
 def list_short_videos(limit: int = 12, user_key: str = "local", offset: int = 0) -> list[dict[str, Any]]:
+    scope_sql, scope_params = _catalog_scope(user_key)
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -216,10 +288,11 @@ def list_short_videos(limit: int = 12, user_key: str = "local", offset: int = 0)
                   -- A short finished on its watch page is watched, even though the
                   -- viewer never reports progress; it must not resurface here.
                   AND COALESCE(pp.completed, false) = false
+                  {scope_sql}
                 ORDER BY v.published_at DESC NULLS LAST, v.created_at DESC
                 LIMIT %s OFFSET %s
                 """,
-                (user_key, user_key, max(1, min(limit, 60)), max(0, offset)),
+                (user_key, user_key, *scope_params, max(1, min(limit, 60)), max(0, offset)),
             )
             return list(cur.fetchall())
 
@@ -232,19 +305,24 @@ def list_subscription_uploads(limit: int = 30, user_key: str = "local", include_
             cur.execute(
                 f"""
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url,
-                       v.published_at, v.duration_seconds, v.tags,
-                       c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id
+                       v.published_at, v.duration_seconds, v.view_count, v.tags,
+                       c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
+                       COALESCE(pp.percent_completed, 0) AS percent_completed,
+                       COALESCE(pp.completed, false) AS progress_completed,
+                       COALESCE(pp.manually_marked_watched, false) AS manually_marked_watched,
+                       pp.resume_seconds
                 FROM videos v
                 JOIN channels c ON c.id = v.channel_id
-                JOIN freshrss_subscriptions fs ON fs.youtube_channel_id = c.youtube_channel_id
                 LEFT JOIN user_video_feedback uvf ON uvf.video_id = v.id AND uvf.user_key = %s
+                LEFT JOIN playback_progress pp ON pp.video_id = v.id AND pp.user_key = %s
                 WHERE v.published_at IS NOT NULL
+                  AND {ACTIVE_SUBSCRIPTION_SQL}
                   AND COALESCE(uvf.not_interested, false) = false
                   {shorts_clause}
                 ORDER BY v.published_at DESC
                 LIMIT %s
                 """,
-                (user_key, max(1, min(limit, 100))),
+                (user_key, user_key, user_key, max(1, min(limit, 100))),
             )
             return list(cur.fetchall())
 
@@ -328,7 +406,7 @@ def set_notifications_seen_at(value: str, user_key: str = "local") -> None:
         conn.commit()
 
 
-def list_popular_tags(limit: int = 8, min_channels: int = 2, pool: int = 500) -> list[dict[str, Any]]:
+def list_popular_tags(limit: int = 8, min_channels: int = 2, pool: int = 500, user_key: str | None = None) -> list[dict[str, Any]]:
     """Most common real YouTube tags across recently published videos.
 
     Requires a tag to span at least two channels. Channel keyword lists are routinely
@@ -336,15 +414,18 @@ def list_popular_tags(limit: int = 8, min_channels: int = 2, pool: int = 500) ->
     "krzgesagt", ...), and those only ever occur on that one channel — so cross-channel
     frequency filters them out far more reliably than string-matching the channel title,
     and it also matches what makes a useful feed chip: a tag that groups several creators.
+    Read from `user_key`'s part of the catalog, so a chip never names what someone else
+    searched for.
     """
+    scope_sql, scope_params = _catalog_scope(user_key)
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 WITH recent AS (
                   SELECT v.tags, v.channel_id
                   FROM videos v
-                  WHERE array_length(v.tags, 1) > 0
+                  WHERE array_length(v.tags, 1) > 0{scope_sql}
                   ORDER BY v.published_at DESC NULLS LAST, v.created_at DESC
                   LIMIT %s
                 ), exploded AS (
@@ -359,7 +440,7 @@ def list_popular_tags(limit: int = 8, min_channels: int = 2, pool: int = 500) ->
                 ORDER BY COUNT(DISTINCT channel_id) DESC, COUNT(*) DESC, tag ASC
                 LIMIT %s
                 """,
-                (max(50, pool), max(1, min_channels), max(1, min(limit, 40))),
+                (*scope_params, max(50, pool), max(1, min_channels), max(1, min(limit, 40))),
             )
             return list(cur.fetchall())
 
@@ -559,6 +640,10 @@ def upsert_user(authentik_sub: str, display_name: str = "", profile: dict[str, A
     return dict(row) if row else {}
 
 
+# Mirrors ranker.MODES without importing numpy-backed code into every db import.
+RANKER_MODES = ("graph", "blend", "classic")
+
+
 def get_feed_preferences(user_key: str = "local") -> dict[str, Any]:
     with connect() as conn:
         with conn.cursor() as cur:
@@ -576,10 +661,17 @@ def get_feed_preferences(user_key: str = "local") -> dict[str, Any]:
                 (user_id,),
             )
             topics = list(cur.fetchall())
+            # A kids profile (profiles.py) forces comments and Shorts off whatever its
+            # stored switches say, so every reader of these two settings enforces it.
+            cur.execute("SELECT is_kids FROM account_profiles WHERE user_key = %s", (user_key,))
+            kids = bool((cur.fetchone() or {}).get("is_kids"))
         conn.commit()
     preferred = [row["topic"] for row in topics if row.get("preference") == "follow"]
     muted = [row["topic"] for row in topics if row.get("preference") == "mute"]
+    if kids:
+        profile = {**profile, "exclude_shorts": True, "show_comments": False}
     return {
+        "kids_profile": kids,
         "preferred_topics": preferred,
         "muted_topics": muted,
         "prioritize_subscriptions": bool(profile.get("prioritize_subscriptions", True)),
@@ -592,10 +684,22 @@ def get_feed_preferences(user_key: str = "local") -> dict[str, Any]:
         # Off by default for the same reason as RYD: it sends something about what this
         # deployment is watching to a third party.
         "sponsorblock_enabled": bool(profile.get("sponsorblock_enabled", False)),
+        # DeArrow: off by default for the same reason as SponsorBlock.
+        "dearrow_enabled": bool(profile.get("dearrow_enabled", False)),
+        "dearrow_casing": str(profile.get("dearrow_casing") or "") if str(profile.get("dearrow_casing") or "") in ("", "lowercase") else "",
+        "dearrow_thumbnails": bool(profile.get("dearrow_thumbnails", True)),
         # The channel Posts tab works regardless; this only controls the feeds.
         "show_posts_in_feeds": bool(profile.get("show_posts_in_feeds", False)),
         "muted_channels": [str(c) for c in (profile.get("muted_channels") or []) if str(c).strip()],
         "sponsorblock_actions": profile.get("sponsorblock_actions") or {},
+        "setup_dismissed": bool(profile.get("setup_dismissed", False)),
+        # "" follows ranker.DEFAULT_MODE, so a changed default reaches everyone who never chose.
+        "ranker_mode": str(profile.get("ranker_mode") or "") if str(profile.get("ranker_mode") or "") in RANKER_MODES else "",
+        # "Help tune recommendations": interleave Graph with Graph + popularity on the
+        # Recommended shelf and count clicks per side. Off unless chosen; nothing leaves the server.
+        "explore_enabled": bool(profile.get("explore_enabled", False)),
+        # Home shelves the user closed with "Hide this shelf"; Feed controls lists them.
+        "hidden_shelves": [str(k) for k in (profile.get("hidden_shelves") or []) if str(k).strip()],
     }
 
 
@@ -612,6 +716,12 @@ def set_feed_preferences(
     show_posts_in_feeds: bool | None = None,
     muted_channels: list[str] | None = None,
     sponsorblock_actions: dict[str, str] | None = None,
+    dearrow_enabled: bool | None = None,
+    dearrow_casing: str | None = None,
+    dearrow_thumbnails: bool | None = None,
+    setup_dismissed: bool | None = None,
+    ranker_mode: str | None = None,
+    explore_enabled: bool | None = None,
     user_key: str = "local",
 ) -> dict[str, Any]:
     preferred_topics = [topic.strip().lower() for topic in (preferred_topics or []) if topic.strip()]
@@ -646,6 +756,19 @@ def set_feed_preferences(
                 from . import sponsorblock
 
                 profile_updates["sponsorblock_actions"] = sponsorblock.normalize_actions(sponsorblock_actions)
+            if dearrow_enabled is not None:
+                profile_updates["dearrow_enabled"] = bool(dearrow_enabled)
+            if dearrow_casing is not None:
+                profile_updates["dearrow_casing"] = dearrow_casing if dearrow_casing in ("", "lowercase") else ""
+            if dearrow_thumbnails is not None:
+                profile_updates["dearrow_thumbnails"] = bool(dearrow_thumbnails)
+            if setup_dismissed is not None:
+                profile_updates["setup_dismissed"] = bool(setup_dismissed)
+            if ranker_mode is not None:
+                mode = str(ranker_mode or "").strip().lower()
+                profile_updates["ranker_mode"] = mode if mode in RANKER_MODES else ""
+            if explore_enabled is not None:
+                profile_updates["explore_enabled"] = bool(explore_enabled)
             cur.execute("UPDATE users SET profile = %s::jsonb, updated_at = now() WHERE id = %s", (json.dumps(profile_updates), user_id))
             cur.execute("DELETE FROM user_topic_preferences WHERE user_id = %s", (user_id,))
             for topic in preferred_topics:
@@ -670,6 +793,63 @@ def set_feed_preferences(
     return get_feed_preferences(user_key)
 
 
+def set_channel_muted(channel_key: str, muted: bool, user_key: str = "local") -> list[str]:
+    """Add one creator to, or take one off, the muted list. Returns the new list.
+
+    The same `muted_channels` profile entry the feed controls dialog edits, changed one
+    key at a time under a row lock, so a mute from a card menu can never overwrite the
+    rest of the list or the user's topic preferences (set_feed_preferences rewrites both).
+    """
+    key = str(channel_key or "").strip().lower()
+    with connect() as conn:
+        with conn.cursor() as cur:
+            user_id = _ensure_local_user_id(cur, user_key)
+            cur.execute("SELECT profile FROM users WHERE id = %s FOR UPDATE", (user_id,))
+            row = cur.fetchone() or {}
+            profile = row.get("profile") if isinstance(row.get("profile"), dict) else {}
+            current = [str(c).strip().lower() for c in (profile.get("muted_channels") or []) if str(c).strip()]
+            if key:
+                if muted and key not in current:
+                    current.append(key)
+                elif not muted:
+                    current = [c for c in current if c != key]
+            current = current[-400:]
+            cur.execute(
+                "UPDATE users SET profile = COALESCE(profile, '{}'::jsonb) || jsonb_build_object('muted_channels', %s::jsonb), updated_at = now() WHERE id = %s",
+                (json.dumps(current), user_id),
+            )
+        conn.commit()
+    return current
+
+
+def set_shelf_hidden(shelf_key: str, hidden: bool, user_key: str = "local") -> list[str]:
+    """Hide one Home shelf, or show it again. Returns the new list of hidden shelf keys.
+
+    Changed one key at a time under a row lock, like set_channel_muted, so it never
+    rewrites the rest of the profile.
+    """
+    key = str(shelf_key or "").strip().lower()
+    with connect() as conn:
+        with conn.cursor() as cur:
+            user_id = _ensure_local_user_id(cur, user_key)
+            cur.execute("SELECT profile FROM users WHERE id = %s FOR UPDATE", (user_id,))
+            row = cur.fetchone() or {}
+            profile = row.get("profile") if isinstance(row.get("profile"), dict) else {}
+            current = [str(k).strip().lower() for k in (profile.get("hidden_shelves") or []) if str(k).strip()]
+            if key:
+                if hidden and key not in current:
+                    current.append(key)
+                elif not hidden:
+                    current = [k for k in current if k != key]
+            current = current[-50:]
+            cur.execute(
+                "UPDATE users SET profile = COALESCE(profile, '{}'::jsonb) || jsonb_build_object('hidden_shelves', %s::jsonb), updated_at = now() WHERE id = %s",
+                (json.dumps(current), user_id),
+            )
+        conn.commit()
+    return current
+
+
 PLAYBACK_DEFAULTS: dict[str, Any] = {
     "prefer_local": True,
     "public_invidious_enabled": False,
@@ -681,7 +861,61 @@ PLAYBACK_DEFAULTS: dict[str, Any] = {
     # Source ids the user switched off. One uniform list so every row in Settings —
     # local, public instance, YouTube — toggles the same way.
     "disabled_sources": [],
+    # The last caption choice made in the player: on or off, and which language and kind
+    # (manual or automatic) to look for on the next video.
+    "captions_enabled": False,
+    "captions_language": "",
+    "captions_auto": False,
+    # Live chat and chat replay on watch pages, read through yt-dlp. Off by default.
+    "live_chat_enabled": False,
+    # Autoplay: when a video ends, count down and open the first Up next video. On by
+    # default, as on YouTube; a list (?list=) plays its own next item either way.
+    "autoplay": True,
+    # The speed every video starts at. The player's speed menu still changes it per video.
+    "default_speed": 1.0,
 }
+
+# The speeds the player's own menu offers, so a default is always one it can show as chosen.
+PLAYBACK_SPEEDS = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
+
+
+def _playback_speed(value: Any) -> float:
+    """One of PLAYBACK_SPEEDS, or 1.0 for anything else."""
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return speed if speed in PLAYBACK_SPEEDS else 1.0
+
+
+def instance_url_problem(url: Any) -> str:
+    """What is wrong with an instance address, or "" when normalize_instance_urls can keep it.
+
+    The answer finishes a sentence that starts with the address.
+    """
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    if any(character.isspace() for character in value):
+        return "has a space in it"
+    if "://" in value and not value.startswith(("http://", "https://")):
+        return "is not an http or https address"
+    try:
+        parts = urllib.parse.urlsplit(value if "://" in value else f"https://{value}")
+        parts.port
+    except ValueError:
+        return "has an invalid host or port"
+    host = (parts.hostname or "").rstrip(".")
+    if parts.username or parts.password or parts.query or parts.fragment or not host or parts.netloc.endswith(":"):
+        return "is not a plain address such as yewtu.be or https://yewtu.be"
+    try:
+        ipaddress.ip_address(host)
+        return ""
+    except ValueError:
+        pass
+    if all(label and label.replace("-", "").isalnum() and not label.startswith("-") and not label.endswith("-") for label in host.split(".")):
+        return ""
+    return "has an invalid host name"
 
 
 def normalize_instance_urls(urls: Any, limit: int = 6) -> list[str]:
@@ -702,6 +936,12 @@ def normalize_instance_urls(urls: Any, limit: int = 6) -> list[str]:
     return cleaned
 
 
+def _caption_language(value: Any) -> str:
+    """A BCP 47-ish tag such as en, pt-BR or es-419, or empty."""
+    text = str(value or "").strip()[:24]
+    return text if re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*", text) else ""
+
+
 def normalize_playback_preferences(stored: Any) -> dict[str, Any]:
     """Fill in defaults, clean the lists, and migrate the old per-source flags."""
     stored = stored if isinstance(stored, dict) else {}
@@ -714,6 +954,12 @@ def normalize_playback_preferences(stored: Any) -> dict[str, Any]:
     preferences["prefer_local"] = bool(preferences["prefer_local"])
     preferences["public_invidious_enabled"] = bool(preferences["public_invidious_enabled"])
     preferences["youtube_fallback"] = bool(preferences["youtube_fallback"])
+    preferences["captions_enabled"] = bool(preferences["captions_enabled"])
+    preferences["captions_auto"] = bool(preferences["captions_auto"])
+    preferences["captions_language"] = _caption_language(preferences["captions_language"])
+    preferences["live_chat_enabled"] = bool(preferences["live_chat_enabled"])
+    preferences["autoplay"] = bool(preferences["autoplay"])
+    preferences["default_speed"] = _playback_speed(preferences["default_speed"])
 
     disabled = preferences.get("disabled_sources")
     disabled_set = {str(item) for item in disabled if str(item).strip()} if isinstance(disabled, list) else set()
@@ -747,8 +993,26 @@ def set_playback_preferences(
     source_order: list[str] | None = None,
     disabled_sources: list[str] | None = None,
     user_key: str = "local",
+    captions_enabled: bool | None = None,
+    captions_language: str | None = None,
+    captions_auto: bool | None = None,
+    live_chat_enabled: bool | None = None,
+    autoplay: bool | None = None,
+    default_speed: float | None = None,
 ) -> dict[str, Any]:
     updates = get_playback_preferences(user_key)
+    if autoplay is not None:
+        updates["autoplay"] = bool(autoplay)
+    if default_speed is not None:
+        updates["default_speed"] = _playback_speed(default_speed)
+    if captions_enabled is not None:
+        updates["captions_enabled"] = bool(captions_enabled)
+    if captions_language is not None:
+        updates["captions_language"] = _caption_language(captions_language)
+    if captions_auto is not None:
+        updates["captions_auto"] = bool(captions_auto)
+    if live_chat_enabled is not None:
+        updates["live_chat_enabled"] = bool(live_chat_enabled)
     if disabled_sources is not None:
         disabled = sorted({str(item).strip() for item in disabled_sources if str(item).strip()})
         updates["disabled_sources"] = disabled
@@ -784,7 +1048,8 @@ def set_playback_preferences(
     return updates
 
 
-def _subscription_interest_profile(limit: int = 500) -> dict[str, Any]:
+def _subscription_interest_profile(user_key: str, limit: int = 500) -> dict[str, Any]:
+    """Words and channels of the videos this user's subscriptions brought in."""
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -792,13 +1057,13 @@ def _subscription_interest_profile(limit: int = 500) -> dict[str, Any]:
                 SELECT v.title, v.author, v.tags, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id
                 FROM videos v
                 LEFT JOIN channels c ON c.id = v.channel_id
-                {_FRESHRSS_LATEST_JOIN}
+                {_FEED_ENTRY_LATEST_JOIN}
                 WHERE (v.source_kind = 'subscription' OR fe.subscription_id IS NOT NULL)
                   AND {ACTIVE_SUBSCRIPTION_SQL}
                 ORDER BY COALESCE(v.published_at, v.created_at) DESC
                 LIMIT %s
                 """,
-                (limit,),
+                (user_key, limit),
             )
             rows = list(cur.fetchall())
     token_counts: dict[str, int] = {}
@@ -901,12 +1166,21 @@ def videos_missing_dislikes(limit: int = 40, max_age_days: int = 30) -> list[str
             return [str(row["youtube_video_id"]) for row in cur.fetchall()]
 
 
-def store_search_results(items: list[dict[str, Any]], query: str) -> int:
+def escape_like_pattern(needle: str) -> str:
+    """Escape LIKE/ILIKE metacharacters so user-supplied text is matched literally.
+
+    `%` and `_` are wildcards and a raw backslash depends on the text: without this,
+    searching for `50%` silently matched every title and `a_b` matched `a-b`.
+    """
+    return needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+def store_search_results(items: list[dict[str, Any]], query: str, user_key: str | None = None) -> int:
     """Persist videos returned by a YouTube search so the rest of the app can use them.
 
     A search result that is not in the database has no watch page, cannot be saved to a
     playlist and cannot be rated. Storing it as a discovery row — tagged with the search
-    that surfaced it — makes it an ordinary video everywhere else.
+    that surfaced it — makes it an ordinary video everywhere else. The rows are shared;
+    who was shown them is recorded for `user_key` only (catalog_scope.py).
     """
     stored = 0
     for item in items:
@@ -915,6 +1189,10 @@ def store_search_results(items: list[dict[str, Any]], query: str) -> int:
                 stored += 1
         except Exception:
             continue
+    if user_key:
+        from . import catalog_scope
+
+        catalog_scope.record_rows(user_key, items, "search")
     return stored
 
 
@@ -961,6 +1239,17 @@ def store_takeout_import(parsed: dict[str, Any], summary: dict[str, Any], user_k
                         for item in videos
                     ],
                 )
+            # Imported watches already in the catalog are this person's (catalog_scope.py).
+            cur.execute(
+                """
+                INSERT INTO video_provenance (user_key, video_id, source)
+                SELECT t.user_key, v.id, 'takeout' FROM takeout_watched_videos t
+                JOIN videos v ON v.youtube_video_id = t.youtube_video_id
+                WHERE t.user_key = %s
+                ON CONFLICT (user_key, video_id) DO NOTHING
+                """,
+                (user_key,),
+            )
             cur.execute(
                 "INSERT INTO takeout_imports (user_key, summary) VALUES (%s, %s::jsonb) RETURNING *",
                 (user_key, json.dumps(summary, default=str)),
@@ -1198,13 +1487,13 @@ def list_downloads(user_key: str = "local", query: str = "", limit: int = 200) -
     is still on disk and still playable.
     """
     cleaned = (query or "").strip()
-    pattern = f"%{cleaned}%"
+    pattern = f"%{escape_like_pattern(cleaned)}%"
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 SELECT d.id AS download_id, d.youtube_video_id, d.title AS download_title,
-                       d.filename, d.container, d.height, d.quality, d.size_bytes, d.created_at AS downloaded_at,
+                       d.filename, d.path, d.container, d.height, d.quality, d.size_bytes, d.created_at AS downloaded_at,
                        COALESCE(v.title, d.title) AS title,
                        v.url, v.thumbnail_url, v.author, v.duration_seconds, v.view_count,
                        v.published_at, v.tags, v.source_kind, v.discovery_source,
@@ -1457,7 +1746,7 @@ def _apply_recommendation_scores(
     slot and topic affinity never got to decide anything. Subscriptions reach the page
     through their own shelf instead.
     """
-    profile = _subscription_interest_profile()
+    profile = _subscription_interest_profile(user_key)
     prefs = get_feed_preferences(user_key)
     subscription_tokens: dict[str, int] = profile["tokens"]
     subscription_channels: set[str] = profile["channels"]
@@ -1673,12 +1962,15 @@ def system_counts() -> dict[str, Any]:
             cur.execute(
                 """
                 SELECT
-                  (SELECT COUNT(*) FROM freshrss_subscriptions) AS subscriptions,
+                  -- Install-wide: feeds somebody follows, and the people-feed pairs.
+                  (SELECT COUNT(*) FROM feeds fs WHERE EXISTS (SELECT 1 FROM user_subscriptions us WHERE us.feed_id = fs.id)) AS subscriptions,
+                  (SELECT COUNT(*) FROM feeds) AS feeds,
+                  (SELECT COUNT(*) FROM user_subscriptions) AS user_subscriptions,
                   (SELECT COUNT(*) FROM channels) AS channels,
                   (SELECT COUNT(*) FROM videos) AS videos,
                   (SELECT COUNT(*) FROM videos WHERE source_kind = 'subscription') AS subscription_videos,
                   (SELECT COUNT(*) FROM videos WHERE source_kind = 'discovery') AS discovery_videos,
-                  (SELECT COUNT(*) FROM freshrss_entries) AS freshrss_entries,
+                  (SELECT COUNT(*) FROM feed_entries) AS feed_entries,
                   (SELECT COUNT(*) FROM user_video_events) AS user_video_events,
                   (SELECT COUNT(*) FROM users) AS users,
                   (SELECT COUNT(*) FROM interactions) AS interactions,
@@ -1766,34 +2058,35 @@ def finish_sync_run(sync_id: int, status: str, message: str | None, subscription
 SUBSCRIPTION_REAL_ID_RE = re.compile(r"^feed/\d+$")
 
 
-def _dedupe_subscription(cur: Any, incoming_id: str, feed_url: str | None, youtube_channel_id: str | None) -> None:
-    """Collapse rows that describe the same feed under different stream ids.
+def _dedupe_feed(cur: Any, incoming_id: str, feed_url: str | None, youtube_channel_id: str | None) -> str:
+    """Collapse rows that describe the same feed under different ids; return the survivor.
 
-    Subscribing from OpenFeed has to store a row before FreshRSS has assigned a numeric id,
-    so it uses a ``feed/<url>`` placeholder. The next sync then imports the same feed
-    under its real ``feed/<n>`` id — a different primary key — leaving the channel listed
-    twice. Keep the real id when we have one and repoint anything referencing the loser,
-    since collection membership cascades on delete.
+    Subscribing stores a row under a ``feed/<url>`` id. Installs that once imported their
+    feeds from a feed reader also hold numeric ``feed/<n>`` ids, and the two can describe
+    the same channel. Keep the numeric id when there is one and repoint everything that
+    references a loser (entries, collection members, people's subscriptions), because
+    deleting the loser cascades.
     """
     if not feed_url and not youtube_channel_id:
-        return
+        return incoming_id
     cur.execute(
         """
-        SELECT id FROM freshrss_subscriptions
+        SELECT id FROM feeds
         WHERE (%s::text IS NOT NULL AND feed_url = %s)
            OR (%s::text IS NOT NULL AND youtube_channel_id = %s)
+        ORDER BY id ASC
         """,
         (feed_url, feed_url, youtube_channel_id or None, youtube_channel_id or None),
     )
     ids = [str(row["id"]) for row in cur.fetchall()]
     if len(ids) < 2:
-        return
+        return incoming_id
     real_ids = [item for item in ids if SUBSCRIPTION_REAL_ID_RE.match(item)]
     keep = real_ids[0] if real_ids else incoming_id
     losers = [item for item in ids if item != keep]
     if not losers:
-        return
-    cur.execute("UPDATE freshrss_entries SET subscription_id = %s WHERE subscription_id = ANY(%s)", (keep, losers))
+        return keep
+    cur.execute("UPDATE feed_entries SET subscription_id = %s WHERE subscription_id = ANY(%s)", (keep, losers))
     # Move collection membership across, skipping rows that would collide with the keeper.
     cur.execute(
         """
@@ -1807,50 +2100,98 @@ def _dedupe_subscription(cur: Any, incoming_id: str, feed_url: str | None, youtu
         """,
         (keep, losers, keep),
     )
-    cur.execute("DELETE FROM freshrss_subscriptions WHERE id = ANY(%s)", (losers,))
+    # Followers of a loser follow the keeper, keeping the earliest subscription date.
+    cur.execute(
+        """
+        INSERT INTO user_subscriptions (user_key, feed_id, created_at)
+        SELECT user_key, %s, MIN(created_at) FROM user_subscriptions
+        WHERE feed_id = ANY(%s)
+        GROUP BY user_key
+        ON CONFLICT (user_key, feed_id) DO UPDATE
+          SET created_at = LEAST(user_subscriptions.created_at, EXCLUDED.created_at)
+        """,
+        (keep, losers),
+    )
+    cur.execute("DELETE FROM feeds WHERE id = ANY(%s)", (losers,))
+    return keep
 
 
-def upsert_subscription(item: dict[str, Any], youtube_channel_id: str | None) -> None:
-    categories = json.dumps(item.get("categories") or [])
+def _upsert_feed(cur: Any, item: dict[str, Any], youtube_channel_id: str | None) -> str:
+    cur.execute(
+        """
+        INSERT INTO feeds (id, title, feed_url, html_url, youtube_channel_id, categories)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+        ON CONFLICT (id) DO UPDATE SET
+          -- The row is shared, and the title a subscriber sends is only a hint (a page's
+          -- data-title, an OPML outline). It fills a placeholder but never renames a feed
+          -- other people follow; the poller sets the real title (refresh_feed_title).
+          title = CASE WHEN btrim(feeds.title) IN ('', feeds.id, COALESCE(feeds.feed_url, ''), COALESCE(feeds.youtube_channel_id, ''))
+                       THEN EXCLUDED.title ELSE feeds.title END,
+          feed_url = COALESCE(feeds.feed_url, EXCLUDED.feed_url),
+          html_url = COALESCE(feeds.html_url, EXCLUDED.html_url),
+          youtube_channel_id = COALESCE(feeds.youtube_channel_id, EXCLUDED.youtube_channel_id),
+          updated_at = now()
+        """,
+        (
+            item["id"],
+            item.get("title") or item.get("sortid") or "Untitled subscription",
+            item.get("url"),
+            item.get("htmlUrl"),
+            youtube_channel_id,
+            json.dumps(item.get("categories") or []),
+        ),
+    )
+    return _dedupe_feed(cur, str(item["id"]), item.get("url"), youtube_channel_id)
+
+
+def upsert_feed(item: dict[str, Any], youtube_channel_id: str | None) -> str:
+    """Store or refresh a shared feed row without subscribing anybody. Returns its id."""
     with connect() as conn:
         with conn.cursor() as cur:
+            feed_id = _upsert_feed(cur, item, youtube_channel_id)
+        conn.commit()
+    return feed_id
+
+
+def subscribe(user_key: str, item: dict[str, Any], youtube_channel_id: str | None) -> dict[str, Any]:
+    """Subscribe one user to a feed, creating the shared feed row if nobody had it.
+
+    Returns {"feed_id", "created"}: created is False when this user already followed it.
+    The poller picks the feed up again from its next pass if nobody followed it before.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            feed_id = _upsert_feed(cur, item, youtube_channel_id)
             cur.execute(
                 """
-                INSERT INTO freshrss_subscriptions (id, title, feed_url, html_url, youtube_channel_id, categories)
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb)
-                ON CONFLICT (id) DO UPDATE SET
-                  title = EXCLUDED.title,
-                  feed_url = EXCLUDED.feed_url,
-                  html_url = EXCLUDED.html_url,
-                  youtube_channel_id = EXCLUDED.youtube_channel_id,
-                  categories = EXCLUDED.categories,
-                  updated_at = now()
+                INSERT INTO user_subscriptions (user_key, feed_id) VALUES (%s, %s)
+                ON CONFLICT (user_key, feed_id) DO NOTHING
                 """,
-                (
-                    item["id"],
-                    item.get("title") or item.get("sortid") or "Untitled subscription",
-                    item.get("url"),
-                    item.get("htmlUrl"),
-                    youtube_channel_id,
-                    categories,
-                ),
+                (user_key, feed_id),
             )
-            _dedupe_subscription(cur, str(item["id"]), item.get("url"), youtube_channel_id)
+            created = bool(cur.rowcount)
         conn.commit()
+    return {"feed_id": feed_id, "created": created}
 
 
-def upsert_channel(title: str, youtube_channel_id: str | None, feed_url: str | None) -> int | None:
+def upsert_channel(title: str, youtube_channel_id: str | None, feed_url: str | None, keep_title: bool = False) -> int | None:
+    """Store a channel. keep_title: the title is only a hint from a subscriber (a page's
+    data-title, an OPML outline), so it names a new row but never renames a known one."""
     if not title and not youtube_channel_id:
         return None
+    title_sql = (
+        "COALESCE(NULLIF(channels.title, ''), EXCLUDED.title)" if keep_title
+        else "COALESCE(NULLIF(EXCLUDED.title, ''), channels.title)"
+    )
     with connect() as conn:
         with conn.cursor() as cur:
             if youtube_channel_id:
                 cur.execute(
-                    """
+                    f"""
                     INSERT INTO channels (youtube_channel_id, title, feed_url)
                     VALUES (%s, %s, %s)
                     ON CONFLICT (youtube_channel_id) DO UPDATE SET
-                      title = COALESCE(NULLIF(EXCLUDED.title, ''), channels.title),
+                      title = {title_sql},
                       feed_url = COALESCE(EXCLUDED.feed_url, channels.feed_url),
                       updated_at = now()
                     RETURNING id
@@ -1912,20 +2253,16 @@ def upsert_entry(entry: dict[str, Any], video_id: int | None, subscription_id: s
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO freshrss_entries
-                  (id, video_id, subscription_id, title, url, author, published_at, is_read, is_starred, raw)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                INSERT INTO feed_entries
+                  (id, video_id, subscription_id, title, url, author, published_at, raw)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                 ON CONFLICT (id) DO UPDATE SET
-                  video_id = COALESCE(EXCLUDED.video_id, freshrss_entries.video_id),
-                  subscription_id = COALESCE(EXCLUDED.subscription_id, freshrss_entries.subscription_id),
+                  video_id = COALESCE(EXCLUDED.video_id, feed_entries.video_id),
+                  subscription_id = COALESCE(EXCLUDED.subscription_id, feed_entries.subscription_id),
                   title = EXCLUDED.title,
-                  url = COALESCE(EXCLUDED.url, freshrss_entries.url),
-                  author = COALESCE(EXCLUDED.author, freshrss_entries.author),
-                  published_at = COALESCE(EXCLUDED.published_at, freshrss_entries.published_at),
-                  -- State is sticky: a re-poll carries no read/starred knowledge, so
-                  -- it must never clear state, only ever set it.
-                  is_read = freshrss_entries.is_read OR EXCLUDED.is_read,
-                  is_starred = freshrss_entries.is_starred OR EXCLUDED.is_starred,
+                  url = COALESCE(EXCLUDED.url, feed_entries.url),
+                  author = COALESCE(EXCLUDED.author, feed_entries.author),
+                  published_at = COALESCE(EXCLUDED.published_at, feed_entries.published_at),
                   raw = EXCLUDED.raw,
                   updated_at = now()
                 """,
@@ -1937,34 +2274,38 @@ def upsert_entry(entry: dict[str, Any], video_id: int | None, subscription_id: s
                     entry.get("url"),
                     entry.get("author"),
                     entry.get("published_at"),
-                    bool(entry.get("is_read")),
-                    bool(entry.get("is_starred")),
                     raw,
                 ),
             )
         conn.commit()
 
 
-def list_recent_videos(limit: int = 50) -> list[dict[str, Any]]:
+def list_recent_videos(limit: int = 50, user_key: str | None = None) -> list[dict[str, Any]]:
+    """Newest stored videos: `user_key`'s part of the catalog, or all of it for a
+    server-side read (user_key None)."""
+    scope_sql, scope_params = _catalog_scope(user_key)
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                         v.published_at, v.duration_seconds, v.view_count, v.tags, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
-                        fe.is_read, fe.is_starred, v.source_kind, v.discovery_source
+                        v.source_kind, v.discovery_source
                 FROM videos v
                 LEFT JOIN channels c ON c.id = v.channel_id
-                {_FRESHRSS_LATEST_JOIN}
+                {_FEED_ENTRY_LATEST_JOIN}
+                WHERE TRUE{scope_sql}
                 ORDER BY v.published_at DESC NULLS LAST, v.created_at DESC
                 LIMIT %s
                 """,
-                (limit,),
+                (*scope_params, limit),
             )
             return list(cur.fetchall())
 
 
-def get_video_by_youtube_id(youtube_video_id: str) -> dict[str, Any] | None:
+def get_video_by_youtube_id(youtube_video_id: str, user_key: str | None = None) -> dict[str, Any] | None:
+    """One video with its channel. The subscription columns describe `user_key`'s own
+    subscriptions, and are empty when no user_key is given."""
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1976,82 +2317,287 @@ def get_video_by_youtube_id(youtube_video_id: str) -> dict[str, Any] | None:
                         v.source_kind, v.discovery_source, v.discovered_at,
                         v.published_at, v.created_at, v.updated_at,
                         c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id, c.subscriber_count AS channel_subscriber_count,
-                        fe.is_read, fe.is_starred, fe.subscription_id,
+                        fe.subscription_id,
                         fs.title AS subscription_title, fs.feed_url AS subscription_feed_url,
                         cs.id AS channel_subscription_id, cs.feed_url AS channel_subscription_feed_url
                 FROM videos v
                 LEFT JOIN channels c ON c.id = v.channel_id
-                {_FRESHRSS_LATEST_JOIN}
-                LEFT JOIN freshrss_subscriptions fs ON fs.id = fe.subscription_id
+                {_FEED_ENTRY_LATEST_JOIN}
+                LEFT JOIN {user_feeds_sql()} fs ON fs.id = fe.subscription_id
                 -- Subscription state belongs to the channel, not to how this particular
                 -- video arrived. Joining only through the RSS entry above reports a
                 -- recommended or searched video as unsubscribed even when the channel is
-                -- subscribed, because such videos have no freshrss_entries row.
-                LEFT JOIN freshrss_subscriptions cs ON cs.youtube_channel_id = c.youtube_channel_id
+                -- subscribed, because such videos have no feed_entries row.
+                LEFT JOIN {user_feeds_sql()} cs ON cs.youtube_channel_id = c.youtube_channel_id
                 WHERE v.youtube_video_id = %s
                 LIMIT 1
                 """,
-                (youtube_video_id,),
+                (user_key, user_key, youtube_video_id),
             )
             row = cur.fetchone()
             return dict(row) if row else None
 
 
-def search_videos(query: str, limit: int = 50) -> list[dict[str, Any]]:
+SEARCH_DATE_INTERVALS = {"hour": "1 hour", "today": "1 day", "week": "7 days", "month": "1 month", "year": "1 year"}
+# The same bands YouTube's own Duration filter uses, so both halves of a search agree.
+SEARCH_DURATION_BOUNDS = {"short": (1, 239), "medium": (240, 1200), "long": (1201, None)}
+
+
+def _search_filter_sql(kind: str, date: str, duration: str) -> str:
+    """Extra WHERE terms for a filtered search. Every value comes from a fixed table."""
+    terms: list[str] = []
+    if kind == "shorts":
+        terms.append(SHORT_VIDEO_SQL)
+    elif kind == "videos":
+        terms.append(f"NOT {SHORT_VIDEO_SQL}")
+    interval = SEARCH_DATE_INTERVALS.get(date)
+    if interval:
+        terms.append(f"v.published_at >= now() - interval '{interval}'")
+    bounds = SEARCH_DURATION_BOUNDS.get(duration)
+    if bounds:
+        terms.append(f"v.duration_seconds >= {int(bounds[0])}")
+        if bounds[1] is not None:
+            terms.append(f"v.duration_seconds <= {int(bounds[1])}")
+    return "".join(f" AND {term}" for term in terms)
+
+
+# Library search over descriptions. ILIKE over ~150 MB of description and summary text
+# took ~3 s per search on an 82k-video library; a GIN full-text index answers in a few ms.
+# The index is built CONCURRENTLY on a background thread (ensure_search_index), not in
+# schema.sql: there it would hold startup of both the app and the worker for about a minute
+# and the two would race to create it. Until it is valid, search falls back to ILIKE.
+SEARCH_TEXT_INDEX = "idx_videos_text_fts"
+_SEARCH_TEXT_TSV = "to_tsvector('simple', coalesce(summary, '') || ' ' || coalesce(description, ''))"
+_SEARCH_TEXT_TSV_V = "to_tsvector('simple', coalesce(v.summary, '') || ' ' || coalesce(v.description, ''))"
+_search_index_state: dict[str, Any] = {"valid": False, "checked": 0.0}
+_SEARCH_INDEX_RECHECK_SECONDS = 300.0
+
+
+def _search_index_valid() -> bool:
+    """Whether the description index exists and is usable. Cached for five minutes."""
+    now = time.monotonic()
+    if _search_index_state["valid"] or now - _search_index_state["checked"] < _SEARCH_INDEX_RECHECK_SECONDS:
+        return bool(_search_index_state["valid"])
+    _search_index_state["checked"] = now
+    try:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT i.indisvalid FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname = %s",
+                (SEARCH_TEXT_INDEX,),
+            ).fetchone()
+        _search_index_state["valid"] = bool(row and row["indisvalid"])
+    except Exception:  # noqa: BLE001 - search still works through ILIKE
+        _search_index_state["valid"] = False
+    return bool(_search_index_state["valid"])
+
+
+def ensure_search_index() -> bool:
+    """Build the description full-text index if it is missing. Safe to call from every process.
+
+    An advisory lock keeps the app and the worker from building it twice. A build that died
+    half way leaves an INVALID index, which is dropped and rebuilt. Returns True when the
+    index is valid afterwards.
+    """
+    with psycopg.connect(get_settings().database_url, autocommit=True, row_factory=dict_row) as conn:
+        if not conn.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS ok", (SEARCH_TEXT_INDEX,)).fetchone()["ok"]:
+            return False
+        try:
+            row = conn.execute(
+                "SELECT i.indisvalid FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname = %s",
+                (SEARCH_TEXT_INDEX,),
+            ).fetchone()
+            if row and not row["indisvalid"]:
+                conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {SEARCH_TEXT_INDEX}")
+                row = None
+            if not row:
+                conn.execute(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {SEARCH_TEXT_INDEX} ON videos USING gin ({_SEARCH_TEXT_TSV})")
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", (SEARCH_TEXT_INDEX,))
+    _search_index_state["checked"] = 0.0
+    _search_index_state["valid"] = False
+    return _search_index_valid()
+
+
+def search_videos(
+    query: str, limit: int = 50, sort: str = "relevance", kind: str = "", date: str = "", duration: str = "",
+    *, user_key: str = "local",
+) -> list[dict[str, Any]]:
+    """Library matches for a search: `user_key`'s part of the shared catalog only
+    (catalog_scope.py), so one person's searches never surface in another's results."""
     cleaned = query.strip()
     if not cleaned:
-        return list_recent_videos(limit)
+        return list_recent_videos(limit, user_key)
 
-    pattern = f"%{cleaned}%"
+    pattern = f"%{escape_like_pattern(cleaned)}%"
+    filters = _search_filter_sql(kind, date, duration)
+    # The scope is applied after the UNION, to the few rows it found, so each branch keeps
+    # its own index plan; the scope set is computed once per query (a hashed subplan).
+    scope_sql, scope_params = _catalog_scope(user_key)
+    # Titles, channels, authors and tags keep substring matching. Descriptions match the
+    # query as a phrase of whole words once the index exists ("gardening tips" finds
+    # "Gardening tips for spring", not "gardening-tipsy").
+    if _search_index_valid():
+        text_match = f"{_SEARCH_TEXT_TSV_V} @@ phraseto_tsquery('simple', %s)"
+        text_params: tuple[Any, ...] = (cleaned,)
+    else:
+        text_match = "(v.summary ILIKE %s OR v.description ILIKE %s)"
+        text_params = (pattern, pattern)
+    order_by = "search_score DESC, v.published_at DESC NULLS LAST, v.created_at DESC"
+    if sort == "view_count":
+        order_by = f"v.view_count DESC NULLS LAST, {order_by}"
+    elif sort == "upload_date":
+        order_by = "v.published_at DESC NULLS LAST, search_score DESC, v.created_at DESC"
+    elif sort == "rating":
+        # Likes against dislikes, which exist only where Return YouTube Dislike supplied an
+        # estimate; the search page offers Rating only while that is on. Under 20 votes the
+        # ratio is noise, so those sort with the unrated (search_extras.RATING_MIN_VOTES).
+        order_by = (
+            "CASE WHEN v.dislike_source = 'ryd' AND v.like_count IS NOT NULL AND v.dislike_count IS NOT NULL "
+            "AND v.like_count + v.dislike_count >= 20 "
+            f"THEN v.like_count::float / (v.like_count + v.dislike_count) END DESC NULLS LAST, {order_by}"
+        )
+    # Matches are collected first and scored after. One WHERE with every field OR-ed together
+    # forces a sequential scan, which would compute the description tsvector for every row
+    # (~25 s) instead of reading the index; a UNION lets each branch use its own plan.
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
+                WITH hits AS (
+                  SELECT v.id
+                  FROM videos v
+                  LEFT JOIN channels c ON c.id = v.channel_id
+                  WHERE v.title ILIKE %s
+                     OR c.title ILIKE %s
+                     OR v.author ILIKE %s
+                     OR array_to_string(COALESCE(v.tags, '{{}}'), ' ') ILIKE %s
+                  UNION
+                  SELECT v.id FROM videos v WHERE {text_match}
+                )
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                         v.summary, v.published_at, v.duration_seconds, v.view_count, v.tags, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
-                        fe.is_read, fe.is_starred, v.source_kind, v.discovery_source,
+                        v.source_kind, v.discovery_source,
                         CASE
                           WHEN v.title ILIKE %s THEN 6
                           WHEN c.title ILIKE %s THEN 5
                           WHEN v.author ILIKE %s THEN 4
                           WHEN array_to_string(COALESCE(v.tags, '{{}}'), ' ') ILIKE %s THEN 3
-                          WHEN v.summary ILIKE %s THEN 2
-                          WHEN v.description ILIKE %s THEN 1
-                          ELSE 0
+                          ELSE 1
                         END AS search_score
-                FROM videos v
+                FROM hits h
+                JOIN videos v ON v.id = h.id
                 LEFT JOIN channels c ON c.id = v.channel_id
-                {_FRESHRSS_LATEST_JOIN}
-                WHERE v.title ILIKE %s
-                   OR c.title ILIKE %s
-                   OR v.author ILIKE %s
-                   OR array_to_string(COALESCE(v.tags, '{{}}'), ' ') ILIKE %s
-                   OR v.summary ILIKE %s
-                   OR v.description ILIKE %s
-                ORDER BY search_score DESC, v.published_at DESC NULLS LAST, v.created_at DESC
+                {_FEED_ENTRY_LATEST_JOIN}
+                WHERE TRUE{filters}{scope_sql}
+                ORDER BY {order_by}
                 LIMIT %s
                 """,
-                (pattern, pattern, pattern, pattern, pattern, pattern,
-                 pattern, pattern, pattern, pattern, pattern, pattern, limit),
+                (pattern, pattern, pattern, pattern, *text_params,
+                 pattern, pattern, pattern, pattern, *scope_params, limit),
             )
             return list(cur.fetchall())
 
 
-def video_ids_in_library(youtube_video_ids: list[Any]) -> set[str]:
+_CHANNEL_RESULT_COLUMNS = """
+    c.youtube_channel_id, c.title, c.avatar_url, c.handle, c.subscriber_count, c.verified,
+    fs.id AS subscription_id,
+    COALESCE(fs.feed_url, c.feed_url) AS feed_url,
+    (SELECT COUNT(*) FROM videos v WHERE v.channel_id = c.id) AS video_count,
+    (SELECT MAX(v.published_at) FROM videos v WHERE v.channel_id = c.id) AS latest_video_at
+"""
+
+
+def search_channels(query: str, limit: int = 20, *, user_key: str) -> list[dict[str, Any]]:
+    """Stored channels whose name or handle matches, ones this user follows first."""
+    cleaned = query.strip()
+    if not cleaned:
+        return []
+    pattern = f"%{escape_like_pattern(cleaned)}%"
+    # A stored channel this user does not follow is listed only when one of its videos is in
+    # their part of the catalog: otherwise "yours first" would list channels other accounts
+    # searched for or opened ahead of YouTube's own results.
+    scope_sql, scope_params = _catalog_scope(user_key, "sv.id")
+    known = (
+        f" AND (fs.id IS NOT NULL OR EXISTS (SELECT 1 FROM videos sv WHERE sv.channel_id = c.id{scope_sql}))"
+        if scope_sql else ""
+    )
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {_CHANNEL_RESULT_COLUMNS}
+                FROM channels c
+                LEFT JOIN {user_feeds_sql()} fs ON fs.youtube_channel_id = c.youtube_channel_id
+                WHERE c.youtube_channel_id IS NOT NULL
+                  AND (c.title ILIKE %s OR COALESCE(c.handle, '') ILIKE %s){known}
+                ORDER BY (fs.id IS NOT NULL) DESC, (lower(c.title) = lower(%s)) DESC, c.subscriber_count DESC NULLS LAST, c.title ASC
+                LIMIT %s
+                """,
+                (user_key, pattern, pattern, *scope_params, cleaned, limit),
+            )
+            return list(cur.fetchall())
+
+
+def store_search_channels(items: list[dict[str, Any]], *, user_key: str) -> list[dict[str, Any]]:
+    """Keep channels a search returned, and read them back in the order they came.
+
+    /channel/<id> needs a row, the same reason store_search_results keeps videos. What a
+    search reports only fills gaps: enrichment owns these columns, and the description a
+    search returns is a truncated excerpt, so it is left for enrichment to fetch whole.
+    """
+    channel_ids = [str(item.get("youtube_channel_id") or "") for item in items if item.get("youtube_channel_id")]
+    if not channel_ids:
+        return []
+    with connect() as conn:
+        with conn.cursor() as cur:
+            for item in items:
+                channel_id = item.get("youtube_channel_id")
+                if not channel_id:
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO channels (youtube_channel_id, title, avatar_url, handle, subscriber_count, verified)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (youtube_channel_id) DO UPDATE SET
+                      avatar_url = COALESCE(channels.avatar_url, EXCLUDED.avatar_url),
+                      handle = COALESCE(channels.handle, EXCLUDED.handle),
+                      subscriber_count = COALESCE(channels.subscriber_count, EXCLUDED.subscriber_count)
+                    """,
+                    (channel_id, item.get("title") or channel_id, item.get("avatar_url"), item.get("handle"),
+                     item.get("subscriber_count"), bool(item.get("verified"))),
+                )
+            cur.execute(
+                f"""
+                SELECT {_CHANNEL_RESULT_COLUMNS}
+                FROM channels c
+                LEFT JOIN {user_feeds_sql()} fs ON fs.youtube_channel_id = c.youtube_channel_id
+                WHERE c.youtube_channel_id = ANY(%s)
+                """,
+                (user_key, channel_ids),
+            )
+            rows = {str(row["youtube_channel_id"]): dict(row) for row in cur.fetchall()}
+        conn.commit()
+    return [rows[channel_id] for channel_id in channel_ids if channel_id in rows]
+
+
+def video_ids_in_library(youtube_video_ids: list[Any], user_key: str | None = None) -> set[str]:
     """Which of these YouTube ids are already stored, regardless of source.
 
     Search results are stored on sight, so by page 2 the page-1 YouTube rows are
     library rows. The scroll endpoint uses this to keep them (and any other
-    stored video) off later pages instead of repeating them.
+    stored video) off later pages instead of repeating them. With `user_key`, "stored"
+    means in that person's part of the catalog: a video another account stored is still
+    "From YouTube" to them. Without it (storage decisions), the whole catalog.
     """
     ids = [str(video_id) for video_id in youtube_video_ids if str(video_id or "").strip()]
     if not ids:
         return set()
+    scope_sql, scope_params = _catalog_scope(user_key, "videos.id")
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT youtube_video_id FROM videos WHERE youtube_video_id = ANY(%s)",
-                (ids,),
+                f"SELECT youtube_video_id FROM videos WHERE youtube_video_id = ANY(%s){scope_sql}",
+                (ids, *scope_params),
             )
             return {str(row["youtube_video_id"]) for row in cur.fetchall()}
 
@@ -2144,6 +2690,28 @@ def set_video_feedback(youtube_video_id: str, event_type: str, payload: dict[str
                       updated_at = now()
                     """,
                     (user_key, video_id, youtube_video_id, raw),
+                )
+            elif event_type == "mark_unwatched":
+                # The reverse of mark_watched, and of a finished playback: the video reads
+                # as unwatched again. The resume mark is a reading of where playback really
+                # stopped (mark_watched never touched it, and finishing already drops it),
+                # so it stays, and so does lifetime watch time. The earlier mark_watched
+                # events go because the feed and History count them as watched.
+                cur.execute(
+                    """
+                    UPDATE playback_progress SET
+                      completed = false,
+                      manually_marked_watched = false,
+                      percent_completed = 0,
+                      furthest_seconds = 0,
+                      updated_at = now()
+                    WHERE user_key = %s AND video_id = %s
+                    """,
+                    (user_key, video_id),
+                )
+                cur.execute(
+                    "DELETE FROM user_video_events WHERE user_key = %s AND video_id = %s AND event_type = 'mark_watched'",
+                    (user_key, video_id),
                 )
 
             set_reaction = reaction is not sentinel
@@ -2305,21 +2873,77 @@ def create_playlist(name: str, description: str | None = None, user_key: str = "
     return dict(row)
 
 
-def remove_subscription(feed_url: str | None = None, youtube_channel_id: str | None = None) -> int:
+def _unsubscribe_feed_ids(cur: Any, user_key: str, feed_ids: list[str]) -> list[dict[str, Any]]:
+    """Drop one user's follow of these feeds and take them out of that user's collections.
+
+    The shared feed row, its entries and the videos stay: another person may follow it,
+    and history must survive an unsubscribe. A feed nobody follows any more simply stops
+    being polled (list_rss_due_channels).
+    """
+    if not feed_ids:
+        return []
+    cur.execute(
+        """
+        DELETE FROM user_subscriptions us
+        USING feeds f
+        WHERE us.feed_id = f.id AND us.user_key = %s AND us.feed_id = ANY(%s)
+        RETURNING f.id, f.title, f.feed_url, f.youtube_channel_id
+        """,
+        (user_key, list(feed_ids)),
+    )
+    removed = [dict(row) for row in cur.fetchall()]
+    if removed:
+        cur.execute(
+            """
+            DELETE FROM subscription_collection_members scm
+            USING subscription_collections sc
+            WHERE scm.collection_id = sc.id AND sc.user_key = %s AND scm.subscription_id = ANY(%s)
+            """,
+            (user_key, [str(row["id"]) for row in removed]),
+        )
+    return removed
+
+
+def unsubscribe_feeds(user_key: str, feed_ids: list[str]) -> list[dict[str, Any]]:
+    """Unsubscribe one user from feeds by id. Returns the feeds actually removed."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            removed = _unsubscribe_feed_ids(cur, user_key, [str(item) for item in feed_ids if item])
+        conn.commit()
+    return removed
+
+
+def remove_subscription(feed_url: str | None = None, youtube_channel_id: str | None = None, *, user_key: str) -> int:
+    """Unsubscribe one user from the feed(s) matching a URL, id or channel. Returns how many."""
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                DELETE FROM freshrss_subscriptions
-                WHERE (%s::text IS NOT NULL AND (feed_url = %s OR id = %s OR id = 'feed/' || %s))
-                   OR (%s::text IS NOT NULL AND youtube_channel_id = %s)
+                SELECT fs.id FROM feeds fs
+                JOIN user_subscriptions us ON us.feed_id = fs.id AND us.user_key = %s
+                WHERE (%s::text IS NOT NULL AND (fs.feed_url = %s OR fs.id = %s OR fs.id = 'feed/' || %s))
+                   OR (%s::text IS NOT NULL AND fs.youtube_channel_id = %s)
                 """,
-                (feed_url, feed_url, feed_url, feed_url, youtube_channel_id, youtube_channel_id),
+                (user_key, feed_url, feed_url, feed_url, feed_url, youtube_channel_id, youtube_channel_id),
             )
-            count = cur.rowcount or 0
+            feed_ids = [str(row["id"]) for row in cur.fetchall()]
+            removed = _unsubscribe_feed_ids(cur, user_key, feed_ids)
         conn.commit()
-    return int(count)
+    return len(removed)
 
+
+def is_subscribed(youtube_channel_id: str, *, user_key: str) -> bool:
+    """Whether this user follows the channel."""
+    if not youtube_channel_id:
+        return False
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT EXISTS (SELECT 1 FROM {user_feeds_sql()} fs WHERE fs.youtube_channel_id = %s) AS subscribed",
+                (user_key, youtube_channel_id),
+            )
+            row = cur.fetchone() or {}
+    return bool(row.get("subscribed"))
 
 
 def create_subscription_collection(name: str, description: str | None = None, user_key: str = "local") -> dict[str, Any]:
@@ -2355,7 +2979,8 @@ def list_subscription_collections(user_key: str = "local") -> list[dict[str, Any
                   FROM (
                     SELECT fs.title, c.avatar_url
                     FROM subscription_collection_members m
-                    JOIN freshrss_subscriptions fs ON fs.id = m.subscription_id
+                    JOIN feeds fs ON fs.id = m.subscription_id
+                    JOIN user_subscriptions us ON us.feed_id = fs.id AND us.user_key = sc.user_key
                     LEFT JOIN channels c ON c.youtube_channel_id = fs.youtube_channel_id
                     WHERE m.collection_id = sc.id
                     ORDER BY fs.title ASC
@@ -2443,7 +3068,9 @@ def add_subscription_to_collection(collection_id: str, subscription_id: str, use
                 INSERT INTO subscription_collection_members (collection_id, subscription_id)
                 SELECT sc.id, fs.id
                 FROM subscription_collections sc
-                JOIN freshrss_subscriptions fs ON fs.id = %s
+                JOIN feeds fs ON fs.id = %s
+                -- Only a feed this user follows can go into this user's collection.
+                JOIN user_subscriptions us ON us.feed_id = fs.id AND us.user_key = sc.user_key
                 WHERE sc.id = %s AND sc.user_key = %s
                 ON CONFLICT (collection_id, subscription_id) DO UPDATE SET added_at = subscription_collection_members.added_at
                 RETURNING *
@@ -2482,7 +3109,8 @@ def list_collection_subscriptions(collection_id: str, user_key: str = "local") -
                 SELECT fs.*, c.avatar_url AS channel_avatar_url, COUNT(v.id) AS video_count, MAX(v.published_at) AS latest_video_at
                 FROM subscription_collections sc
                 JOIN subscription_collection_members scm ON scm.collection_id = sc.id
-                JOIN freshrss_subscriptions fs ON fs.id = scm.subscription_id
+                JOIN feeds fs ON fs.id = scm.subscription_id
+                JOIN user_subscriptions us ON us.feed_id = fs.id AND us.user_key = sc.user_key
                 LEFT JOIN channels c ON c.youtube_channel_id = fs.youtube_channel_id
                 LEFT JOIN videos v ON v.channel_id = c.id
                 WHERE sc.id = %s AND sc.user_key = %s
@@ -2501,13 +3129,14 @@ def list_collection_videos(collection_id: str, limit: int = 80, user_key: str = 
                 f"""
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                         v.published_at, v.duration_seconds, v.view_count, v.tags, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
-                        fe.is_read, fe.is_starred, v.source_kind, v.discovery_source
+                        v.source_kind, v.discovery_source
                 FROM subscription_collections sc
                 JOIN subscription_collection_members scm ON scm.collection_id = sc.id
-                JOIN freshrss_subscriptions fs ON fs.id = scm.subscription_id
+                JOIN feeds fs ON fs.id = scm.subscription_id
+                JOIN user_subscriptions us ON us.feed_id = fs.id AND us.user_key = sc.user_key
                 JOIN channels c ON c.youtube_channel_id = fs.youtube_channel_id
                 JOIN videos v ON v.channel_id = c.id
-                {_FRESHRSS_LATEST_JOIN}
+                {_FEED_ENTRY_LATEST_JOIN}
                 WHERE sc.id = %s AND sc.user_key = %s
                 ORDER BY v.published_at DESC NULLS LAST, v.created_at DESC
                 LIMIT %s
@@ -2516,15 +3145,24 @@ def list_collection_videos(collection_id: str, limit: int = 80, user_key: str = 
             )
             return list(cur.fetchall())
 
-def list_playlists(user_key: str = "local") -> list[dict[str, Any]]:
+def list_playlists(user_key: str = "local", youtube_video_id: str = "") -> list[dict[str, Any]]:
+    """The owner's playlists. Given a video, each row also says whether it holds it.
+
+    runtime_seconds is summed from the durations we actually know; runtime_known is how
+    many videos that covers, so a caller can tell a total from a partial one.
+    """
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT p.*, COUNT(pi.id) AS video_count, MAX(pi.added_at) AS latest_video_at, cover.thumbnail_url AS cover_thumbnail_url,
-                       cover.youtube_video_id AS cover_youtube_video_id
+                       cover.youtube_video_id AS cover_youtube_video_id,
+                       COALESCE(SUM(runtime.duration_seconds), 0) AS runtime_seconds,
+                       COUNT(runtime.duration_seconds) AS runtime_known,
+                       COALESCE(BOOL_OR(pi.youtube_video_id = %s), false) AS has_video
                 FROM playlists p
                 LEFT JOIN playlist_items pi ON pi.playlist_id = p.id
+                LEFT JOIN videos runtime ON runtime.id = pi.video_id
                 LEFT JOIN LATERAL (
                   SELECT v.thumbnail_url, v.youtube_video_id
                   FROM playlist_items x
@@ -2537,7 +3175,7 @@ def list_playlists(user_key: str = "local") -> list[dict[str, Any]]:
                 GROUP BY p.id, cover.thumbnail_url, cover.youtube_video_id
                 ORDER BY p.updated_at DESC
                 """,
-                (user_key,),
+                (youtube_video_id, user_key),
             )
             return list(cur.fetchall())
 
@@ -2575,9 +3213,12 @@ def get_playlist(playlist_id: str, user_key: str = "local") -> dict[str, Any] | 
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT p.*, COUNT(pi.id) AS video_count, MAX(pi.added_at) AS latest_video_at
+                SELECT p.*, COUNT(pi.id) AS video_count, MAX(pi.added_at) AS latest_video_at,
+                       COALESCE(SUM(runtime.duration_seconds), 0) AS runtime_seconds,
+                       COUNT(runtime.duration_seconds) AS runtime_known
                 FROM playlists p
                 LEFT JOIN playlist_items pi ON pi.playlist_id = p.id
+                LEFT JOIN videos runtime ON runtime.id = pi.video_id
                 WHERE p.id = %s AND p.user_key = %s
                 GROUP BY p.id
                 """,
@@ -2595,14 +3236,13 @@ def list_playlist_videos(playlist_id: str, limit: int = 200, user_key: str = "lo
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                         v.published_at, v.duration_seconds, v.view_count, v.source_kind, v.discovery_source,
                         c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
-                        fe.is_read, fe.is_starred,
                         pi.position, pi.added_at
                 FROM playlist_items pi
                 JOIN playlists p ON p.id = pi.playlist_id AND p.user_key = %s
                 JOIN videos v ON v.id = pi.video_id
                 LEFT JOIN channels c ON c.id = v.channel_id
-                -- One row per video; newest freshrss_entries row wins (see _FRESHRSS_LATEST_JOIN).
-                {_FRESHRSS_LATEST_JOIN}
+                -- One row per video; newest feed_entries row wins (see _FEED_ENTRY_LATEST_JOIN).
+                {_FEED_ENTRY_LATEST_JOIN}
                 WHERE pi.playlist_id = %s
                 ORDER BY pi.position ASC, pi.added_at ASC
                 LIMIT %s
@@ -2677,13 +3317,13 @@ def list_library_activity(limit: int = 80, user_key: str = "local") -> list[dict
                 )
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                        v.published_at, v.duration_seconds, v.view_count, v.tags, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
-                       fe.is_read, fe.is_starred, v.source_kind, v.discovery_source,
+                       v.source_kind, v.discovery_source,
                        le.event_type AS latest_event_type, le.created_at AS latest_event_at,
                        er.event_count, er.open_count, er.more_like_count, er.less_like_count, er.watched_count, er.hide_count
                 FROM latest_event le
                 JOIN videos v ON v.id = le.video_id
                 LEFT JOIN channels c ON c.id = v.channel_id
-                {_FRESHRSS_LATEST_JOIN}
+                {_FEED_ENTRY_LATEST_JOIN}
                 LEFT JOIN event_rollup er ON er.video_id = v.id
                 ORDER BY le.created_at DESC
                 LIMIT %s
@@ -2701,6 +3341,63 @@ def list_recommended_videos(limit: int = 50, offset: int = 0, feed_filter: str =
     """
     # "recommended" is "all" as far as row matching goes; it only changes the weighting.
     lane_key = (feed_filter or "").strip().lower()
+    # Ranker v2 (ranker.py) serves the two recommendation lanes in graph/blend mode, and the
+    # deeper Home lanes as "recommended-recent" / "recommended-long". Every other lane, the
+    # "classic" mode, and any v2 failure (no numpy, index still building, an exception) fall
+    # through to the legacy ranker below, which stays intact.
+    if lane_key in V2_HOME_LANES:
+        from . import ranker
+
+        try:
+            v2_rows = ranker.recommended_rows(max(1, min(int(limit or 50), 200)), max(0, int(offset or 0)), lane_key, user_key)
+        except Exception as exc:  # noqa: BLE001 - the legacy ranker is the fallback
+            ranker.note_fallback(f"{type(exc).__name__}: {exc}")
+            v2_rows = None
+        if v2_rows is not None:
+            return v2_rows
+        rows = _list_recommended_videos_classic(limit, offset, V2_HOME_LANES[lane_key], user_key)
+        return _apply_v2_lane_rules(rows, "recommended")
+    if lane_key in {"recommended", "all", ""}:
+        from . import ranker
+
+        try:
+            v2_rows = ranker.recommended_rows(
+                max(1, min(int(limit or 50), 200)), max(0, int(offset or 0)), lane_key or "all", user_key
+            )
+        except Exception as exc:  # noqa: BLE001 - the legacy ranker is the fallback
+            ranker.note_fallback(f"{type(exc).__name__}: {exc}")
+            v2_rows = None
+        if v2_rows is not None:
+            return v2_rows
+        # v2 could not serve (index still building after a restart, numpy missing, an error).
+        # The classic rows below get the v2 lane rules applied, so the fallback never shows
+        # live streams, Shorts or (on the recommended lane) subscribed channels.
+        rows = _list_recommended_videos_classic(limit, offset, feed_filter, user_key)
+        return _apply_v2_lane_rules(rows, lane_key)
+    return _list_recommended_videos_classic(limit, offset, feed_filter, user_key)
+
+
+# The deeper Home lanes v2 serves, and the classic filter each falls back to. The plain
+# "recent" / "long-form" filter chips stay on the classic ranker (they include subscriptions).
+V2_HOME_LANES = {"recommended-recent": "recent", "recommended-long": "long-form"}
+
+
+def _apply_v2_lane_rules(rows: list[dict[str, Any]], lane_key: str) -> list[dict[str, Any]]:
+    out = []
+    for row in rows:
+        duration = row.get("duration_seconds")
+        if duration is not None and float(duration or 0) <= 0:
+            continue  # live or premiere
+        if is_short_video(row):
+            continue
+        if lane_key == "recommended" and row.get("is_subscribed_channel"):
+            continue
+        out.append(row)
+    return out
+
+
+def _list_recommended_videos_classic(limit: int = 50, offset: int = 0, feed_filter: str = "all", user_key: str = "local") -> list[dict[str, Any]]:
+    lane_key = (feed_filter or "").strip().lower()
     recommended_lane = lane_key == "recommended"
     # Continue Watching is the one lane that must keep partial watches: it selects
     # them by progress below, so the watched exclusion must not apply to it.
@@ -2714,7 +3411,10 @@ def list_recommended_videos(limit: int = 50, offset: int = 0, feed_filter: str =
     # Anything past #500 never got evaluated for interest fit, so niche discovery
     # videos were invisible no matter how well they matched. 2000 covers a typical
     # library in one pass while staying cheap (small rows, one query).
-    candidate_limit = max(min((requested + skip) * 12, 5000), 2000)
+    # The pool must be the same for every page of a scroll, or pages ranked against a
+    # bigger pool repeat what earlier pages showed. Pages are diversified one at a time
+    # (_paged_diversify), so 2000 rows serve about 60 pages; only past that does it grow.
+    candidate_limit = 2000 if requested + skip <= 1500 else 5000
     subscription_weight = "0.0" if recommended_lane else "6.0"
     # Opening a video counts as watching it, so anything with watch evidence stays
     # out of the recommendation lanes instead of popping up again — scored higher
@@ -2730,6 +3430,8 @@ def list_recommended_videos(limit: int = 50, offset: int = 0, feed_filter: str =
                     AND COALESCE(pp.total_watch_seconds, 0) = 0))"""
     else:
         watched_predicate = """CASE WHEN pp.id IS NULL THEN COALESCE(er.watched_count, 0) = 0 ELSE COALESCE(pp.completed, false) = false AND COALESCE(pp.manually_marked_watched, false) = false END"""
+    # Only this person's part of the shared catalog is a candidate (catalog_scope.py).
+    scope_sql, scope_params = _catalog_scope(user_key)
     with connect() as conn:
         with conn.cursor() as cur:
             _tune_ranking_cursor(cur)
@@ -2753,16 +3455,16 @@ def list_recommended_videos(limit: int = 50, offset: int = 0, feed_filter: str =
                   WHERE user_key = %s
                   GROUP BY video_id
                 ),
-                {_FRESHRSS_LATEST_CTE}
+                {_FEED_ENTRY_LATEST_CTE}
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                        v.published_at, v.created_at, v.duration_seconds, v.view_count, v.tags, v.topic_vector, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
-                       fe.is_read, fe.is_starred,
                        v.source_kind, v.discovery_source,
                        {ACTIVE_SUBSCRIPTION_SQL} AS is_subscribed_channel,
                        uvf.reaction, COALESCE(uvf.not_interested, false) AS not_interested,
                        COALESCE(pp.percent_completed, 0) AS percent_completed,
                        COALESCE(pp.completed, false) AS progress_completed,
                        COALESCE(pp.manually_marked_watched, false) AS manually_marked_watched,
+                       pp.resume_seconds,
                        COALESCE(er.feedback_score, 0) AS feedback_score,
                        COALESCE(er.hide_count, 0) AS hide_count,
                        COALESCE(er.watched_count, 0) AS watched_count,
@@ -2774,25 +3476,52 @@ def list_recommended_videos(limit: int = 50, offset: int = 0, feed_filter: str =
                          -- and it also decided which rows survived the candidate LIMIT below.
                          + CASE WHEN v.source_kind = 'subscription' AND {ACTIVE_SUBSCRIPTION_SQL} THEN {subscription_weight} WHEN v.source_kind = 'discovery' THEN 0.4 ELSE 0.0 END
                          + CASE WHEN v.published_at >= now() - interval '3 days' THEN 2.4 WHEN v.published_at >= now() - interval '14 days' THEN 1.4 WHEN v.published_at >= now() - interval '60 days' THEN 0.5 ELSE 0.0 END
-                         + CASE WHEN fe.is_starred THEN 4.5 ELSE 0.0 END
                          - CASE WHEN COALESCE(pp.percent_completed, 0) > 0 AND COALESCE(pp.percent_completed, 0) < 0.4 THEN 1.5 ELSE 0.0 END AS recommendation_score
                 FROM videos v
                 LEFT JOIN channels c ON c.id = v.channel_id
-                {_FRESHRSS_LATEST_JOIN_CTE}
+                {_FEED_ENTRY_LATEST_JOIN_CTE}
                 LEFT JOIN event_rollup er ON er.video_id = v.id
                 LEFT JOIN user_video_feedback uvf ON uvf.video_id = v.id AND uvf.user_key = %s
                 LEFT JOIN playback_progress pp ON pp.video_id = v.id AND pp.user_key = %s
                 WHERE CASE WHEN uvf.id IS NULL THEN COALESCE(er.hide_count, 0) = 0 ELSE COALESCE(uvf.not_interested, false) = false END
                   AND {watched_predicate}
+                  {scope_sql}
                 ORDER BY recommendation_score DESC, v.published_at DESC NULLS LAST, v.created_at DESC
                 LIMIT %s
                 """,
-                (user_key, user_key, user_key, candidate_limit),
+                # event_rollup, the two subscription checks, uvf, pp, the scope.
+                (user_key, user_key, user_key, user_key, user_key, *scope_params, candidate_limit),
             )
             rows = list(cur.fetchall())
     scored = _apply_recommendation_scores(rows, feed_filter, user_key, suppress_subscription_bias=recommended_lane)
-    diversified = _diversify_recommendations(scored, requested + skip, channel_cap_override=2 if recommended_lane else 0)
-    return diversified[skip:skip + requested]
+    return _paged_diversify(scored, requested, skip, channel_cap_override=2 if recommended_lane else 0)
+
+
+def _row_video_key(row: dict[str, Any]) -> str:
+    return str(row.get("youtube_video_id") or row.get("id") or "")
+
+
+def _paged_diversify(scored: list[dict[str, Any]], requested: int, skip: int, channel_cap_override: int = 0) -> list[dict[str, Any]]:
+    """Page `skip // requested` of the diversified ranking, never overlapping earlier pages.
+
+    The diversity caps scale with the size asked for, so diversifying the first 60 rows does
+    not start with the same 30 as diversifying the first 30: slicing [30:60] out of a
+    60-row pass repeated videos page 0 had already shown (45 of 300 on Home's Recent chip).
+    Each page is instead its own pass of `requested` rows over what earlier pages left, so
+    page N is exactly what follows page N-1.
+    """
+    if not skip:
+        return _diversify_recommendations(scored, requested, channel_cap_override=channel_cap_override)
+    pages: list[dict[str, Any]] = []
+    remaining = scored
+    while remaining and len(pages) < skip + requested:
+        chunk = _diversify_recommendations(remaining, requested, channel_cap_override=channel_cap_override)
+        if not chunk:
+            break
+        pages.extend(chunk)
+        taken = {_row_video_key(row) for row in chunk}
+        remaining = [row for row in remaining if _row_video_key(row) not in taken]
+    return pages[skip:skip + requested]
 
 
 def list_subscription_recommendations(limit: int = 50, user_key: str = "local") -> list[dict[str, Any]]:
@@ -2819,15 +3548,15 @@ def list_subscription_recommendations(limit: int = 50, user_key: str = "local") 
                   WHERE user_key = %s
                   GROUP BY video_id
                 ),
-                {_FRESHRSS_LATEST_CTE}
+                {_FEED_ENTRY_LATEST_CTE}
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                        v.published_at, v.duration_seconds, v.view_count, v.tags, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
-                       fe.is_read, fe.is_starred,
                        v.source_kind, v.discovery_source,
                        uvf.reaction, COALESCE(uvf.not_interested, false) AS not_interested,
                        COALESCE(pp.percent_completed, 0) AS percent_completed,
                        COALESCE(pp.completed, false) AS progress_completed,
                        COALESCE(pp.manually_marked_watched, false) AS manually_marked_watched,
+                       pp.resume_seconds,
                        COALESCE(er.feedback_score, 0) AS feedback_score,
                        COALESCE(er.hide_count, 0) AS hide_count,
                        COALESCE(er.watched_count, 0) AS watched_count,
@@ -2836,11 +3565,10 @@ def list_subscription_recommendations(limit: int = 50, user_key: str = "local") 
                          + CASE WHEN uvf.reaction = 'like' THEN 8.0 WHEN uvf.reaction = 'dislike' THEN -8.0 ELSE 0.0 END
                          + 4.0
                          + CASE WHEN v.published_at >= now() - interval '3 days' THEN 2.0 WHEN v.published_at >= now() - interval '14 days' THEN 1.2 WHEN v.published_at >= now() - interval '60 days' THEN 0.4 ELSE 0.0 END
-                         + CASE WHEN fe.is_starred THEN 4.0 ELSE 0.0 END
                          - CASE WHEN COALESCE(pp.percent_completed, 0) > 0 AND COALESCE(pp.percent_completed, 0) < 0.4 THEN 1.5 ELSE 0.0 END AS recommendation_score
                 FROM videos v
                 LEFT JOIN channels c ON c.id = v.channel_id
-                {_FRESHRSS_LATEST_JOIN_CTE}
+                {_FEED_ENTRY_LATEST_JOIN_CTE}
                 LEFT JOIN event_rollup er ON er.video_id = v.id
                 LEFT JOIN user_video_feedback uvf ON uvf.video_id = v.id AND uvf.user_key = %s
                 LEFT JOIN playback_progress pp ON pp.video_id = v.id AND pp.user_key = %s
@@ -2851,7 +3579,7 @@ def list_subscription_recommendations(limit: int = 50, user_key: str = "local") 
                 ORDER BY recommendation_score DESC, v.published_at DESC NULLS LAST, v.created_at DESC
                 LIMIT %s
                 """,
-                (user_key, user_key, user_key, limit),
+                (user_key, user_key, user_key, user_key, limit),
             )
             return list(cur.fetchall())
 
@@ -2872,6 +3600,19 @@ def list_related_videos(
     """
     requested = max(1, min(int(limit or 14), 40))
     anchor = get_video_by_youtube_id(youtube_video_id) or {}
+    # Ranker v2: the anchor's own related list and its walk (ranker.up_next_rows). The pool
+    # re-sort below is the fallback while the index builds, for an anchor not indexed yet, and
+    # in Classic mode.
+    if not include_shorts and anchor.get("id") is not None:
+        from . import ranker
+
+        try:
+            v2_rows = ranker.up_next_rows(int(anchor["id"]), requested, user_key)
+        except Exception as exc:  # noqa: BLE001 - the legacy ordering is the fallback
+            ranker.note_fallback(f"{type(exc).__name__}: {exc}")
+            v2_rows = None
+        if v2_rows:
+            return v2_rows
     anchor_tokens = set(_recommendation_tokens(anchor))
     anchor_channel = _recommendation_channel_key(anchor)
 
@@ -3085,6 +3826,7 @@ def enrichment_status() -> dict[str, Any]:
 
 def list_discovery_videos(limit: int = 50, user_key: str = "local") -> list[dict[str, Any]]:
     candidate_limit = max(limit * 6, 120)
+    scope_sql, scope_params = _catalog_scope(user_key)
     with connect() as conn:
         with conn.cursor() as cur:
             _tune_ranking_cursor(cur)
@@ -3108,10 +3850,10 @@ def list_discovery_videos(limit: int = 50, user_key: str = "local") -> list[dict
                   WHERE user_key = %s
                   GROUP BY video_id
                 ),
-                {_FRESHRSS_LATEST_CTE}
+                {_FEED_ENTRY_LATEST_CTE}
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                        v.published_at, v.duration_seconds, v.view_count, v.tags, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
-                       fe.is_read, fe.is_starred, v.source_kind, v.discovery_source,
+                       v.source_kind, v.discovery_source,
                        COALESCE(er.feedback_score, 0) AS feedback_score,
                        COALESCE(er.hide_count, 0) AS hide_count,
                        COALESCE(er.watched_count, 0) AS watched_count,
@@ -3123,17 +3865,18 @@ def list_discovery_videos(limit: int = 50, user_key: str = "local") -> list[dict
                          - CASE WHEN COALESCE(pp.percent_completed, 0) > 0 AND COALESCE(pp.percent_completed, 0) < 0.4 THEN 1.5 ELSE 0.0 END AS recommendation_score
                 FROM videos v
                 LEFT JOIN channels c ON c.id = v.channel_id
-                {_FRESHRSS_LATEST_JOIN_CTE}
+                {_FEED_ENTRY_LATEST_JOIN_CTE}
                 LEFT JOIN event_rollup er ON er.video_id = v.id
                 LEFT JOIN user_video_feedback uvf ON uvf.video_id = v.id AND uvf.user_key = %s
                 LEFT JOIN playback_progress pp ON pp.video_id = v.id AND pp.user_key = %s
                 WHERE v.source_kind = 'discovery'
                   AND CASE WHEN uvf.id IS NULL THEN COALESCE(er.hide_count, 0) = 0 ELSE COALESCE(uvf.not_interested, false) = false END
                   AND CASE WHEN pp.id IS NULL THEN COALESCE(er.watched_count, 0) = 0 ELSE COALESCE(pp.completed, false) = false AND COALESCE(pp.manually_marked_watched, false) = false END
+                  {scope_sql}
                 ORDER BY recommendation_score DESC, v.discovered_at DESC NULLS LAST, v.published_at DESC NULLS LAST, v.created_at DESC
                 LIMIT %s
                 """,
-                (user_key, user_key, user_key, candidate_limit),
+                (user_key, user_key, user_key, *scope_params, candidate_limit),
             )
             rows = list(cur.fetchall())
     scored = _apply_recommendation_scores(rows, "discovery", user_key)
@@ -3159,15 +3902,7 @@ def list_discovery_seed_videos(limit: int = 5) -> list[dict[str, Any]]:
             return list(cur.fetchall())
 
 
-def upsert_discovered_video(item: dict[str, Any], source_video_id: int | None, source: str, reason: str | None = None) -> int | None:
-    youtube_video_id = item.get("youtube_video_id")
-    if not youtube_video_id:
-        return None
-    channel_id = upsert_channel(item.get("channel_title") or item.get("author") or "Unknown channel", item.get("youtube_channel_id"), item.get("feed_url"))
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
+_DISCOVERED_VIDEO_UPSERT_SQL = """
                 INSERT INTO videos
                   (youtube_video_id, channel_id, title, url, thumbnail_url, author, summary, published_at,
                    duration_seconds, view_count, source_kind, discovery_source, discovered_at)
@@ -3194,7 +3929,18 @@ def upsert_discovered_video(item: dict[str, Any], source_video_id: int | None, s
                   discovered_at = COALESCE(videos.discovered_at, now()),
                   updated_at = now()
                 RETURNING id
-                """,
+                """
+
+
+def upsert_discovered_video(item: dict[str, Any], source_video_id: int | None, source: str, reason: str | None = None) -> int | None:
+    youtube_video_id = item.get("youtube_video_id")
+    if not youtube_video_id:
+        return None
+    channel_id = upsert_channel(item.get("channel_title") or item.get("author") or "Unknown channel", item.get("youtube_channel_id"), item.get("feed_url"))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                _DISCOVERED_VIDEO_UPSERT_SQL,
                 (
                     youtube_video_id,
                     channel_id,
@@ -3224,28 +3970,88 @@ def upsert_discovered_video(item: dict[str, Any], source_video_id: int | None, s
     return discovered_id
 
 
-def list_subscriptions(limit: int = 500) -> list[dict[str, Any]]:
+def upsert_discovered_videos(items: list[dict[str, Any]], source: str) -> int:
+    """upsert_discovered_video for a whole listing page, on one connection.
+
+    The per-row version opens two connections per video (channel, then video); a channel
+    page of 60 cost about 1.7 s in connection setup alone.
+    """
+    rows = [item for item in items if item.get("youtube_video_id")]
+    if not rows:
+        return 0
+    channel_ids: dict[tuple[str, str], int | None] = {}
+    for item in rows:
+        key = (str(item.get("channel_title") or item.get("author") or "Unknown channel"), str(item.get("youtube_channel_id") or ""))
+        if key not in channel_ids:
+            channel_ids[key] = upsert_channel(key[0], key[1] or None, item.get("feed_url"))
+    params = []
+    for item in rows:
+        youtube_video_id = item["youtube_video_id"]
+        key = (str(item.get("channel_title") or item.get("author") or "Unknown channel"), str(item.get("youtube_channel_id") or ""))
+        params.append((
+            youtube_video_id, channel_ids[key], item.get("title") or youtube_video_id,
+            item.get("url") or f"https://www.youtube.com/watch?v={youtube_video_id}", item.get("thumbnail_url"),
+            item.get("author") or item.get("channel_title"), item.get("summary"), item.get("published_at"),
+            item.get("duration_seconds"), item.get("view_count"), source,
+        ))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(_DISCOVERED_VIDEO_UPSERT_SQL, params)
+        conn.commit()
+    return len(params)
+
+
+def list_subscriptions(limit: int = 500, recent_first: bool = False, *, user_key: str) -> list[dict[str, Any]]:
+    """The feeds this user follows, by title, or with recent_first the sidebar's order:
+    channels that uploaded in the last 14 days, newest first, then the rest by title.
+
+    GET /api/subscriptions returns these rows as they are, and an outside tool reads that,
+    so the column list is a contract: add to it, never rename or drop."""
+    latest = "MAX(COALESCE(fe.published_at, fe.created_at))"
+    order = (
+        f"CASE WHEN {latest} >= now() - interval '14 days' THEN {latest} END DESC NULLS LAST, fs.title ASC"
+        if recent_first else "fs.title ASC"
+    )
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT fs.id, fs.title, fs.feed_url, fs.html_url, fs.youtube_channel_id, fs.updated_at,
                        c.avatar_url AS channel_avatar_url,
                        COUNT(fe.id) AS video_count,
                        MAX(COALESCE(fe.published_at, fe.created_at)) AS latest_video_at
-                FROM freshrss_subscriptions fs
-                LEFT JOIN freshrss_entries fe ON fe.subscription_id = fs.id
+                FROM feeds fs
+                JOIN user_subscriptions us ON us.feed_id = fs.id AND us.user_key = %s
+                LEFT JOIN feed_entries fe ON fe.subscription_id = fs.id
                 LEFT JOIN channels c ON c.youtube_channel_id = fs.youtube_channel_id
                 GROUP BY fs.id, fs.title, fs.feed_url, fs.html_url, fs.youtube_channel_id, fs.updated_at, c.avatar_url
-                ORDER BY fs.title ASC
+                ORDER BY {order}
                 LIMIT %s
                 """,
-                (limit,),
+                (user_key, limit),
             )
             return list(cur.fetchall())
 
 
-def list_playlist_subscriptions(limit: int = 80) -> list[dict[str, Any]]:
+def list_followed_feeds(limit: int = 500) -> list[dict[str, Any]]:
+    """Every feed at least one person follows, by title. For background work (upload
+    backfill), which serves the whole install and so is not per user."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT fs.id, fs.title, fs.feed_url, fs.html_url, fs.youtube_channel_id
+                FROM feeds fs
+                WHERE {FOLLOWED_FEED_SQL}
+                ORDER BY fs.title ASC, fs.id ASC
+                LIMIT %s
+                """,
+                (max(1, int(limit)),),
+            )
+            return list(cur.fetchall())
+
+
+def list_playlist_subscriptions(limit: int = 80, *, user_key: str) -> list[dict[str, Any]]:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -3253,22 +4059,25 @@ def list_playlist_subscriptions(limit: int = 80) -> list[dict[str, Any]]:
                 SELECT fs.id, fs.title, fs.feed_url, fs.html_url, fs.youtube_channel_id, fs.updated_at,
                        COUNT(fe.id) AS video_count,
                        MAX(COALESCE(fe.published_at, fe.created_at)) AS latest_video_at
-                FROM freshrss_subscriptions fs
-                LEFT JOIN freshrss_entries fe ON fe.subscription_id = fs.id
-                WHERE fs.feed_url ILIKE '%%playlist%%'
+                FROM feeds fs
+                JOIN user_subscriptions us ON us.feed_id = fs.id AND us.user_key = %s
+                LEFT JOIN feed_entries fe ON fe.subscription_id = fs.id
+                WHERE (fs.feed_url ILIKE '%%playlist%%'
                    OR fs.html_url ILIKE '%%playlist%%'
                    OR fs.id ILIKE '%%playlist%%'
-                   OR fs.categories::text ILIKE '%%playlist%%'
+                   OR fs.categories::text ILIKE '%%playlist%%')
                 GROUP BY fs.id, fs.title, fs.feed_url, fs.html_url, fs.youtube_channel_id, fs.updated_at
                 ORDER BY latest_video_at DESC NULLS LAST, fs.title ASC
                 LIMIT %s
                 """,
-                (limit,),
+                (user_key, limit),
             )
             return list(cur.fetchall())
 
 
-def list_liked_videos(limit: int = 80, user_key: str = "local") -> list[dict[str, Any]]:
+def list_liked_videos(limit: int = 80, user_key: str = "local", oldest: bool = False) -> list[dict[str, Any]]:
+    """Liked videos, most recently liked first, or oldest first."""
+    direction = "ASC" if oldest else "DESC"
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -3287,29 +4096,21 @@ def list_liked_videos(limit: int = 80, user_key: str = "local") -> list[dict[str
                   SELECT video_id, MAX(liked_at) AS liked_at
                   FROM liked_events
                   GROUP BY video_id
-                ), starred_entries AS (
-                  SELECT video_id, MAX(updated_at) AS starred_at
-                  FROM freshrss_entries
-                  WHERE is_starred = true AND video_id IS NOT NULL
-                  GROUP BY video_id
                 ), liked_rows AS (
                   SELECT DISTINCT ON (v.id)
                          v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                          v.published_at, v.duration_seconds, v.view_count, v.tags, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
-                         fe.is_read, fe.is_starred, v.source_kind, v.discovery_source,
-                         CASE WHEN le.liked_at IS NOT NULL THEN 'liked' ELSE 'starred' END AS latest_event_type,
-                         GREATEST(COALESCE(le.liked_at, TIMESTAMPTZ 'epoch'), COALESCE(se.starred_at, TIMESTAMPTZ 'epoch')) AS latest_event_at
-                  FROM videos v
-                  LEFT JOIN liked_rollup le ON le.video_id = v.id
-                  LEFT JOIN starred_entries se ON se.video_id = v.id
+                         v.source_kind, v.discovery_source,
+                         'liked' AS latest_event_type,
+                         le.liked_at AS latest_event_at
+                  FROM liked_rollup le
+                  JOIN videos v ON v.id = le.video_id
                   LEFT JOIN channels c ON c.id = v.channel_id
-                  {_FRESHRSS_LATEST_JOIN}
-                  WHERE le.video_id IS NOT NULL OR se.video_id IS NOT NULL
                   ORDER BY v.id, latest_event_at DESC, v.published_at DESC NULLS LAST
                 )
                 SELECT *
                 FROM liked_rows
-                ORDER BY latest_event_at DESC NULLS LAST, published_at DESC NULLS LAST
+                ORDER BY latest_event_at {direction} NULLS LAST, published_at {direction} NULLS LAST
                 LIMIT %s
                 """,
                 (user_key, user_key, limit),
@@ -3317,40 +4118,76 @@ def list_liked_videos(limit: int = 80, user_key: str = "local") -> list[dict[str
             return list(cur.fetchall())
 
 
-def list_history_videos(limit: int = 80, user_key: str = "local") -> list[dict[str, Any]]:
+def list_history_videos(limit: int = 80, user_key: str = "local", oldest: bool = False) -> list[dict[str, Any]]:
+    """Watch history, newest first, or oldest first."""
+    direction = "ASC" if oldest else "DESC"
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 WITH history_events AS (
-                  SELECT video_id,
+                  SELECT video_id, user_key,
                          MAX(created_at) AS latest_event_at,
                          COUNT(*) FILTER (WHERE event_type = 'watch_page_open') AS open_count,
                          COUNT(*) FILTER (WHERE event_type = 'mark_watched') AS watched_count
                   FROM user_video_events
                   WHERE event_type IN ('watch_page_open', 'mark_watched') AND user_key = %s
-                  GROUP BY video_id
+                  GROUP BY video_id, user_key
                 ), history_rows AS (
                   SELECT DISTINCT ON (v.id)
                          v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                          v.published_at, v.duration_seconds, v.view_count, v.tags, c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
-                         fe.is_read, fe.is_starred, v.source_kind, v.discovery_source,
+                         v.source_kind, v.discovery_source,
                          CASE WHEN he.watched_count > 0 THEN 'watched' ELSE 'opened' END AS latest_event_type,
-                         he.latest_event_at, he.open_count, he.watched_count
+                         he.latest_event_at, he.open_count, he.watched_count,
+                         pp.furthest_seconds, pp.resume_seconds, pp.current_seconds,
+                         pp.duration_seconds AS progress_duration_seconds,
+                         COALESCE(pp.completed, false) AS completed,
+                         COALESCE(pp.manually_marked_watched, false) AS manually_marked_watched
                   FROM history_events he
                   JOIN videos v ON v.id = he.video_id
                   LEFT JOIN channels c ON c.id = v.channel_id
-                  {_FRESHRSS_LATEST_JOIN}
+                  LEFT JOIN playback_progress pp ON pp.video_id = he.video_id AND pp.user_key = he.user_key
+                  {_FEED_ENTRY_LATEST_JOIN}
                   ORDER BY v.id, he.latest_event_at DESC
                 )
                 SELECT *
                 FROM history_rows
-                ORDER BY latest_event_at DESC NULLS LAST, published_at DESC NULLS LAST
+                ORDER BY latest_event_at {direction} NULLS LAST, published_at {direction} NULLS LAST
                 LIMIT %s
                 """,
                 (user_key, limit),
             )
             return list(cur.fetchall())
+
+
+def remove_history_video(youtube_video_id: str, user_key: str = "local") -> int:
+    """Forget that this owner watched this video: the history events and the resume mark.
+
+    Reactions and playlists are separate facts about the video and are left alone. The
+    two tables go together because leaving the progress row would keep the video in
+    Continue watching, and in the watch-time signal, after it left History.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM user_video_events e
+                USING videos v
+                WHERE e.video_id = v.id
+                  AND v.youtube_video_id = %s
+                  AND e.user_key = %s
+                  AND e.event_type IN ('watch_page_open', 'mark_watched')
+                """,
+                (youtube_video_id, user_key),
+            )
+            removed = cur.rowcount or 0
+            cur.execute(
+                "DELETE FROM playback_progress WHERE youtube_video_id = %s AND user_key = %s",
+                (youtube_video_id, user_key),
+            )
+        conn.commit()
+    return int(removed)
 
 
 def list_channels(limit: int = 200) -> list[dict[str, Any]]:
@@ -3420,7 +4257,7 @@ def list_channels_needing_media(limit: int = 10, refresh: bool = False) -> list[
                 SELECT c.id, c.youtube_channel_id, c.title,
                        (fs.id IS NOT NULL) AS subscribed
                 FROM channels c
-                LEFT JOIN freshrss_subscriptions fs ON fs.youtube_channel_id = c.youtube_channel_id
+                LEFT JOIN feeds fs ON fs.youtube_channel_id = c.youtube_channel_id AND {FOLLOWED_FEED_SQL}
                 WHERE c.youtube_channel_id IS NOT NULL AND {condition}
                 ORDER BY (fs.id IS NOT NULL) DESC, c.avatar_url IS NOT NULL, c.updated_at ASC
                 LIMIT %s
@@ -3431,15 +4268,15 @@ def list_channels_needing_media(limit: int = 10, refresh: bool = False) -> list[
 
 
 def count_subscription_channels_missing_media() -> int:
-    """How many subscribed channels still have no avatar."""
+    """How many channels somebody follows still have no avatar."""
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT COUNT(*) AS missing
-                FROM freshrss_subscriptions fs
+                FROM feeds fs
                 JOIN channels c ON c.youtube_channel_id = fs.youtube_channel_id
-                WHERE c.avatar_url IS NULL
+                WHERE c.avatar_url IS NULL AND {FOLLOWED_FEED_SQL}
                 """
             )
             row = cur.fetchone()
@@ -3450,11 +4287,11 @@ def list_subscription_channels_needing_media(limit: int = 20) -> list[dict[str, 
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT c.id, c.youtube_channel_id, c.title
-                FROM freshrss_subscriptions fs
+                FROM feeds fs
                 JOIN channels c ON c.youtube_channel_id = fs.youtube_channel_id
-                WHERE c.avatar_url IS NULL
+                WHERE c.avatar_url IS NULL AND {FOLLOWED_FEED_SQL}
                 ORDER BY fs.title ASC
                 LIMIT %s
                 """,
@@ -3463,11 +4300,13 @@ def list_subscription_channels_needing_media(limit: int = 20) -> list[dict[str, 
             return list(cur.fetchall())
 
 
-def get_channel_by_youtube_id(youtube_channel_id: str) -> dict[str, Any] | None:
+def get_channel_by_youtube_id(youtube_channel_id: str, user_key: str | None = None) -> dict[str, Any] | None:
+    """One channel. The subscription columns describe `user_key`'s own subscription, and
+    are empty when no user_key is given."""
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT c.id, c.youtube_channel_id, c.title, c.feed_url, c.updated_at,
                        c.avatar_url, c.banner_url, c.subscriber_count,
                        COUNT(v.id) AS video_count,
@@ -3476,15 +4315,50 @@ def get_channel_by_youtube_id(youtube_channel_id: str) -> dict[str, Any] | None:
                        fs.id AS subscription_id, fs.title AS subscription_title, fs.html_url AS subscription_html_url
                 FROM channels c
                 LEFT JOIN videos v ON v.channel_id = c.id
-                LEFT JOIN freshrss_subscriptions fs ON fs.youtube_channel_id = c.youtube_channel_id
+                LEFT JOIN {user_feeds_sql()} fs ON fs.youtube_channel_id = c.youtube_channel_id
                 WHERE c.youtube_channel_id = %s
                 GROUP BY c.id, fs.id, fs.title, fs.html_url
                 LIMIT 1
                 """,
-                (youtube_channel_id,),
+                (user_key, youtube_channel_id),
             )
             row = cur.fetchone()
             return dict(row) if row else None
+
+
+_PROGRESS_FIELDS = ("percent_completed", "progress_completed", "manually_marked_watched", "resume_seconds")
+
+
+def attach_user_progress(videos: list[dict[str, Any]], user_key: str = "local") -> list[dict[str, Any]]:
+    """Merge one user's watch state into rows read without it, in a single query.
+
+    Channel pages and library search read videos without a user, so their cards never
+    showed a watched check or progress bar, and their menus offered "Mark watched" for a
+    video already marked. Rows that already carry the fields are left alone.
+    """
+    ids = sorted({str(row["youtube_video_id"]) for row in videos if row.get("youtube_video_id") and "progress_completed" not in row})
+    if not ids:
+        return videos
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT youtube_video_id, COALESCE(percent_completed, 0) AS percent_completed,
+                   COALESCE(completed, false) AS progress_completed,
+                   COALESCE(manually_marked_watched, false) AS manually_marked_watched,
+                   resume_seconds
+            FROM playback_progress
+            WHERE user_key = %s AND youtube_video_id = ANY(%s)
+            """,
+            (user_key, ids),
+        ).fetchall()
+    by_id = {row["youtube_video_id"]: row for row in rows}
+    for video in videos:
+        state = by_id.get(str(video.get("youtube_video_id") or ""))
+        if state is None or "progress_completed" in video:
+            continue
+        for field in _PROGRESS_FIELDS:
+            video[field] = state[field]
+    return videos
 
 
 def list_channel_videos(youtube_channel_id: str, limit: int = 50, sort: str = "latest", offset: int = 0, query: str = "") -> list[dict[str, Any]]:
@@ -3497,16 +4371,16 @@ def list_channel_videos(youtube_channel_id: str, limit: int = 50, sort: str = "l
     with connect() as conn:
         with conn.cursor() as cur:
             if cleaned:
-                pattern = f"%{cleaned}%"
+                pattern = f"%{escape_like_pattern(cleaned)}%"
                 cur.execute(
                     f"""
                     SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                             v.published_at, v.metadata_source, v.duration_seconds, v.view_count, v.source_kind, v.discovery_source,
                             c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
-                            fe.is_read, fe.is_starred, v.source_kind, v.discovery_source
+                            v.source_kind, v.discovery_source
                     FROM videos v
                     JOIN channels c ON c.id = v.channel_id
-                    {_FRESHRSS_LATEST_JOIN}
+                    {_FEED_ENTRY_LATEST_JOIN}
                     WHERE c.youtube_channel_id = %s
                       AND (v.title ILIKE %s OR COALESCE(v.summary, '') ILIKE %s OR COALESCE(v.description, '') ILIKE %s)
                     ORDER BY {order_by}
@@ -3520,10 +4394,10 @@ def list_channel_videos(youtube_channel_id: str, limit: int = 50, sort: str = "l
                 SELECT v.id, v.youtube_video_id, v.title, v.url, v.thumbnail_url, v.author,
                         v.published_at, v.metadata_source, v.duration_seconds, v.view_count, v.source_kind, v.discovery_source,
                         c.title AS channel_title, c.avatar_url AS channel_avatar_url, c.youtube_channel_id,
-                        fe.is_read, fe.is_starred, v.source_kind, v.discovery_source
+                        v.source_kind, v.discovery_source
                 FROM videos v
                 JOIN channels c ON c.id = v.channel_id
-                {_FRESHRSS_LATEST_JOIN}
+                {_FEED_ENTRY_LATEST_JOIN}
                 WHERE c.youtube_channel_id = %s
                 ORDER BY {order_by}
                 LIMIT %s OFFSET %s
@@ -3666,8 +4540,8 @@ def liked_topic_vectors(user_key: str = "local", limit: int = 100) -> list[dict[
 def store_takeout_subscriptions(items: list[dict[str, Any]], user_key: str = "local") -> int:
     """Record the channels an archive says the user follows.
 
-    `subscribed_at` is preserved across re-imports so a channel already pushed to FreshRSS
-    is not offered again.
+    `subscribed_at` is preserved across re-imports so a channel already subscribed from
+    the archive is not offered again.
     """
     rows = [
         (
@@ -3699,19 +4573,19 @@ def store_takeout_subscriptions(items: list[dict[str, Any]], user_key: str = "lo
 
 
 def pending_takeout_subscriptions(user_key: str = "local", limit: int = 500) -> list[dict[str, Any]]:
-    """Imported channels not yet subscribed here, and not already in FreshRSS."""
+    """Imported channels this user does not follow yet."""
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT ts.youtube_channel_id, ts.title, ts.channel_url
                 FROM takeout_subscriptions ts
-                LEFT JOIN freshrss_subscriptions fs ON fs.youtube_channel_id = ts.youtube_channel_id
-                WHERE ts.user_key = %s AND ts.subscribed_at IS NULL AND ts.failed_at IS NULL AND fs.id IS NULL
+                WHERE ts.user_key = %s AND ts.subscribed_at IS NULL AND ts.failed_at IS NULL
+                  AND NOT {subscribed_channel_sql(column="ts.youtube_channel_id")}
                 ORDER BY ts.title NULLS LAST
                 LIMIT %s
                 """,
-                (user_key, max(1, min(limit, 2000))),
+                (user_key, user_key, max(1, min(limit, 2000))),
             )
             return list(cur.fetchall())
 
@@ -3720,16 +4594,17 @@ def takeout_subscription_counts(user_key: str = "local") -> dict[str, int]:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT COUNT(*) AS total,
                        COUNT(*) FILTER (WHERE ts.subscribed_at IS NOT NULL) AS applied,
-                       COUNT(*) FILTER (WHERE ts.subscribed_at IS NULL AND fs.id IS NOT NULL) AS already_present,
+                       COUNT(*) FILTER (WHERE ts.subscribed_at IS NULL AND mine.youtube_channel_id IS NOT NULL) AS already_present,
                        COUNT(*) FILTER (WHERE ts.subscribed_at IS NULL AND ts.failed_at IS NOT NULL) AS unavailable
                 FROM takeout_subscriptions ts
-                LEFT JOIN freshrss_subscriptions fs ON fs.youtube_channel_id = ts.youtube_channel_id
+                LEFT JOIN (SELECT DISTINCT youtube_channel_id FROM {user_feeds_sql()} uf) mine
+                  ON mine.youtube_channel_id = ts.youtube_channel_id
                 WHERE ts.user_key = %s
                 """,
-                (user_key,),
+                (user_key, user_key),
             )
             row = cur.fetchone() or {}
     total = int(row.get("total") or 0)
@@ -3890,6 +4765,31 @@ def top_feed_channels(user_key: str = "local", limit: int = 14) -> list[dict[str
     ]
 
 
+def channel_titles_for_keys(keys: list[str]) -> dict[str, str]:
+    """Display titles for channel keys as `_recommendation_channel_key` builds them.
+
+    A key is a lowercased channel id, or a lowercased title when the row had no id. An
+    unknown key maps to itself.
+    """
+    wanted = [str(key).strip().lower() for key in keys if str(key or "").strip()]
+    if not wanted:
+        return {}
+    titles = {key: key for key in wanted}
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (lower(youtube_channel_id)) lower(youtube_channel_id) AS key, title
+                FROM channels
+                WHERE lower(youtube_channel_id) = ANY(%s) AND title IS NOT NULL
+                """,
+                (wanted,),
+            )
+            for row in cur.fetchall():
+                titles[row["key"]] = str(row["title"])
+    return titles
+
+
 def channel_ids_for_titles(titles: list[str]) -> dict[str, str]:
     """Resolve channel names to ids, lowercased for matching.
 
@@ -3944,19 +4844,20 @@ def list_videos_with_decoded_dates(limit: int = 40) -> list[dict[str, Any]]:
             return list(cur.fetchall())
 
 
-# Direct-RSS polling state. The poller (rss.py) fills the same freshrss_* tables the
-# FreshRSS mirror used to fill; these helpers only read/write the polling columns
-# added to freshrss_subscriptions (etag, last_modified, last_checked_at,
-# fetch_failures, next_fetch_after). Existing queries are untouched.
+# Direct-RSS polling state. The poller (rss.py) fills feeds and feed_entries; these
+# helpers only read/write the polling columns on feeds (etag, last_modified,
+# last_checked_at, fetch_failures, next_fetch_after).
 RSS_DUE_CHANNEL_LIMIT_MAX = 500
 
 
 def list_rss_due_channels(limit: int = 100) -> list[dict[str, Any]]:
-    """Subscriptions whose feed is due for a direct-RSS fetch, stalest first.
+    """Feeds due for a direct-RSS fetch, stalest first.
 
-    A row is due when it identifies a feed (youtube_channel_id, or feed_url as
-    fallback) and has no backoff hold (next_fetch_after IS NULL) or the hold has
-    expired. Never-checked rows (last_checked_at IS NULL) come first.
+    A feed is due when somebody follows it (a user_subscriptions row), it identifies a
+    feed (youtube_channel_id, or feed_url as fallback) and has no backoff hold
+    (next_fetch_after IS NULL) or the hold has expired. Never-checked rows
+    (last_checked_at IS NULL) come first. A feed is fetched once however many people
+    follow it, and one nobody follows is not fetched at all.
     """
     try:
         capped = int(limit)
@@ -3966,12 +4867,13 @@ def list_rss_due_channels(limit: int = 100) -> list[dict[str, Any]]:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT id, youtube_channel_id, feed_url, etag, last_modified
-                FROM freshrss_subscriptions
-                WHERE (youtube_channel_id IS NOT NULL OR feed_url IS NOT NULL)
-                  AND (next_fetch_after IS NULL OR next_fetch_after <= now())
-                ORDER BY last_checked_at ASC NULLS FIRST, next_fetch_after ASC NULLS FIRST, id ASC
+                f"""
+                SELECT fs.id, fs.youtube_channel_id, fs.feed_url, fs.etag, fs.last_modified
+                FROM feeds fs
+                WHERE (fs.youtube_channel_id IS NOT NULL OR fs.feed_url IS NOT NULL)
+                  AND (fs.next_fetch_after IS NULL OR fs.next_fetch_after <= now())
+                  AND {FOLLOWED_FEED_SQL}
+                ORDER BY fs.last_checked_at ASC NULLS FIRST, fs.next_fetch_after ASC NULLS FIRST, fs.id ASC
                 LIMIT %s
                 """,
                 (capped,),
@@ -3991,8 +4893,8 @@ def record_rss_fetch(
     Always stamps last_checked_at. On success the validators are stored (a None
     argument keeps the previously stored value), fetch_failures resets to 0 and
     the next fetch is scheduled ttl_seconds out. On failure fetch_failures
-    increments and the next fetch backs off FreshRSS-style, doubling per
-    consecutive failure and capped at one day.
+    increments and the next fetch backs off, doubling per consecutive failure
+    and capped at one day.
     """
     try:
         ttl = int(ttl_seconds)
@@ -4004,7 +4906,7 @@ def record_rss_fetch(
             if ok:
                 cur.execute(
                     """
-                    UPDATE freshrss_subscriptions
+                    UPDATE feeds
                     SET last_checked_at = now(),
                         etag = COALESCE(%s, etag),
                         last_modified = COALESCE(%s, last_modified),
@@ -4016,7 +4918,7 @@ def record_rss_fetch(
                 )
             else:
                 cur.execute(
-                    "SELECT fetch_failures FROM freshrss_subscriptions WHERE id = %s",
+                    "SELECT fetch_failures FROM feeds WHERE id = %s",
                     (sub_id,),
                 )
                 row = cur.fetchone() or {}
@@ -4030,7 +4932,7 @@ def record_rss_fetch(
                 backoff_seconds = min(3600 * (2 ** min(failures - 1, 5)), 86400)
                 cur.execute(
                     """
-                    UPDATE freshrss_subscriptions
+                    UPDATE feeds
                     SET last_checked_at = now(),
                         fetch_failures = %s,
                         next_fetch_after = now() + make_interval(secs => %s)
@@ -4041,10 +4943,24 @@ def record_rss_fetch(
         conn.commit()
 
 
-def subscription_id_for_channel(youtube_channel_id: str) -> str | None:
-    """The freshrss_subscriptions row id for a channel, for entries.subscription_id.
+def refresh_feed_title(feed_id: str, title: str) -> None:
+    """Name a shared feed after what the feed itself says (the poller calls this)."""
+    cleaned = " ".join(str(title or "").split())[:200]
+    if not feed_id or not cleaned:
+        return
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE feeds SET title = %s, updated_at = now() WHERE id = %s AND title IS DISTINCT FROM %s",
+                (cleaned, feed_id, cleaned),
+            )
+        conn.commit()
 
-    Returns None when the channel has no subscription row. When duplicates exist
+
+def subscription_id_for_channel(youtube_channel_id: str) -> str | None:
+    """The feeds row id for a channel, for feed_entries.subscription_id.
+
+    Returns None when the channel has no feed row. When duplicates exist
     the lowest id wins deterministically.
     """
     if not youtube_channel_id:
@@ -4053,7 +4969,7 @@ def subscription_id_for_channel(youtube_channel_id: str) -> str | None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id FROM freshrss_subscriptions
+                SELECT id FROM feeds
                 WHERE youtube_channel_id = %s
                 ORDER BY id ASC
                 LIMIT 1
@@ -4067,7 +4983,7 @@ def subscription_id_for_channel(youtube_channel_id: str) -> str | None:
 
 
 def latest_sync_run(source: str) -> dict[str, Any] | None:
-    """The newest sync_runs row for a source (e.g. 'rss' or 'freshrss'), or None."""
+    """The newest sync_runs row for a source (e.g. 'rss'), or None."""
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(

@@ -1,0 +1,60 @@
+/* Channel tools: the Live tab's badges, select mode on the Channels page, and the Shorts
+   Subscribe pill and menus. */
+
+/* ---- Live tab ---- */
+/* LIVE is the one red badge on a thumbnail: on air is a signal, like an unread dot. */
+.duration.is-live { background: var(--accent-solid); color: #fff; letter-spacing: .04em; font-weight: 680; }
+.duration.is-upcoming { letter-spacing: .04em; }
+
+/* ---- Channels page: select mode ---- */
+.subs-toolbar [data-bulk-toggle] { flex: none; }
+.bulk-bar { position: sticky; top: calc(var(--header, 56px) + 6px); z-index: 20; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+  margin: 0 0 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--r-panel); background: var(--menu); box-shadow: var(--shadow); }
+.bulk-bar[hidden] { display: none; }
+.bulk-all { display: inline-flex; align-items: center; gap: 8px; min-height: var(--hit); padding: 0 6px; font-size: 13px; font-weight: 550; cursor: pointer; }
+.bulk-count { margin: 0; color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.bulk-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: auto; }
+.bulk-menu > summary { list-style: none; }
+.bulk-menu > summary::-webkit-details-marker { display: none; }
+.bulk-bar[data-empty] [data-bulk-needs] { opacity: .45; cursor: default; }
+.bulk-bar input[type="checkbox"], .bulk-check input { width: 18px; height: 18px; margin: 0; accent-color: var(--bone); cursor: pointer; }
+.channel-grid.is-selecting .channel-row { grid-template-columns: auto minmax(0, 1fr) auto auto; cursor: pointer; }
+.bulk-check { display: grid; place-items: center; min-width: var(--hit); min-height: var(--hit); cursor: pointer; }
+.channel-grid.is-selecting .channel-row.is-selected { background: var(--surface-2); }
+
+/* ---- Shorts ---- */
+.shorts-byline { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.shorts-byline .shorts-channel { min-width: 0; flex: 0 1 auto; }
+.shorts-subscribe { pointer-events: auto; flex: none; min-height: 32px; padding: 0 14px; border: 0; border-radius: 999px; cursor: pointer;
+  background: var(--bone); color: var(--on-bone); font-size: 12.5px; font-weight: 650;
+  transition: background var(--dur-press) ease, transform var(--dur-press) var(--ease-press); }
+.shorts-subscribe:hover { background: var(--bone-hover); }
+.shorts-subscribe:active { transform: scale(.96); }
+.shorts-subscribe:focus-visible { outline: 0; box-shadow: var(--focus); }
+.shorts-subscribe.subscribed { background: rgba(255,255,255,.16); color: #fff; font-weight: 550; }
+.shorts-subscribe.subscribed:hover { background: rgba(255,255,255,.24); }
+.shorts-more > summary { list-style: none; }
+.shorts-more > summary::-webkit-details-marker { display: none; }
+.shorts-more .menu-panel { min-width: 220px; }
+
+/* The Home shelf card: ⋮ beside the title, as on a long-form card. */
+.short-card .short-copy { position: relative; padding-right: 26px; }
+.short-card-menu { position: absolute; top: 6px; right: -4px; }
+
+@media (max-width: 600px) {
+  .bulk-bar { top: calc(var(--header, 56px) + 4px); }
+  .bulk-actions { margin-left: 0; width: 100%; }
+  .bulk-actions .btn span { white-space: nowrap; }
+  .channel-grid.is-selecting .channel-row { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "check main actions" ". chips chips"; }
+  .channel-grid.is-selecting .bulk-check { grid-area: check; }
+  .shorts-subscribe { min-height: 36px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shorts-subscribe { transition: none; }
+  .shorts-subscribe:active { transform: none; }
+}
+
+.shorts-more > summary:focus-visible { outline: 0; box-shadow: none; }
+.shorts-more > summary:focus-visible .shorts-disc { box-shadow: var(--focus); }
+.shorts-more[open] > summary .shorts-disc { background: var(--surface-3); }

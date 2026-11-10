@@ -28,6 +28,7 @@ from typing import Any, Iterable
 
 import httpx
 
+from . import outbound
 from .config import get_settings
 
 logger = logging.getLogger("openfeed.sponsorblock")
@@ -209,7 +210,7 @@ def fetch_segments(video_id: str, categories: Iterable[str], *, force: bool = Fa
     url = f"{SPONSORBLOCK_ENDPOINT}/{hash_prefix(video_id)}"
     headers = {"accept": "application/json", "user-agent": "OpenFeed (+https://github.com/S0nrxse/openFeed)"}
     try:
-        with httpx.Client(timeout=SPONSORBLOCK_TIMEOUT_SECONDS, follow_redirects=False, headers=headers) as client:
+        with outbound.client(timeout=SPONSORBLOCK_TIMEOUT_SECONDS, follow_redirects=False, headers=headers) as client:
             response = client.get(url, params={"categories": _json_list(categories)})
     except httpx.HTTPError as exc:
         raise SponsorBlockError(f"SponsorBlock request failed: {exc}") from exc

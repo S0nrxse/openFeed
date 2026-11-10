@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 import httpx
 
-from . import db
+from . import db, outbound
 from .config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -83,8 +83,10 @@ def fetch_video_metadata(youtube_video_id: str) -> tuple[str, dict[str, Any]]:
                 errors.append(f"invidious: {exc}")
 
         try:
+            # Only when Invidious could not answer. Through the outbound proxy when set.
             watch_url = quote(f"https://www.youtube.com/watch?v={youtube_video_id}", safe="")
-            response = client.get(f"https://www.youtube.com/oembed?url={watch_url}&format=json")
+            with outbound.client(timeout=timeout, follow_redirects=True) as youtube:
+                response = youtube.get(f"https://www.youtube.com/oembed?url={watch_url}&format=json")
             response.raise_for_status()
             return "youtube_oembed", _normalize_oembed(response.json())
         except Exception as exc:

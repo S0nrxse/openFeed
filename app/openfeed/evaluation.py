@@ -1,23 +1,27 @@
-"""Offline evaluation for the recommendation ranker.
+"""Offline evaluation for the recommendation ranker: leave one subscribed channel out.
 
-Every weight in the scorer is a hand-typed constant, and until now there was no way to
-tell whether changing one helped or hurt. This holds out the most recently watched videos,
-asks the ranker to produce a feed from everything *before* them, and measures how much of
-the held-out set it actually surfaced.
+The previous harness held out the most recent watches and asked the ranker to resurface
+them. It could not work: the real history was shorter than the holdout, and the ranker
+excludes watched videos by design, so every held-out video was unreachable and every
+metric was 0 whatever the ranker did.
 
-The metrics are the standard ones for ranked retrieval:
+This one asks a question the live data can answer. For each subscribed channel with at
+least `min_videos` videos, drop it from the seeds, rank the whole library, and see where
+that channel's videos land among everything you do not follow. A ranker that understands
+your subscriptions should place a channel you chose near the top even when it was not
+told about it. Reported per mode:
 
-* **recall@k** - of the videos the user really went on to watch, what fraction appeared in
-  the top k. This is the headline number: it answers "would the feed have shown me this?"
-* **MRR** - mean reciprocal rank of the first hit. Rewards putting a good video first
-  rather than twentieth.
-* **nDCG@k** - like recall but discounted by position, so a hit at rank 2 counts for more
-  than a hit at rank 20.
+* **nDCG@20** - binary relevance, discounted by position.
+* **recall@100** - share of the held-out channel's videos in the top 100.
+* **random** - the expectation of each metric under a uniformly random order of the same
+  candidates, so a number can be read against chance.
 
-A caveat worth stating plainly: this can only measure whether the ranker resurfaces things
-the user already chose, which is biased toward what the old feed happened to show them. It
-cannot measure whether a video they never saw would have been good. It is a regression
-guard and a relative comparison tool, not a measure of absolute quality.
+Limits, stated plainly: positives are a whole channel, so this measures "finds channels
+like the ones you follow", not "finds the next video you will enjoy". The held-out
+channel's own videos are linked to each other in YouTube's related lists, and the walk
+does not use that (the channel is not a seed). Classic cannot be re-seeded (it reads the
+subscriptions from the database), so its row is computed from the live feed with the
+held-out channel still known to it, which favours classic.
 """
 
 from __future__ import annotations
@@ -25,142 +29,74 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+import time
+from typing import Any
 
-from . import db
+from . import db, ranker
 
 logger = logging.getLogger("openfeed.evaluation")
 
-DEFAULT_K_VALUES = (10, 20, 50)
+
+def _subscribed_keys(user_key: str) -> list[str]:
+    """The channels this user follows, lowercased."""
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT lower(btrim(f.youtube_channel_id)) AS k FROM feeds f "
+            "JOIN user_subscriptions us ON us.feed_id = f.id "
+            "WHERE us.user_key = %s AND f.youtube_channel_id IS NOT NULL AND btrim(f.youtube_channel_id) <> ''",
+            (user_key,),
+        ).fetchall()
+    return [str(row["k"]) for row in rows]
 
 
-@dataclass
-class EvalResult:
-    """One evaluation run, ready to print or serve as JSON."""
-
-    lane: str
-    holdout: int
-    candidates: int
-    recall: dict[int, float] = field(default_factory=dict)
-    ndcg: dict[int, float] = field(default_factory=dict)
-    mrr: float = 0.0
-    hits: list[str] = field(default_factory=list)
-    misses: list[str] = field(default_factory=list)
-    note: str = ""
-
-    def public(self) -> dict[str, Any]:
-        return {
-            "lane": self.lane,
-            "holdout": self.holdout,
-            "candidates": self.candidates,
-            "recall": {f"@{k}": round(v, 4) for k, v in sorted(self.recall.items())},
-            "ndcg": {f"@{k}": round(v, 4) for k, v in sorted(self.ndcg.items())},
-            "mrr": round(self.mrr, 4),
-            "hits": self.hits,
-            "misses": self.misses[:20],
-            "note": self.note,
-        }
+def _classic_ranked_ids(user_key: str, depth: int = 200) -> list[int]:
+    """The legacy recommendation lane (it returns at most 200 rows)."""
+    with ranker.forced_mode("classic"):
+        rows = db.list_recommended_videos(min(depth, 200), 0, "recommended", user_key)
+    return [int(row["id"]) for row in rows if row.get("id") is not None]
 
 
-def _reciprocal_rank(ranked: list[str], relevant: set[str]) -> float:
-    for index, video_id in enumerate(ranked, start=1):
-        if video_id in relevant:
-            return 1.0 / index
-    return 0.0
-
-
-def _ndcg_at(ranked: list[str], relevant: set[str], k: int) -> float:
-    """Binary-relevance nDCG. Ideal DCG is the best achievable given how many exist."""
-    gain = sum(1.0 / math.log2(index + 1) for index, video_id in enumerate(ranked[:k], start=1) if video_id in relevant)
-    ideal_hits = min(len(relevant), k)
-    if not ideal_hits:
-        return 0.0
-    ideal = sum(1.0 / math.log2(index + 1) for index in range(1, ideal_hits + 1))
-    return gain / ideal if ideal else 0.0
-
-
-def holdout_watch_history(user_key: str = "local", holdout: int = 20) -> tuple[list[str], list[str]]:
-    """Split watch history into (older, most-recent-holdout), newest last.
-
-    Splitting by time rather than at random is deliberate: a random split lets the ranker
-    peek at the future, which flatters any model that leans on recency.
-    """
-    rows = db.list_history_videos(500, user_key)
-    ordered = [
-        str(row.get("youtube_video_id") or "")
-        for row in reversed(rows)  # list_history_videos is newest-first
-        if row.get("youtube_video_id")
-    ]
-    if len(ordered) <= holdout:
-        return ordered, []
-    return ordered[:-holdout], ordered[-holdout:]
-
-
-def evaluate_lane(
-    lane: str = "recommended",
+def leave_one_channel_out(
     user_key: str = "local",
-    holdout: int = 20,
-    depth: int = 100,
-    k_values: Iterable[int] = DEFAULT_K_VALUES,
-    ranker: Callable[[int, int, str, str], list[dict[str, Any]]] | None = None,
-) -> EvalResult:
-    """Score one feed lane against held-out watch history.
-
-    `ranker` is injectable so a candidate implementation can be measured against the live
-    one without being wired into the app first.
-    """
-    rank = ranker or db.list_recommended_videos
-    _, held = holdout_watch_history(user_key, holdout)
-    result = EvalResult(lane=lane, holdout=len(held), candidates=0)
-    if not held:
-        result.note = "Not enough watch history to hold anything out."
-        return result
-
-    ranked_rows = rank(depth, 0, lane, user_key)
-    ranked = [str(row.get("youtube_video_id") or "") for row in ranked_rows if row.get("youtube_video_id")]
-    result.candidates = len(ranked)
-    relevant = set(held)
-
-    # The ranker excludes anything already watched, which is correct for a live feed and
-    # fatal for an offline test: every held-out video would be filtered out by definition.
-    # Videos it cannot possibly return are reported rather than silently counted as misses.
-    returnable = {video_id for video_id in ranked}
-    unreachable = [video_id for video_id in held if video_id not in returnable]
-    if len(unreachable) == len(held):
-        result.note = (
-            "Every held-out video was filtered from the candidate pool, most likely because "
-            "the ranker hides watched videos. Compare lanes relatively, not absolutely."
-        )
-
-    for k in k_values:
-        top = ranked[:k]
-        found = sum(1 for video_id in top if video_id in relevant)
-        result.recall[k] = found / len(relevant)
-        result.ndcg[k] = _ndcg_at(ranked, relevant, k)
-    result.mrr = _reciprocal_rank(ranked, relevant)
-    result.hits = [video_id for video_id in ranked if video_id in relevant][:20]
-    result.misses = unreachable
-    return result
-
-
-def compare_lanes(
-    lanes: Iterable[str] = ("recommended", "all"),
-    user_key: str = "local",
-    holdout: int = 20,
-    depth: int = 100,
+    min_videos: int = 5,
+    max_channels: int = 0,
+    include_classic: bool = True,
+    index: Any = None,
+    subscribed: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Run several lanes over one split so the numbers are directly comparable."""
-    results = {lane: evaluate_lane(lane, user_key, holdout, depth).public() for lane in lanes}
-    ranked = sorted(results.items(), key=lambda item: item[1]["recall"].get("@20", 0), reverse=True)
+    """Run the evaluation on the live library. `index`/`subscribed` are injectable for tests."""
+    if not ranker.NUMPY_AVAILABLE:
+        return {"ok": False, "note": "numpy is not installed, so ranker v2 cannot be evaluated."}
+    started = time.perf_counter()
+    if index is None:
+        index = ranker.INDEX.current()
+        if index is None:
+            # The first build reads every video's metadata (~40 s); it runs in the
+            # background rather than inside this request.
+            return {"ok": False, "note": f"The ranking index is not built yet ({ranker.INDEX.state}); try again shortly."}
+    keys = subscribed if subscribed is not None else _subscribed_keys(user_key)
+    classic_ids: list[int] | None = None
+    note = ""
+    if include_classic:
+        try:
+            classic_ids = _classic_ranked_ids(user_key)
+        except Exception as exc:  # noqa: BLE001 - classic is optional here
+            note = f"classic not computed: {exc}"
+    result = ranker.loco_evaluate(index, keys, ("graph", "blend"), min_videos, max_channels, classic_ids)
     return {
         "ok": True,
-        "user_key": user_key,
-        "holdout": holdout,
-        "depth": depth,
-        "lanes": results,
-        "best_by_recall_at_20": ranked[0][0] if ranked else "",
+        "method": "leave-one-subscribed-channel-out",
+        "min_videos": min_videos,
+        "index_version": index.version,
+        "index_videos": index.n,
+        "subscribed_channels": len(keys),
+        "default_mode": ranker.DEFAULT_MODE,
+        "seconds": round(time.perf_counter() - started, 2),
+        "note": note or (
+            "classic is the live legacy lane (top 200), not re-seeded per channel; its numbers are favoured by that leak."
+            if classic_ids is not None else ""
+        ),
+        **result,
     }
 
 
@@ -195,49 +131,48 @@ def coverage_report(user_key: str = "local", depth: int = 100) -> dict[str, Any]
     }
 
 
-def full_report(user_key: str = "local", holdout: int = 20, depth: int = 100) -> dict[str, Any]:
+def full_report(
+    user_key: str = "local",
+    min_videos: int = 5,
+    max_channels: int = 0,
+    include_classic: bool = True,
+    depth: int = 100,
+) -> dict[str, Any]:
     return {
         "ok": True,
-        "quality": compare_lanes(("recommended", "all"), user_key, holdout, depth),
+        "quality": leave_one_channel_out(user_key, min_videos, max_channels, include_classic),
         "coverage": coverage_report(user_key, depth),
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate the OpenFeed recommendation ranker.")
+    parser = argparse.ArgumentParser(description="Evaluate the OpenFeed recommendation ranker (leave one channel out).")
     parser.add_argument("--user", default="local")
-    parser.add_argument("--holdout", type=int, default=20)
-    parser.add_argument("--depth", type=int, default=100)
+    parser.add_argument("--min-videos", type=int, default=5)
+    parser.add_argument("--max-channels", type=int, default=0)
+    parser.add_argument("--no-classic", action="store_true")
     parser.add_argument("--json", action="store_true", help="print raw JSON instead of a summary")
     args = parser.parse_args()
 
-    report = full_report(args.user, args.holdout, args.depth)
+    # A one-off process has no warm index (the app builds it on a thread at startup), so
+    # build it here; with the on-disk related cache this takes seconds, not a full read.
+    if ranker.NUMPY_AVAILABLE and ranker.INDEX.current() is None:
+        ranker.INDEX.rebuild()
+    quality = leave_one_channel_out(args.user, args.min_videos, args.max_channels, not args.no_classic)
     if args.json:
-        print(json.dumps(report, indent=2))
+        print(json.dumps(quality, indent=2, default=str))
         return
-
-    quality = report["quality"]
-    coverage = report["coverage"]
-    print(f"holdout={quality['holdout']} depth={quality['depth']}\n")
-    print(f"{'lane':<14}{'recall@10':>11}{'recall@20':>11}{'ndcg@20':>10}{'mrr':>8}")
-    for lane, data in quality["lanes"].items():
-        print(
-            f"{lane:<14}{data['recall'].get('@10', 0):>11.3f}{data['recall'].get('@20', 0):>11.3f}"
-            f"{data['ndcg'].get('@20', 0):>10.3f}{data['mrr']:>8.3f}"
-        )
-    note = next((d["note"] for d in quality["lanes"].values() if d.get("note")), "")
-    if note:
-        print(f"\nnote: {note}")
-
-    print(f"\ncoverage over {coverage['videos']} videos")
-    print(f"  distinct creators : {coverage['distinct_channels']}")
-    print(f"  max per creator   : {coverage['max_per_channel']} ({coverage['top_channel_share']:.0%} share)")
-    print(f"  sources           : {coverage['sources']}")
-    print(f"  score range       : {coverage['score_range']}")
-    print("  signal coverage   :")
-    for name, share in coverage["signal_coverage"].items():
-        flag = "  <- fires on everything" if share >= 0.98 else ""
-        print(f"      {name:<32}{share:>6.0%}{flag}")
+    if not quality.get("ok"):
+        print(quality.get("note"))
+        return
+    print(f"{quality['units']} channels held out ({quality['skipped_small']} too small), "
+          f"index {quality['index_videos']} videos, {quality['seconds']}s\n")
+    print(f"{'mode':<9}{'nDCG@20':>9}{'random':>9}{'recall@100':>12}{'random':>9}{'hit units':>11}")
+    for mode, row in quality["summary"].items():
+        print(f"{mode:<9}{row['ndcg@20']:>9.4f}{row['random_ndcg@20']:>9.4f}{row['recall@100']:>12.4f}"
+              f"{row['random_recall@100']:>9.4f}{row['units_with_hit_in_top20']:>11}")
+    if quality.get("note"):
+        print(f"\nnote: {quality['note']}")
 
 
 if __name__ == "__main__":

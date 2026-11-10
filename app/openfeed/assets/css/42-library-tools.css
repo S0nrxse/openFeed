@@ -1,0 +1,167 @@
+/* Library tools: Sort and Select beside a list's filter, select mode, playlist reorder
+   and visibility, the History side panel, the import dialog. Behaviour is in
+   assets/js/ui-library-tools.js. */
+
+/* ---------- list tools beside the filter ---------- */
+.library-toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.library-toolbar .list-tool { height: 36px; padding: 0 12px; gap: 6px; }
+.library-toolbar .toolbar-search + .list-tool,
+.library-toolbar .toolbar-search + .sort-menu { margin-left: auto; }
+.list-tool[aria-pressed="true"] { background: var(--bone); color: var(--on-bone); }
+.sort-menu > summary { list-style: none; }
+.sort-menu > summary::-webkit-details-marker { display: none; }
+.sort-menu .menu-panel { right: 0; left: auto; min-width: 220px; }
+.sort-menu .menu-row:not([aria-current]) .menu-icon { visibility: hidden; }
+
+/* ---------- select mode ---------- */
+.select-bar {
+  position: sticky; top: calc(var(--header) + 8px); z-index: 5;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  margin-bottom: 14px; padding: 4px 6px 4px 4px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2);
+}
+.select-count { font-size: 13.5px; font-weight: 600; font-variant-numeric: tabular-nums; padding-right: 4px; }
+.select-bar-actions { display: flex; gap: 6px; margin-left: auto; }
+.is-selecting .library-toolbar { display: none; }
+.is-selecting .library-row { position: relative; padding-left: 48px; cursor: pointer; border-radius: var(--r-thumb); }
+.is-selecting .library-row .row-actions,
+.is-selecting .library-row .row-drag,
+.is-selecting .library-row .row-index { display: none; }
+.is-selecting .media-row.library-row.with-index { grid-template-columns: var(--row-thumb) minmax(0, 1fr) auto; }
+.is-selecting .library-row.is-selected { background: var(--surface-2); }
+.select-check {
+  position: absolute; left: 6px; top: 50%; translate: 0 -50%;
+  display: grid; place-items: center; width: 36px; height: 36px; cursor: pointer;
+}
+.select-check input {
+  appearance: none; -webkit-appearance: none; display: grid; place-items: center;
+  width: 20px; height: 20px; margin: 0; border: 1.5px solid var(--muted-2); border-radius: 6px;
+  background: transparent; cursor: pointer;
+  transition: background var(--dur-press) ease, border-color var(--dur-press) ease, transform var(--dur-press) var(--ease-press);
+}
+.select-check input::after {
+  content: ""; width: 10px; height: 6px; margin-top: -2px;
+  border: solid var(--on-bone); border-width: 0 0 2px 2px; rotate: -45deg; opacity: 0;
+}
+.select-check input:checked { background: var(--bone); border-color: var(--bone); }
+.select-check input:checked::after { opacity: 1; }
+.select-check input:focus-visible { outline: none; box-shadow: var(--focus); }
+.select-check input:active { transform: scale(.96); }
+
+/* ---------- playlist reorder ---------- */
+.library-row { position: relative; }
+.row-drag {
+  position: absolute; left: 8px; top: 50%; translate: 0 -50%; z-index: 1;
+  display: grid; place-items: center; width: 24px; height: 40px; padding: 0;
+  border: 0; border-radius: 6px; background: var(--bg); color: var(--muted);
+  cursor: grab; touch-action: none; opacity: 0;
+  transition: opacity var(--dur-press) ease, background var(--dur-press) ease;
+}
+.row-drag .icon { width: 18px; height: 18px; }
+.library-row:hover .row-drag, .row-drag:focus-visible, .is-dragging .row-drag { opacity: 1; }
+.row-drag:hover { background: var(--surface-2); color: var(--text); }
+.row-drag:focus-visible { outline: none; box-shadow: var(--focus); }
+.is-reordering, .is-reordering * { cursor: grabbing; user-select: none; }
+.library-row.is-dragging { background: var(--surface-2); border-radius: var(--r-thumb); box-shadow: var(--shadow); z-index: 3; }
+.library-row.is-dragging .row-drag { cursor: grabbing; }
+
+/* ---------- playlist visibility and owner ---------- */
+.playlist-byline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.visibility-menu > summary { list-style: none; }
+.visibility-menu > summary::-webkit-details-marker { display: none; }
+.visibility-pill {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px;
+  border: 1px solid transparent; border-radius: 999px; background: var(--surface-2);
+  color: var(--text); font-size: 12.5px; font-weight: 550; cursor: pointer;
+  transition: background var(--dur-press) ease, border-color var(--dur-press) ease, transform var(--dur-press) var(--ease-press);
+}
+.visibility-pill .icon { width: 15px; height: 15px; }
+.visibility-pill .icon:last-child { width: 13px; height: 13px; color: var(--muted); }
+summary.visibility-pill:hover { background: var(--surface-3); border-color: var(--border); }
+summary.visibility-pill:active { transform: scale(.96); }
+summary.visibility-pill:focus-visible { outline: none; box-shadow: var(--focus); }
+.visibility-pill.is-static { cursor: default; }
+.visibility-menu .menu-panel { left: 0; right: auto; width: min(380px, calc(100vw - 32px)); }
+.visibility-menu .menu-sub { white-space: normal; overflow: visible; text-overflow: clip; }
+.playlist-owner { color: var(--muted); font-size: 12.5px; }
+
+/* ---------- History: side panel and the paused banner ---------- */
+.history-layout { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 32px; align-items: start; }
+.history-main { min-width: 0; }
+.history-side { position: sticky; top: calc(var(--header) + 16px); display: grid; gap: 2px; padding-top: 2px; }
+.history-control {
+  display: flex; align-items: center; gap: 12px; width: 100%; min-height: 40px; padding: 0 12px;
+  border: 0; border-radius: 999px; background: transparent; color: var(--text);
+  font: inherit; font-size: 13.5px; font-weight: 550; text-align: left; cursor: pointer;
+  transition: background var(--dur-press) ease, transform var(--dur-press) var(--ease-press);
+}
+.history-control:hover { background: var(--surface-2); }
+.history-control:active { transform: scale(.96); }
+.history-control:focus-visible { outline: none; box-shadow: var(--focus); }
+.history-control:disabled { opacity: .55; cursor: default; }
+.history-paused {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px;
+  margin-bottom: 16px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--r-panel); background: var(--surface);
+}
+.history-paused-icon { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 999px; background: var(--surface-3); }
+.history-paused-copy h2 { margin: 0; font-size: 14.5px; font-weight: 600; }
+.history-paused-copy p { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.45; }
+
+/* ---------- Downloads: a record whose file is gone ---------- */
+.quality-chip.is-missing { top: 6px; bottom: auto; background: var(--badge); color: #f2686c; }
+.library-row .redownload { white-space: nowrap; }
+.library-row .row-actions:has(.redownload) { opacity: 1; }
+
+/* ---------- import dialog ---------- */
+.playlist-import-dialog { width: min(460px, calc(100vw - 32px)); }
+/* .btn and .import-progress set a display, which would otherwise beat [hidden]. */
+.playlist-import-dialog [hidden], .dialog-alt[hidden] { display: none; }
+.playlist-import-dialog .status-line { flex: 1; min-width: 0; margin: 0; color: var(--ember-text); font-size: 12.5px; }
+.import-progress { display: grid; gap: 8px; }
+.import-progress-text { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.45; font-variant-numeric: tabular-nums; }
+.playlist-edit-dialog select.field-input, .playlist-import-dialog select.field-input { width: 100%; height: 36px; font-size: 13px; }
+.dialog-alt { margin: 0; color: var(--muted); font-size: 12.5px; }
+.link-button { padding: 0; border: 0; background: none; color: var(--text); font: inherit; font-weight: 550; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.link-button:focus-visible { outline: none; box-shadow: var(--focus); border-radius: 4px; }
+.shared-playlists { margin-top: 28px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .select-check input, .visibility-pill, .history-control, .row-drag { transition: none; }
+  .select-check input:active, summary.visibility-pill:active, .history-control:active { transform: none; }
+}
+
+@media (max-width: 1100px) {
+  .history-layout { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .history-side { position: static; order: -1; display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+  .history-control { width: auto; min-height: 36px; background: var(--surface-2); font-size: 13px; gap: 8px; padding: 0 14px; }
+  .history-control .icon { width: 17px; height: 17px; }
+}
+
+@media (max-width: 600px) {
+  .library-toolbar .toolbar-search { flex: 1 1 100%; }
+  .library-toolbar .toolbar-search + .list-tool,
+  .library-toolbar .toolbar-search + .sort-menu { margin-left: 0; }
+  .library-toolbar .list-tool { height: 40px; }
+  .row-drag { display: none; }
+  .select-bar { top: calc(var(--header) + 4px); border-radius: var(--r-panel); }
+  .select-bar-actions { width: 100%; margin-left: 0; }
+  .select-bar-actions .btn { flex: 1 1 0; justify-content: center; height: 40px; }
+  .is-selecting .media-row.library-row, .is-selecting .media-row.library-row.with-index { padding-left: 42px; }
+  .select-check { left: 0; width: 40px; height: 44px; }
+  .history-paused { grid-template-columns: minmax(0, 1fr) auto; }
+  .history-paused-icon { display: none; }
+  .history-control { min-height: 40px; }
+  .visibility-menu .menu-panel { min-width: 0; }
+  .library-row .redownload span { display: none; }
+  .library-row .redownload { width: max(36px, var(--hit)); padding: 0; justify-content: center; }
+}
+
+/* The import dialog's error gets its own line above the buttons once it has text, instead
+   of a narrow column beside them on phones (QA, 2026-11-09). */
+.dialog-actions:has([data-pl-import-status]:not(:empty)) { flex-wrap: wrap; }
+.dialog-actions [data-pl-import-status]:not(:empty) { flex: 1 0 100%; margin: 0 0 4px; }
+.dialog-actions [data-pl-import-status]:empty { display: none; }
+/* Bulk "Save to playlist": the new-name field and Create share one row. */
+.save-picker-search[data-bulk-create] { display: flex; gap: 8px; align-items: center; }
+.save-picker-search[data-bulk-create] .field-input { flex: 1 1 auto; min-width: 0; }
+.save-picker-search[data-bulk-create] .btn { flex: none; }

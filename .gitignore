@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+# Further OIDC providers' client secrets (compose.yml env_file).
+signin.env
 compose.local.yml
 secrets/*.sops.yaml
 OpenFeedPlan.txt

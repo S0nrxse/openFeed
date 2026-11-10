@@ -1,0 +1,22 @@
+/* ---------- appearance ----------
+   "Appearance: Dark" in the account menu opens its options as a second page of the same
+   panel, the way YouTube's does. The light token set itself is in 00-tokens.css. */
+.appearance-page { display: none; }
+.menu-panel[data-view="appearance"] > :not(.appearance-page, .sheet-handle) { display: none; }
+.menu-panel[data-view="appearance"] > .appearance-page { display: block; }
+.appearance-head { display: flex; align-items: center; gap: 6px; padding: 0 4px 6px 0; margin-bottom: 4px; border-bottom: 1px solid var(--border-soft); }
+.appearance-head h2 { margin: 0; font-size: 13.5px; font-weight: 600; letter-spacing: -.005em; }
+.appearance-back .icon { width: 18px; height: 18px; }
+.appearance-note { margin: 0; padding: 4px 10px 8px; color: var(--muted-2); font-size: 11.5px; line-height: 1.4; }
+.appearance-option[aria-checked="false"] .menu-icon .icon { visibility: hidden; }
+.appearance-option[aria-checked="true"] .menu-icon { color: var(--text); }
+[data-appearance-open] .menu-trailing { display: grid; place-items: center; }
+[data-appearance-open] .menu-trailing .icon { width: 16px; height: 16px; color: var(--muted); }
+
+/* Over video the frame is dark in both themes, so a face drawn on it keeps the dark tint. */
+.shorts-overlay .avatar { --avatar-l: 20%; --avatar-ink: #d6d6da; }
+@media (max-width: 900px) {
+  /* A phone Short fills the screen with video, so the tab bar under it stays dark, as on YouTube.
+     These are the dark tokens, so in the dark theme nothing changes. */
+  body:has(.shorts-main) .mobile-bottom-nav { color-scheme: dark; --bar-glass: rgba(10,10,11,.94); --border-soft: rgba(255,255,255,.055); --text: #ededef; --muted: #9a9aa3; --focus: 0 0 0 2px rgba(255,255,255,.5); }
+}

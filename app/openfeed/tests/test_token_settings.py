@@ -12,10 +12,12 @@ class TokenSettingsTests(unittest.TestCase):
             html = main._settings_dialog(user, "alice")
         self.assertIn('data-settings-pane="api-tokens"', html)
         self.assertIn('data-api-token-form', html)
-        self.assertIn('value="read" selected', html)
+        self.assertIn('value="read" checked', html)
         self.assertIn('/assets/api-tokens-v1.js', html)
         self.assertNotIn('ofd_', html)
-        self.assertNotIn('data-api-token-form', main._api_tokens_pane({"authenticated": False}))
+        # Anonymous with sign-in on: no form. (Sign-in off is the local profile's: test_system_ui.)
+        with patch.dict("os.environ", {"OPENFEED_AUTH_MODE": "authentik_oidc"}):
+            self.assertNotIn('data-api-token-form', main._api_tokens_pane({"authenticated": False}))
         self.assertNotIn('data-api-token-form', main._api_tokens_pane({"authenticated": True, "via_token": True}))
 
     def test_old_settings_link_opens_actual_token_pane(self):

@@ -19,7 +19,7 @@ def _row(index: int) -> dict[str, object]:
 class SidebarSubscriptionGroupTests(unittest.TestCase):
     def test_probe_renders_visible_plus_one_with_rest_hidden(self) -> None:
         with patch.object(db, "list_subscriptions", return_value=[_row(i) for i in range(20)]):
-            html = main._sidebar_subscription_group()
+            html = main._sidebar_subscription_group(user_key="local")
 
         self.assertEqual(html.count('class="nav-item nav-channel"'), 7)
         self.assertEqual(html.count('nav-channel-extra'), 1)
@@ -28,7 +28,7 @@ class SidebarSubscriptionGroupTests(unittest.TestCase):
 
     def test_full_list_counts_remaining_exactly(self) -> None:
         with patch.object(db, "list_subscriptions", return_value=[_row(i) for i in range(10)]):
-            html = main._sidebar_subscription_group(limit=250)
+            html = main._sidebar_subscription_group(limit=250, user_key="local")
 
         self.assertEqual(html.count('class="nav-item nav-channel"'), 7)
         self.assertEqual(html.count('nav-channel-extra'), 3)
@@ -37,7 +37,7 @@ class SidebarSubscriptionGroupTests(unittest.TestCase):
 
     def test_no_toggle_when_everything_fits(self) -> None:
         with patch.object(db, "list_subscriptions", return_value=[_row(i) for i in range(5)]):
-            html = main._sidebar_subscription_group()
+            html = main._sidebar_subscription_group(user_key="local")
 
         self.assertNotIn("data-subscription-more", html)
         self.assertNotIn(" hidden", html)

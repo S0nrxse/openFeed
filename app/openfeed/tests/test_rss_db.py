@@ -1,12 +1,12 @@
 """Tests for the direct-RSS polling helpers in ``openfeed.db``.
 
-The poller fills the same freshrss_* tables the FreshRSS mirror used to fill;
+The poller fills the feeds and feed_entries tables;
 these tests cover only the polling-state helpers (due selection, fetch outcome
 recording, channel->subscription lookup, newest sync run).
 
 DB-free: ``db.connect`` is patched with a fake whose cursor emulates just enough
 Postgres semantics for these queries against an in-memory store, in the style of
-test_db_queries.py / test_freshrss_latest_join.py. The real database is never
+test_db_queries.py / sqlcapture.py. The real database is never
 touched. For the due query the fake asserts the SQL carries the contract clauses
 (identity filter, backoff filter, NULLS FIRST ordering) and then applies that
 same contract in Python; the backoff math lives in Python in ``record_rss_fetch``
@@ -70,13 +70,13 @@ class _FakeCursor:
     def execute(self, query: str, params: Any = None) -> None:
         self.calls.append((query, params))
         params = params or ()
-        if "FROM freshrss_subscriptions" in query and "next_fetch_after <=" in query:
+        if "FROM feeds" in query and "next_fetch_after <=" in query:
             self._run_due_query(query, params)
         elif "SELECT fetch_failures" in query:
             sub = self.store["subs"].get(params[0], {})
             self._one = {"fetch_failures": sub.get("fetch_failures", 0)}
             self._rows = []
-        elif "UPDATE freshrss_subscriptions" in query and "fetch_failures = 0" in query:
+        elif "UPDATE feeds" in query and "fetch_failures = 0" in query:
             etag, last_modified, ttl, sub_id = params
             sub = self.store["subs"][params[3]]
             now = _utcnow()
@@ -88,7 +88,7 @@ class _FakeCursor:
             sub["last_checked_at"] = now
             sub["next_fetch_after"] = now + timedelta(seconds=int(ttl))
             self._rows = []
-        elif "UPDATE freshrss_subscriptions" in query and "fetch_failures = %s" in query:
+        elif "UPDATE feeds" in query and "fetch_failures = %s" in query:
             failures, backoff, sub_id = params
             sub = self.store["subs"][sub_id]
             now = _utcnow()
@@ -96,7 +96,7 @@ class _FakeCursor:
             sub["last_checked_at"] = now
             sub["next_fetch_after"] = now + timedelta(seconds=int(backoff))
             self._rows = []
-        elif "FROM freshrss_subscriptions" in query and "youtube_channel_id = %s" in query:
+        elif "FROM feeds" in query and "youtube_channel_id = %s" in query:
             ids = sorted(
                 sub["id"]
                 for sub in self.store["subs"].values()
@@ -359,7 +359,7 @@ class RssDbTests(unittest.TestCase):
                 },
                 {
                     "id": 2,
-                    "source": "freshrss",
+                    "source": "other",
                     "status": "ok",
                     "message": "other source",
                     "started_at": now - timedelta(minutes=1),

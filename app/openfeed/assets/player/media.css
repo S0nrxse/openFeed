@@ -1,0 +1,56 @@
+/* Captions, the caption menu and the cast button, added by assets/player/kit/media-kit.js.
+   Bundled after chrome.css and travels the same way, so the same rule holds: no backticks,
+   no backslashes and no dollar-brace sequences. */
+:root {
+  --of-cast: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6'/%3E%3Cpath d='M2 12a9 9 0 0 1 8 8'/%3E%3Cpath d='M2 16a5 5 0 0 1 4 4'/%3E%3Cpath d='M2 20h.01'/%3E%3C/svg%3E");
+}
+.video-js .of-cc-control { --of-icon: var(--of-captions); }
+.video-js .of-cast-control { --of-icon: var(--of-cast); }
+.video-js .of-cc[hidden], .video-js .of-cast-control[hidden] { display: none !important; }
+/* Invidious orders its bar with flex order (captions 2 ... fullscreen 7). The native bar
+   keeps DOM order, where the kit already inserted these in the right place. */
+.video-js:not(.of-native) .of-cc { order: 2; }
+.video-js:not(.of-native) .of-cast-control { order: 6; }
+
+/* OpenFeed's tracks replace video.js's caption button and its renderer. */
+.of-own-captions .vjs-captions-button, .of-own-captions .vjs-subs-caps-button,
+.of-own-captions .vjs-subtitles-button, .of-own-captions .vjs-text-track-display { display: none !important; }
+
+/* On: a short Bone rule under the glyph. Selection in this system is Bone, never Ember. */
+.video-js .of-cc-control .vjs-icon-placeholder, .video-js .of-cast-control .vjs-icon-placeholder { position: relative; }
+.video-js .of-cc-control.is-on .vjs-icon-placeholder::after, .video-js .of-cast-control.is-on .vjs-icon-placeholder::after {
+  content: ""; position: absolute; left: 1px; right: 1px; bottom: -5px; height: 2px; border-radius: 999px; background: var(--of-bone); }
+.video-js .of-cast-control.is-connecting { opacity: .6; }
+
+/* The language menu: the shared menu panel, each row a language with its kind beside it. */
+.video-js .of-cc .vjs-menu { width: 232px; right: -84px; }
+.video-js .of-cc .vjs-menu li.vjs-menu-item { justify-content: space-between; gap: 10px; }
+.video-js .of-cc .of-cc-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.video-js .of-cc .of-cc-kind { flex: 0 0 auto; color: var(--of-smoke); font-size: 11.5px; font-weight: 500; }
+.video-js .of-cc .vjs-selected .of-cc-kind { color: rgba(10, 10, 11, .62); }
+.video-js .of-cc.is-open [data-tip]::after { display: none !important; }
+/* An open menu keeps the bar up, even after the idle fade would have hidden it. */
+.video-js .vjs-control-bar:has(.of-cc.is-open) { opacity: 1 !important; visibility: visible !important; pointer-events: auto !important; }
+/* video.js opens its menus on hover. Crossing the audio or quality button on the way to a
+   language must not open theirs on top of this one. */
+.video-js .vjs-control-bar:has(.of-cc.is-open) .vjs-menu-button-popup:not(.of-cc) .vjs-menu { display: none !important; }
+.video-js .of-cc .vjs-menu { z-index: 7; }
+/* A phone frame is too narrow to hang the menu off the button, so it anchors to the bar's
+   right edge, as the speed row does. */
+@media (max-width: 600px) {
+  .video-js .of-cc { position: static; }
+  .video-js .of-cc .vjs-menu { right: 8px; left: auto; width: min(232px, calc(100vw - 16px)); }
+}
+
+/* Captions: Bone on the player scrim, the system font at 550, a 6px radius. They sit just
+   above the bottom edge and lift clear of the control bar whenever it shows. */
+.of-captions { position: absolute; left: 5%; right: 5%; bottom: 5%; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  pointer-events: none; text-align: center; transition: bottom .18s ease; }
+.of-captions[hidden] { display: none; }
+.video-js:not(.vjs-user-inactive) .of-captions, .video-js.vjs-paused .of-captions,
+.video-js:has(.of-cc.is-open) .of-captions { bottom: calc(var(--of-track) + 24px); }
+.of-cue { max-width: 100%; padding: .12em .5em; border-radius: 6px; background: rgba(10, 10, 11, .8); color: #ededef;
+  font: 550 clamp(13px, 2.3vw, 34px)/1.35 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, system-ui, sans-serif;
+  letter-spacing: -.006em; white-space: pre-line; overflow-wrap: anywhere; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+.of-cue-note { color: #f2686c; font-size: 13px; }
+@media (prefers-reduced-motion: reduce) { .of-captions { transition: none; } }

@@ -136,7 +136,7 @@ class CollectionPageSmokeTests(unittest.TestCase):
 
     COLLECTION_ID = "12345678-1234-5678-1234-567812345678"
 
-    def _render(self, members, videos=()):
+    def _render(self, members, videos=(), view="channels"):
         collection = {
             "id": self.COLLECTION_ID,
             "name": "Test Collection",
@@ -153,7 +153,7 @@ class CollectionPageSmokeTests(unittest.TestCase):
             list_collection_videos=list(videos),
         ), patch.object(main, "_login_required_redirect", return_value=None), \
             patch.object(main, "_user_key", return_value="local"):
-            return main.collection_page(None, self.COLLECTION_ID)
+            return main.collection_page(None, self.COLLECTION_ID, view=view)
 
     def _member(self, **overrides):
         member = {
@@ -168,6 +168,12 @@ class CollectionPageSmokeTests(unittest.TestCase):
         }
         member.update(overrides)
         return member
+
+    def test_the_feed_view_has_no_member_rows_and_an_empty_collection_explains_itself(self) -> None:
+        self.assertNotIn("data-member-card", self._render([self._member()], view=""))
+        empty = self._render([], view="")
+        self.assertIn("empty-state", empty)
+        self.assertIn("data-add-channels", empty)
 
     def test_renders_with_member_cards_and_remove_controls(self) -> None:
         html = self._render([self._member()])
@@ -192,38 +198,165 @@ class CollectionPageSmokeTests(unittest.TestCase):
             self.assertEqual(caught.exception.status_code, 404)
 
 
+class ChannelsPageSmokeTests(unittest.TestCase):
+    """channels_page: one switch, rendered state, and an honest empty list."""
+
+    COLLECTION = "12345678-1234-5678-1234-567812345678"
+    SUB = {"id": "s1", "title": "Chan", "youtube_channel_id": "UC1", "feed_url": "https://f", "video_count": 2}
+
+    def _render(self, subscriptions=None, collections=(), **query):
+        subscriptions = [self.SUB] if subscriptions is None else subscriptions
+        with offline_db(
+            list_subscriptions=subscriptions,
+            list_subscription_collections=list(collections),
+            list_collection_ids_for_subscriptions={"s1": [self.COLLECTION]} if collections else {},
+            list_subscription_recommendations=[],
+            channel_notification_levels={"UC1": "none"},
+        ), patch.object(main, "_login_required_redirect", return_value=None), \
+            patch.object(main, "_user_key", return_value="local"):
+            return main.channels_page(None, **query)
+
+    def test_it_opens_on_the_channel_list_with_one_visible_selection(self) -> None:
+        html = self._render()
+        self.assertIn('class="channel-row"', html)
+        self.assertEqual(html.count('aria-current="page">Channels<'), 1)
+        self.assertNotIn("View as", html)
+        self.assertNotIn("data-page-tab", html)
+
+    def test_the_bell_shows_the_stored_level(self) -> None:
+        self.assertIn('aria-label="Notifications: None"', self._render())
+
+    def test_timeline_still_renders_with_an_empty_state(self) -> None:
+        html = self._render(view="timeline")
+        self.assertIn('aria-current="page">Timeline<', html)
+        self.assertIn("No videos from your subscriptions yet", html)
+
+    def test_collections_view_and_its_chips(self) -> None:
+        collection = {"id": self.COLLECTION, "name": "Group", "subscription_count": 1, "member_titles": ["Chan"], "member_avatars": [""]}
+        self.assertIn("Open feed", self._render(collections=[collection], tab="collections"))
+        self.assertIn(f'href="/collection/{self.COLLECTION}"', self._render(collections=[collection]))
+
+    def test_groups_filter_on_the_server(self) -> None:
+        collection = {"id": self.COLLECTION, "name": "Group"}
+        html = self._render(collections=[collection], group="none")
+        self.assertNotIn('class="channel-row"', html)
+        self.assertIn("No channels in this group", html)
+
+    def test_no_subscriptions_says_how_to_get_some(self) -> None:
+        html = self._render(subscriptions=[])
+        self.assertIn("No subscriptions yet", html)
+        self.assertIn("/?settings=import", html)
+
+
+class PostCardSafetyTests(unittest.TestCase):
+    """content_html arrives verbatim from YouTube with no sanitization anywhere."""
+
+    def _post(self, **overrides):
+        post = {
+            "post_id": "p1",
+            "youtube_channel_id": "UC123",
+            "author": "Some Channel",
+            "content": "Plain text body",
+            "content_html": "",
+            "attachment": None,
+        }
+        post.update(overrides)
+        return post
+
+    def test_content_html_is_never_rendered_as_markup(self) -> None:
+        evil = '<script>alert(1)</script><img src=x onerror=alert(2)>'
+        html = main._post_card(self._post(content=evil))
+        # The page's <script> blocks are its own; the payload string must appear
+        # only in escaped form.
+        self.assertNotIn("<script>alert", html)
+        self.assertIn(escape(evil, quote=True), html)
+
+    def test_html_fallback_renders_escaped_not_raw(self) -> None:
+        evil = '<script>alert(1)</script>'
+        # When the extracted plain text is empty the raw HTML string is shown, but
+        # only through escape() — never as markup.
+        html = main._post_card(self._post(content="", content_html=evil))
+        self.assertNotIn("<script>alert", html)
+        self.assertIn(escape(evil, quote=True), html)
+
+    def test_plain_text_takes_precedence_over_content_html(self) -> None:
+        html = main._post_card(self._post(content="Plain text body", content_html="<script>x</script>"))
+        self.assertIn("Plain text body", html)
+        self.assertNotIn("<script>", html)
+
+    def test_post_id_and_channel_id_are_escaped(self) -> None:
+        evil = '"><script>alert(1)</script>'
+        html = main._post_card(self._post(post_id=evil, youtube_channel_id=evil))
+        self.assertNotIn("<script>alert", html)
+        self.assertIn(f'data-post-id="{escape(evil, quote=True)}"', html)
+
+
+class SafeExternalHrefTests(unittest.TestCase):
+    """Feed-supplied entry links could otherwise ship javascript: hrefs."""
+
+    def test_http_and_https_pass_through(self) -> None:
+        self.assertEqual(main._safe_external_href("https://example.com/watch?v=1"), "https://example.com/watch?v=1")
+        self.assertEqual(main._safe_external_href("http://example.com/feed.xml"), "http://example.com/feed.xml")
+
+    def test_everything_dangerous_drops_out(self) -> None:
+        for evil in (
+            "javascript:alert(1)",
+            "JAVASCRIPT:alert(1)",
+            " data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox",
+            "\u0000javascript:alert(1)",
+            "//cdn.example.com/x",
+            "/relative/path",
+            "chrome://settings",
+        ):
+            self.assertEqual(main._safe_external_href(evil), "", f"{evil!r} must be dropped")
+
+    def test_media_row_original_url_is_browsable_or_relative(self) -> None:
+        evil = "javascript:alert(1)"
+        html = main._media_row(_row_video(url=evil), _row_settings())
+        self.assertNotIn("javascript:", html)
+        html2 = main._media_row(_row_video(url="https://example.com/x"), _row_settings())
+        self.assertIn("https://example.com/x", html2)
+
+
 class SidebarProbeTests(unittest.TestCase):
     """The shell fetches a VISIBLE + 1 probe; the API serves the full list."""
 
     def test_shell_fetches_only_visible_plus_one(self) -> None:
         with patch.object(main.db, "list_subscriptions", return_value=[]) as listed:
-            main._sidebar_subscription_group()
-        listed.assert_called_once_with(main.SIDEBAR_VISIBLE_CHANNELS + 1)
+            main._sidebar_subscription_group(user_key="u1")
+        listed.assert_called_once_with(main.SIDEBAR_VISIBLE_CHANNELS + 1, recent_first=True, user_key="u1")
 
     def test_channels_are_not_over_fetched_threefold(self) -> None:
         with patch.object(main.db, "list_subscriptions", return_value=[]) as listed:
-            main._sidebar_channels(250)
-        listed.assert_called_once_with(250)
+            main._sidebar_channels(250, "u1")
+        listed.assert_called_once_with(250, recent_first=True, user_key="u1")
+
+    def test_without_a_user_the_sidebar_lists_nobodys_channels(self) -> None:
+        with patch.object(main.db, "list_subscriptions", return_value=[_channel_row(0)]) as listed:
+            self.assertEqual(main._sidebar_subscription_group(), "")
+        listed.assert_not_called()
 
     def test_capped_probe_shows_a_generic_more_label(self) -> None:
         rows = [_channel_row(index) for index in range(8)]
         with patch.object(main.db, "list_subscriptions", return_value=rows):
-            html = main._sidebar_subscription_group()
+            html = main._sidebar_subscription_group(user_key="u1")
         self.assertIn(">Show more<", html)
         self.assertNotIn("Show 1 more", html)
 
     def test_full_list_keeps_the_exact_remaining_count(self) -> None:
         rows = [_channel_row(index) for index in range(10)]
         with patch.object(main.db, "list_subscriptions", return_value=rows):
-            html = main._sidebar_subscription_group(limit=250)
+            html = main._sidebar_subscription_group(limit=250, user_key="u1")
         self.assertIn("Show 3 more", html)
 
     def test_sidebar_api_returns_the_full_list(self) -> None:
         rows = [_channel_row(index) for index in range(10)]
         with patch.object(main, "_login_required_redirect", return_value=None), \
+            patch.object(main, "_user_key", return_value="u1"), \
             patch.object(main.db, "list_subscriptions", return_value=rows) as listed:
             html = main.api_sidebar_subscriptions(None)
-        listed.assert_called_once_with(250)
+        listed.assert_called_once_with(250, recent_first=True, user_key="u1")
         self.assertIn("Show 3 more", html)
 
 

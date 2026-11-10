@@ -1,0 +1,369 @@
+/* ---------- shorts ---------- */
+.section-heading h2 { display: inline-flex; align-items: center; gap: 8px; }
+.section-heading h2 .icon { width: 17px; height: 17px; color: var(--accent); }
+.shorts-row { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(158px, 1fr); gap: 16px; overflow-x: auto; padding-bottom: 6px; scrollbar-width: none; }
+.shorts-row::-webkit-scrollbar { display: none; }
+.short-card { min-width: 0; }
+.short-thumb { position: relative; display: block; aspect-ratio: 9 / 16; border-radius: var(--r-thumb); overflow: hidden; background: var(--thumb-bed); border: 1px solid var(--border-soft); }
+.short-thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.short-badge { position: absolute; left: 8px; bottom: 8px; display: grid; place-items: center; width: 24px; height: 24px; border-radius: 6px; background: rgba(10,10,11,.72); color: #fff; backdrop-filter: blur(4px); }
+.short-badge .icon { width: 14px; height: 14px; }
+.short-copy { padding-top: 9px; }
+.short-copy h3 { margin: 0; font-size: 13px; font-weight: 550; line-height: 1.35; letter-spacing: -.006em; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.short-copy p { margin: 4px 0 0; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A Short is vertical; cap the player width so it is not pillarboxed inside a 16:9 frame. */
+.watch-player-shell.is-short { max-width: min(430px, 100%); margin-inline: auto; }
+.watch-player-shell.is-short .player-frame { aspect-ratio: 9 / 16; }
+
+/* ---------- shorts feed (immersive) ---------- */
+.shorts-main { padding: 0 0 0 0; margin-left: var(--sidebar); height: calc(100dvh - var(--header)); margin-top: var(--header); overflow: hidden; }
+.shorts-viewport { position: relative; height: 100%; display: grid; grid-template-columns: minmax(0, 1fr) 0; transition: grid-template-columns .22s ease; }
+.shorts-viewport.comments-open { grid-template-columns: minmax(0, 1fr) clamp(300px, 26vw, 380px); }
+/* One Short per scroll stop, like a vertical feed. */
+.shorts-stage { height: 100%; overflow-y: auto; scroll-snap-type: y mandatory; scrollbar-width: none; overscroll-behavior: contain; }
+.shorts-stage::-webkit-scrollbar { display: none; }
+/* Player and action rail centre together as one unit. */
+.shorts-slide { position: relative; height: 100%; scroll-snap-align: center; scroll-snap-stop: always; display: grid; grid-template-columns: auto 60px; align-items: center; justify-content: center; gap: 14px; padding: 12px 10px; box-sizing: border-box; }
+.shorts-stage-inner { position: relative; height: 100%; aspect-ratio: 9 / 16; max-width: 100%; }
+.shorts-frame { position: relative; height: 100%; width: 100%; border-radius: var(--r-thumb); overflow: hidden; background: #000; border: 1px solid var(--border-soft); }
+.shorts-frame iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+.shorts-poster { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.shorts-play { position: absolute; inset: 0; margin: auto; width: 56px; height: 56px; border: 1px solid var(--border); border-radius: 999px; background: rgba(10,10,11,.72); color: #fff; display: grid; place-items: center; cursor: pointer; transition: opacity var(--dur-press) ease, transform var(--dur-press) ease; }
+.shorts-play .icon { width: 24px; height: 24px; }
+.shorts-play:active { transform: scale(.96); }
+.shorts-slide.is-playing .shorts-play, .shorts-slide.is-playing .shorts-poster { opacity: 0; pointer-events: none; }
+/* A flat scrim, bottom-left, and only as tall as what it carries. Above the tap layer, so
+   the channel and title links take their own clicks; the scrim itself lets taps through. */
+.shorts-overlay { position: absolute; left: 0; right: 0; bottom: 0; z-index: 3; padding: 10px 14px 12px; display: grid; gap: 4px; background: rgba(0,0,0,.55); border-radius: 0 0 var(--r-thumb) var(--r-thumb); pointer-events: none; }
+.shorts-slide.is-failed .shorts-overlay, .shorts-slide.is-failed .shorts-progress, .shorts-slide.is-failed .shorts-glyph { display: none; }
+/* Sits on the frame's bottom edge, above the scrim. Scaled rather than resized, so the
+   frequent clock updates never trigger layout. */
+.shorts-progress { position: absolute; left: 0; right: 0; bottom: 0; z-index: 4; height: 2px; overflow: hidden; border-radius: 0 0 var(--r-thumb) var(--r-thumb); pointer-events: none; }
+.shorts-progress span { display: block; height: 100%; background: var(--accent); transform: scaleX(0); transform-origin: left; }
+/* Over the frame so a swipe scrolls this page instead of being swallowed by the player
+   document, and a tap pauses. A third-party embed has its own controls, so it stands down. */
+.shorts-tap { position: absolute; inset: 0; z-index: 2; display: none; width: 100%; height: 100%; padding: 0; border: 0; background: transparent; cursor: pointer; touch-action: pan-y; }
+.shorts-slide.is-playing .shorts-tap { display: block; }
+.shorts-slide.is-opaque .shorts-tap, .shorts-slide.is-failed .shorts-tap { display: none; }
+.shorts-tap:focus-visible { outline: 0; box-shadow: inset var(--focus); }
+/* Confirms a tap to pause, then stays until playback resumes. */
+.shorts-glyph { position: absolute; top: 50%; left: 50%; z-index: 3; width: 64px; height: 64px; margin: -32px 0 0 -32px; display: grid; place-items: center; border-radius: 999px; background: rgba(10,10,11,.72); color: #fff; opacity: 0; pointer-events: none; transition: opacity var(--dur-fade) ease; }
+.shorts-glyph .icon { width: 26px; height: 26px; }
+.shorts-slide.is-paused.is-playing .shorts-glyph { opacity: 1; }
+.shorts-overlay a { pointer-events: auto; }
+.shorts-channel { display: inline-flex; align-items: center; gap: 9px; color: #fff; font-size: 13px; font-weight: 600; width: max-content; max-width: 100%; min-height: 36px; }
+.shorts-channel .avatar { width: 28px; height: 28px; }
+.shorts-channel span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shorts-title { margin: 0; font-size: 13.5px; font-weight: 500; line-height: 1.4; color: #fff; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.shorts-meta { margin: 0; color: rgba(255,255,255,.72); font-size: 12px; font-variant-numeric: tabular-nums; }
+.shorts-rail { align-self: center; justify-self: start; display: grid; gap: 12px; }
+/* Outside the frame, a stack of 44px discs with a count or label under each. */
+.shorts-action { width: 60px; border: 0; background: transparent; color: var(--text); display: grid; justify-items: center; gap: 4px; padding: 0; cursor: pointer; font-size: 11.5px; font-weight: 500; line-height: 1.2; text-align: center; font-variant-numeric: tabular-nums; }
+.shorts-disc { width: 44px; height: 44px; border-radius: 999px; background: var(--surface-2); display: grid; place-items: center; transition: background var(--dur-press) ease, color var(--dur-press) ease, transform var(--dur-press) var(--ease-press); }
+.shorts-action:hover .shorts-disc { background: var(--surface-3); }
+.shorts-action:active .shorts-disc { transform: scale(.96); }
+.shorts-action:focus-visible { outline: 0; }
+.shorts-action:focus-visible .shorts-disc { box-shadow: var(--focus); }
+.shorts-action .icon { width: 20px; height: 20px; }
+.shorts-action.is-selected .shorts-disc { background: var(--bone); color: var(--on-bone); }
+.shorts-sound-on, .shorts-sound-off { display: grid; }
+.shorts-sound-off, .shorts-action.is-selected .shorts-sound-on { display: none; }
+.shorts-action.is-selected .shorts-sound-off { display: grid; }
+/* Same filled-thumb treatment as the watch page, so a like reads the same everywhere. */
+.shorts-action .icon { transition: fill var(--dur-fade) ease; }
+.shorts-action.is-selected .icon { fill: currentColor; }
+.shorts-action.is-bumped .icon { animation: thumb-pop .38s cubic-bezier(.2,1.55,.35,1); }
+.shorts-action.is-bumped[data-feedback="dislike"] .icon { animation-name: thumb-pop-down; }
+.shorts-nav-buttons { position: absolute; right: 16px; top: 50%; transform: translateY(-50%); display: grid; gap: 10px; z-index: 5; transition: right .22s ease; }
+.shorts-viewport.comments-open .shorts-nav-buttons { right: calc(clamp(300px, 26vw, 380px) + 16px); }
+.shorts-nav { width: 44px; height: 44px; border: 0; border-radius: 999px; background: var(--surface-2); color: var(--text); display: grid; place-items: center; cursor: pointer; transition: background var(--dur-press) ease, transform var(--dur-press) var(--ease-press); }
+.shorts-nav:hover { background: var(--surface-3); }
+.shorts-nav:active { transform: scale(.96); }
+.shorts-nav .icon { width: 20px; height: 20px; }
+.shorts-nav[disabled] { opacity: .35; cursor: default; }
+.shorts-comments { height: 100%; overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr); border-left: 1px solid var(--border-soft); background: var(--surface); }
+.shorts-comments[hidden] { display: none; }
+.shorts-comments-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 10px 10px 14px; border-bottom: 1px solid var(--border-soft); }
+/* Only the two comment sheets use this; ui-kit's own handle belongs to .yt-menu and dialogs. */
+.comments-sheet-handle { display: none; }
+.shorts-comments-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+.shorts-comments-body { overflow-y: auto; padding: 8px 14px 20px; }
+.shorts-comments-body .comment { grid-template-columns: 30px minmax(0, 1fr); gap: 10px; padding: 10px 0; }
+.shorts-comments-body .comment .avatar { width: 30px; height: 30px; }
+.shorts-comments-body .comment-body { font-size: 12.5px; }
+.shorts-enable { display: grid; gap: 10px; justify-items: start; padding: 16px 2px; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+@media (max-width: 900px) {
+  /* Full bleed: the frame takes everything above the tab bar, header included, and the
+     rail and copy sit on it inside the safe areas. */
+  /* The You and bell sheets are children of the header, so it stays rendered for them. */
+  body:has(.shorts-main) .app-header { visibility: hidden; background: none; border: 0; backdrop-filter: none; }
+  body:has(.shorts-main) .app-header .yt-menu[open] .menu-panel { visibility: visible; }
+  body:has(.shorts-main) .nav-line { top: var(--safe-top); }
+  .shorts-viewport.comments-open { grid-template-columns: minmax(0, 1fr); }
+  .shorts-slide { grid-template-columns: minmax(0, 1fr); padding: 0; }
+  .shorts-stage-inner { width: 100%; height: 100%; aspect-ratio: auto; justify-self: stretch; }
+  .shorts-frame { border-radius: 0; border: 0; }
+  .shorts-overlay { padding: 10px calc(76px + var(--safe-right)) 12px calc(14px + var(--safe-left)); border-radius: 0; }
+  .shorts-progress { border-radius: 0; }
+  .shorts-rail { position: absolute; right: calc(8px + var(--safe-right)); bottom: 14px; z-index: 4; justify-self: end; gap: 10px; }
+  .shorts-disc { background: rgba(10,10,11,.6); }
+  .shorts-action.is-selected .shorts-disc { background: var(--over-video-bone); color: var(--over-video-on-bone); }
+  .shorts-action { color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.7); }
+  .shorts-nav-buttons { display: none; }
+  .comments-sheet-handle { display: block; position: relative; height: 22px; touch-action: none; cursor: grab; flex: 0 0 auto; }
+  .comments-sheet-handle::before { content: ""; position: absolute; top: 8px; left: 50%; width: 36px; height: 4px; margin-left: -18px; border-radius: 999px; background: var(--surface-3); }
+  .shorts-comments { position: fixed; left: 0; right: 0; bottom: 0; top: 34dvh; z-index: 90; grid-template-rows: auto auto minmax(0, 1fr); padding-bottom: var(--safe-bottom); border-left: 0; border-top: 1px solid var(--border); border-radius: var(--r-panel) var(--r-panel) 0 0; background: var(--menu); animation: sheet-in .22s var(--ease-press); }
+  .shorts-comments.is-dragging { animation: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shorts-play:active, .shorts-action:active .shorts-disc, .shorts-nav:active, .ts-link:active { transform: none; }
+}
+
+/* ---------- notifications ---------- */
+.bell-wrap { position: relative; display: grid; place-items: center; }
+.bell-badge { position: absolute; top: 0; right: 0; min-width: 18px; height: 18px; padding: 0 4px; border-radius: 999px; background: var(--accent-solid); color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; pointer-events: none; }
+.bell-badge[hidden] { display: none; }
+.notifications-panel { width: min(360px, calc(100vw - 24px)); max-height: min(520px, calc(100dvh - 90px)); padding-bottom: 0; }
+.notification-list { min-width: 0; }
+.notification-group { margin: 8px 0 3px; padding: 0 10px; font-size: 11px; font-weight: 600; line-height: 1.2; letter-spacing: .07em; text-transform: uppercase; color: var(--muted-2); }
+.notification-row { display: grid; grid-template-columns: 5px minmax(0, 1fr) 72px; gap: 9px; align-items: center; min-height: 56px; padding: 7px 10px 7px 8px; border-radius: 8px; color: var(--text); }
+.notification-row:hover { background: var(--surface-3); }
+.notification-dot { width: 5px; height: 5px; border-radius: 999px; }
+.notification-row.unread .notification-dot { background: var(--accent); }
+
+.notification-copy { min-width: 0; }
+.notification-copy strong { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; font-size: 12.5px; font-weight: 500; line-height: 1.35; }
+
+.notification-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+.notification-thumb { position: relative; display: block; width: 72px; aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden; background: var(--thumb-bed); }
+.notification-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.notification-foot { position: sticky; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px -5px 0; padding: 4px 15px; min-height: 40px; background: var(--menu); border-top: 1px solid var(--border-soft); }
+.notification-foot > :only-child { margin-left: auto; }
+.notification-action { position: relative; border: 0; background: none; padding: 0; color: var(--muted); font-size: 12.5px; cursor: pointer; transition: color var(--dur-press) ease; }
+.notification-action:hover { color: var(--text); }
+.notification-action[hidden] { display: none; }
+.notification-action:disabled { opacity: .55; cursor: default; }
+.notification-empty { padding: 16px 10px; }
+
+/* ---------- comments ---------- */
+.comments { margin-top: 24px; }
+.comments-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+.comment-sorts { margin-left: auto; }
+.comments-close, .comments-preview { display: none; }
+.comments-note { margin: -4px 0 12px; color: var(--muted); font-size: 12px; }
+.comments-note[hidden], .comment[hidden] { display: none; }
+.comment-skeleton .skeleton-line { width: 70%; }
+.comment-skeleton .skeleton-line.is-meta { width: 34%; }
+.comments-head h2 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.012em; }
+.comments-count { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.comments-state { color: var(--muted); font-size: 13px; margin: 0; padding: 12px 0; }
+.comment { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 14px; padding: 12px 0; }
+.comment .avatar { width: 36px; height: 36px; }
+.comment-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-bottom: 5px; }
+.comment-author { font-size: 12.5px; font-weight: 600; color: var(--text); }
+/* A creator's own comment is set apart the way YouTube does it: their handle gets a
+   filled chip, and the whole comment a faint tint so it reads as authored, not just
+   another reply. */
+.comment-author.owner { background: var(--text); color: var(--bg); border-radius: 999px; padding: 2px 9px; font-weight: 650; }
+.comment.is-creator { background: var(--wash); border-radius: 12px; padding: 12px 14px; margin-left: -14px; }
+.comment-mention { color: var(--link); font-weight: 550; }
+.comment-heart { position: relative; display: inline-grid; place-items: center; width: 22px; height: 22px; }
+.comment-heart img { width: 18px; height: 18px; border-radius: 999px; object-fit: cover; }
+.comment-heart i { position: absolute; right: -3px; bottom: -3px; font-size: 10px; font-style: normal;
+  color: var(--ember-text); text-shadow: 0 0 3px rgba(0,0,0,.9); }
+.comment-time { color: var(--muted); font-size: 12px; }
+.comment-flag { color: var(--muted); font-size: 11px; display: inline-flex; align-items: center; gap: 4px; }
+.comment-flag .icon { width: 13px; height: 13px; }
+.comment-body { margin: 0; color: var(--text); font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* A clickable timestamp, in a description or a comment. A pill rather than a link
+   because it seeks the player, which is product behaviour and not something a creator
+   linked, so it keeps out of Cobalt. */
+.ts-link { display: inline-flex; align-items: center; min-height: 22px; padding: 0 7px; margin: 0 1px; border: 0; border-radius: 999px;
+  background: var(--surface-2); color: var(--text); font: inherit; font-size: 11.5px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums;
+  vertical-align: 1px; cursor: pointer; transition: background var(--dur-press) ease, transform var(--dur-press) var(--ease-press); }
+.ts-link:hover { background: var(--surface-3); }
+.ts-link:active { transform: scale(.96); }
+.ts-link:focus-visible { outline: 0; box-shadow: var(--focus); }
+.watch-description a { color: var(--link); overflow-wrap: anywhere; }
+.watch-description a:hover { text-decoration: underline; }
+/* Kept tight so the pair reads as one control. The like button carries a count and
+   the dislike does not — YouTube publishes no per-comment dislike figure, and there
+   is nothing to put there — so the gap between them is the only thing holding the
+   two thumbs apart. */
+.comment-reactions { display: inline-flex; align-items: center; gap: 0; margin-left: -5px; }
+.comment-vote-count { font-size: 11.5px; }
+.comment-vote { display: inline-flex; align-items: center; gap: 4px; min-height: 26px; padding: 0 5px;
+  border: 0; border-radius: 999px; background: transparent; color: var(--muted-2); font-size: 12px;
+  font-variant-numeric: tabular-nums; cursor: pointer; transition: background var(--dur-press) ease, color var(--dur-press) ease; }
+.comment-vote:hover { background: var(--surface-3); color: var(--text); }
+.comment-vote .icon { width: 15px; height: 15px; transition: fill var(--dur-fade) ease, transform var(--dur-fade) ease; }
+.comment-vote.is-selected { color: var(--text); }
+.comment-vote.is-selected .icon { fill: currentColor; }
+.comment-vote .icon { transition: fill var(--dur-fade) ease; }
+.comment-vote.is-bumped .icon { animation: thumb-pop .38s cubic-bezier(.2,1.55,.35,1); }
+.comment-vote.is-bumped[data-comment-vote="dislike"] .icon { animation-name: thumb-pop-down; }
+@media (prefers-reduced-motion: reduce) { .comment-vote .icon { transition: none; } }
+.comment-meta { display: flex; align-items: center; gap: 14px; margin-top: 8px; color: var(--muted); font-size: 12px; }
+.comment-meta span { display: inline-flex; align-items: center; gap: 5px; }
+.comment-meta .icon { width: 14px; height: 14px; }
+
+/* ---------- watch ---------- */
+/* The player is a grid child rather than the first thing inside the article, which
+   is what lets theater mode span it across both columns without moving any markup. */
+.watch-main { max-width: 1760px; padding-top: calc(var(--header) + 20px); padding-right: 32px;
+  --watch-gutter: 32px; }
+.watch-layout { display: grid; grid-template-columns: minmax(0, 1fr) clamp(320px, 27vw, 392px);
+  grid-template-areas: "stage panel" "content panel"; gap: 0 28px; align-items: start; min-width: 0; }
+.watch-layout > * { min-width: 0; }
+.watch-stage { grid-area: stage; }
+.watch-content { grid-area: content; }
+.watch-panel { grid-area: panel; }
+.watch-player-shell { position: relative; z-index: 1; background: #000; border: 1px solid var(--border-soft); border-radius: var(--r-panel); overflow: hidden; }
+.player-frame { width: 100%; max-width: 100%; aspect-ratio: 16 / 9; border: 0; background: #000; display: block; }
+.watch-title { margin: 14px 0 8px; font-size: 19px; font-weight: 650; line-height: 1.35; letter-spacing: -.018em; }
+/* "Resuming from 18:58": a line in the page under the player, never over the description or Up next. */
+.resume-note { display: flex; align-items: center; gap: 8px; width: fit-content; max-width: 100%; box-sizing: border-box; min-height: 32px; margin: 12px 0 0;
+  padding: 0 2px 0 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); color: var(--muted); font-size: 12.5px; }
+.resume-note > .icon { flex: 0 0 auto; width: 14px; height: 14px; }
+.resume-note > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resume-note strong { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.resume-note-action { position: relative; flex: 0 0 auto; padding: 4px 6px; border-radius: 6px; color: var(--text); font-weight: 600; text-decoration: none; }
+.resume-note-action:hover { background: var(--surface-3); }
+.resume-note-close { flex: 0 0 auto; display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 999px;
+  background: transparent; color: var(--muted); cursor: pointer; }
+.resume-note-close:hover { background: var(--surface-3); color: var(--text); }
+.resume-note-close .icon { width: 14px; height: 14px; }
+.resume-note-action:focus-visible, .resume-note-close:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.resume-note + .watch-title, body.theater .resume-note + .watch-title { margin-top: 10px; }
+@media (pointer: coarse) { .resume-note { min-height: var(--hit); } .resume-note-close { width: var(--hit); height: var(--hit); } .resume-note-action { padding: 10px 8px; } }
+/* DeArrow: the community title is shown, and the original is one press away. */
+.dearrow-toggle { display: inline-flex; align-items: center; min-height: 28px; margin: -2px 0 8px; padding: 0 10px;
+  border: 1px solid var(--border); border-radius: 999px; background: transparent; color: var(--muted);
+  font: inherit; font-size: 12px; cursor: pointer; }
+.dearrow-toggle:hover { background: var(--surface-2); color: var(--text); }
+.dearrow-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+@media (pointer: coarse) { .dearrow-toggle { min-height: var(--hit); } }
+/* Channel, subscribe and the actions share one row, the way YouTube arranges them.
+   The actions are pushed right by an auto margin and drop to their own line only
+   once the row genuinely runs out of width. */
+/* The margin here is load-bearing: the gap under this row used to come from
+   .watch-actions, which lost it when the actions moved onto this line. Without it
+   the description sits flush against the subscriber count and clips it. */
+.watch-meta-line { display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap;
+  margin: 4px 0 12px; min-height: 40px; color: var(--muted); font-size: 13px; }
+.watch-channel { display: flex; align-items: center; gap: 11px; min-width: 0; flex: 0 1 auto; }
+.watch-channel .avatar { width: 40px; height: 40px; }
+.watch-channel > div { min-width: 0; }
+.watch-creators { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.creator-sep { color: var(--muted-2); font-size: 12px; }
+.watch-channel-name.is-plain { color: var(--muted); cursor: default; }
+.watch-channel-name { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
+.watch-channel .metadata { font-size: 11.5px; margin-top: 2px; }
+.watch-inline-actions, .watch-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* Tooltips for the icon-only actions. data-tip rather than title, so the browser's own
+   tooltip does not arrive a second later on top of this one. */
+@media (hover: hover) {
+  .watch-actions [data-tip] { position: relative; }
+  .watch-actions [data-tip]:hover::after, .watch-actions [data-tip]:focus-visible::after { content: attr(data-tip); position: absolute; left: 50%; top: calc(100% + 6px); z-index: 12;
+    transform: translateX(-50%); padding: 5px 9px; border-radius: var(--r-control); border: 1px solid var(--border); background: var(--menu); color: var(--text);
+    font-size: 11.5px; font-weight: 550; line-height: 1.2; white-space: nowrap; pointer-events: none; }
+  .watch-menu[open] > [data-tip]::after { display: none; }
+}
+.watch-inline-actions { justify-content: flex-end; flex: 0 0 auto; }
+.watch-actions { margin: 0 0 0 auto; }
+
+/* ---------- subscribe + notification bell ---------- */
+.subscribe-group { display: inline-flex; align-items: center; }
+.subscribe-group.is-subscribed { background: var(--surface-2); border-radius: 999px; }
+.subscribe-group:not(.is-subscribed) .notify-menu { display: none; }
+.watch-subscribe { min-height: 36px; border: 0; border-radius: 999px; display: inline-flex; align-items: center; gap: 7px;
+  padding: 0 18px; cursor: pointer; font-size: 13px; font-weight: 650; letter-spacing: -.006em;
+  background: var(--text); color: var(--bg);
+  transition: filter var(--dur-press) ease, transform var(--dur-press) var(--ease-press), background var(--dur-press) ease, color var(--dur-press) ease; }
+.watch-subscribe .icon { width: 16px; height: 16px; }
+.watch-subscribe:hover { filter: brightness(.88); }
+.watch-subscribe:active { transform: scale(.96); }
+.watch-subscribe.subscribed { background: transparent; color: var(--text); font-weight: 550; border-radius: 999px 0 0 999px; padding-right: 14px; }
+.watch-subscribe.subscribed:hover { background: var(--surface-3); filter: none; }
+.notify-menu { display: inline-flex; }
+.notify-trigger { position: relative; min-height: 36px; display: inline-flex; align-items: center; gap: 1px;
+  padding: 0 12px 0 10px; border-radius: 0 999px 999px 0; color: var(--text); cursor: pointer; list-style: none;
+  transition: background var(--dur-press) ease, color var(--dur-press) ease; }
+.notify-trigger::-webkit-details-marker { display: none; }
+.notify-trigger::before { content: ""; position: absolute; left: 0; top: 9px; bottom: 9px; width: 1px; background: var(--border); }
+.notify-trigger:hover, .notify-menu[open] > .notify-trigger { background: var(--surface-3); }
+.notify-trigger.is-muted { color: var(--muted-2); }
+.notify-trigger .icon { width: 17px; height: 17px; }
+.notify-trigger .icon + .icon { width: 13px; height: 13px; color: var(--muted); transition: transform var(--dur-fade) ease; }
+.notify-menu[open] > .notify-trigger .icon + .icon { transform: rotate(180deg); }
+.notify-menu .menu-panel { right: 0; left: auto; top: 42px; width: min(288px, calc(100vw - 24px)); }
+.notify-menu.drop-up .menu-panel { top: auto; bottom: 42px; }
+
+/* ---------- reactions ---------- */
+.watch-reactions { display: inline-flex; align-items: center; background: var(--surface-2); border-radius: 999px; }
+.watch-reactions .pill-action { background: transparent; border-color: transparent; }
+.watch-reactions .pill-action:hover { background: var(--surface-3); }
+.watch-reactions .pill-action:first-child { border-radius: 999px 0 0 999px; padding-right: 13px; }
+.watch-reactions .pill-action:last-child { position: relative; border-radius: 0 999px 999px 0; padding-left: 13px; }
+.watch-reactions .pill-action:last-child::before { content: ""; position: absolute; left: 0; top: 9px; bottom: 9px; width: 1px; background: var(--border-soft); }
+/* The outline is one closed subpath, so filling it is the whole "filled thumb"
+   state — there is no second icon that could drift away from the outline one. */
+.reaction-action .icon { transition: fill var(--dur-fade) ease; }
+.reaction-action.is-selected { color: var(--text); }
+.reaction-action.is-selected .icon { fill: currentColor; }
+.reaction-action.is-bumped .icon { animation: thumb-pop .38s cubic-bezier(.2,1.55,.35,1); }
+.reaction-action.is-bumped[data-feedback="dislike"] .icon { animation-name: thumb-pop-down; }
+@keyframes thumb-pop {
+  0% { transform: scale(1) rotate(0); }
+  30% { transform: scale(1.3) rotate(-10deg); }
+  62% { transform: scale(.93) rotate(4deg); }
+  100% { transform: scale(1) rotate(0); }
+}
+@keyframes thumb-pop-down {
+  0% { transform: scale(1) rotate(0); }
+  30% { transform: scale(1.3) rotate(10deg); }
+  62% { transform: scale(.93) rotate(-4deg); }
+  100% { transform: scale(1) rotate(0); }
+}
+.reaction-count { font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--muted); }
+.reaction-action.is-selected .reaction-count { color: var(--text); }
+.reaction-count.muted { color: var(--muted-2); }
+/* An estimate is set slightly back from a real count so the two do not read alike. */
+.reaction-count.is-estimate { color: var(--muted); }
+.privacy-note { border-left: 2px solid var(--border); padding-left: 10px; margin-top: 4px; line-height: 1.55; }
+
+/* ---------- download picker ---------- */
+.download-dialog { width: min(460px, calc(100vw - 32px)); }
+.download-options { display: grid; gap: 6px; }
+.download-option { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 48px;
+  border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-2); color: var(--text);
+  padding: 0 14px; cursor: pointer; text-align: left; font-size: 13px;
+  transition: background var(--dur-press) ease, border-color var(--dur-press) ease, transform var(--dur-press) var(--ease-press); }
+.download-option:hover { background: var(--surface-3); border-color: var(--border); }
+.download-option:active { transform: scale(.985); }
+.download-option .icon { width: 17px; height: 17px; color: var(--muted); }
+.download-option strong { display: block; font-size: 13.5px; font-weight: 600; }
+.download-option small { display: block; color: var(--muted-2); font-size: 11.5px; margin-top: 2px; }
+.download-size { color: var(--muted-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+/* ---------- video details ---------- */
+.details-dialog { width: min(560px, calc(100vw - 32px)); }
+.details-dialog .video-details > summary { display: none; }
+.details-dialog .video-details { margin: 0; border-top: 0; padding-top: 0; }
+.video-details { margin-top: 14px; border-top: 1px solid var(--border-soft); padding-top: 12px; }
+.video-details > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 7px;
+  color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.video-details > summary::-webkit-details-marker { display: none; }
+.video-details > summary:hover { color: var(--text); }
+.video-details > summary .icon { width: 15px; height: 15px; }
+.video-details[open] > summary { margin-bottom: 12px; color: var(--text); }
+.detail-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px 20px; margin: 0; }
+.detail-row { display: grid; gap: 2px; }
+.detail-row dt { color: var(--muted-2); font-size: 11.5px; }
+.detail-row dd { margin: 0; font-size: 13px; font-variant-numeric: tabular-nums; }
+.detail-tag { display: inline-block; margin-left: 5px; padding: 1px 6px; border-radius: 999px;
+  background: var(--surface-3); color: var(--muted); font-size: 10.5px; font-weight: 600; }
+.detail-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+.detail-chip { padding: 4px 10px; border-radius: 999px; background: var(--surface-2); color: var(--muted);
+  font-size: 11.5px; transition: background var(--dur-press) ease, color var(--dur-press) ease; }
+.detail-chip:hover { background: var(--surface-3); color: var(--text); }

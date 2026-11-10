@@ -145,16 +145,75 @@ class CatchUpShelfTests(unittest.TestCase):
     def test_no_shelf_without_a_subscription_pool(self) -> None:
         self.assertIsNone(main._catch_up_section([], set(), "local", seed=0, page=0))
 
+    def _deep_pool(self) -> list[dict[str, object]]:
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        pool = []
+        for index in range(160):
+            pool.append(_video(
+                f"v{index:03d}", f"chan-{index % 23}", duration_seconds=[300, 900, 2400][index % 3],
+                is_read=index % 2 == 0, published_at=now - timedelta(days=index % 30, hours=1),
+            ))
+        return pool
+
+    def test_catch_up_shelves_never_repeat_a_video_across_pages(self) -> None:
+        pool = self._deep_pool()
+        original = main._favorite_channel_keys
+        main._favorite_channel_keys = lambda user_key, limit=6: ["chan-1", "chan-2"]
+        try:
+            for seed in range(6):
+                shown: dict[str, int] = {}
+                titles = []
+                for page in range(0, 25):
+                    section = main._catch_up_section(pool, set(), "local", seed=seed, page=page)
+                    if not main._is_catch_up_page(page, seed):
+                        continue
+                    if section is None:
+                        continue
+                    titles.append(section["title"])
+                    for row in section["videos"]:
+                        video_id = row["youtube_video_id"]
+                        self.assertNotIn(video_id, shown, f"seed {seed}: {video_id} on page {shown.get(video_id)} and {page}")
+                        shown[video_id] = page
+                # Consecutive catch-up shelves are different variants, not the same one
+                # every third page.
+                self.assertGreater(len(set(titles[:4])), 1, f"seed {seed}: {titles}")
+        finally:
+            main._favorite_channel_keys = original
+
+    def test_later_catch_up_shelves_skip_the_subscription_shelf_head(self) -> None:
+        pool = self._deep_pool()
+        head = {row["youtube_video_id"] for row in pool[:main._CATCH_UP_SUBSCRIPTION_HEAD]}
+        plan = main._catch_up_plan(pool, "local", seed=1, page=12)
+        for page, entry in plan.items():
+            if page == 0:
+                continue
+            self.assertFalse(head & {row["youtube_video_id"] for row in entry["videos"]}, page)
+
+    def test_a_page_duplicate_is_dropped_without_changing_the_plan(self) -> None:
+        pool = self._deep_pool()
+        planned = main._catch_up_plan(pool, "local", seed=0, page=0)[0]["videos"]
+        seen = {planned[0]["youtube_video_id"]}
+        section = main._catch_up_section(pool, seen, "local", seed=0, page=0)
+        self.assertEqual([row["youtube_video_id"] for row in section["videos"]], [row["youtube_video_id"] for row in planned[1:]])
+
 
 class SubscriptionScopingTests(unittest.TestCase):
-    def test_subscription_filter_requires_a_live_freshrss_row(self) -> None:
+    def test_subscription_filter_requires_a_live_subscription(self) -> None:
         row = {"source_kind": "subscription", "is_subscribed_channel": False}
 
         self.assertFalse(db._row_matches_feed_filter(row, "subscription"))
         self.assertTrue(db._row_matches_feed_filter({"source_kind": "subscription", "is_subscribed_channel": True}, "subscription"))
 
-    def test_subscription_queries_check_the_subscription_table(self) -> None:
-        self.assertIn("freshrss_subscriptions", db.ACTIVE_SUBSCRIPTION_SQL)
+    def test_subscription_queries_check_this_users_subscriptions(self) -> None:
+        self.assertIn("feeds", db.ACTIVE_SUBSCRIPTION_SQL)
+        self.assertIn("user_subscriptions", db.ACTIVE_SUBSCRIPTION_SQL)
+        self.assertEqual(db.ACTIVE_SUBSCRIPTION_SQL.count("%s"), 1)
+        # Never NULL, and no "nobody subscribed to anything, so show everything" branch:
+        # that would hand one person's feed to a new account with no subscriptions.
+        self.assertTrue(db.ACTIVE_SUBSCRIPTION_SQL.startswith("COALESCE("))
+        self.assertNotIn("NOT EXISTS", db.ACTIVE_SUBSCRIPTION_SQL)
 
 
 if __name__ == "__main__":

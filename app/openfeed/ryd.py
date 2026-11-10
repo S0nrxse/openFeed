@@ -33,6 +33,7 @@ from typing import Any
 
 import httpx
 
+from . import outbound
 from .config import get_settings
 
 logger = logging.getLogger("openfeed.ryd")
@@ -145,7 +146,7 @@ def fetch_batch(video_ids: list[str]) -> list[dict[str, Any]]:
         return []
     results: list[dict[str, Any]] = []
     headers = {"accept": "application/json", "user-agent": "OpenFeed (+https://github.com/S0nrxse/openFeed)"}
-    with httpx.Client(timeout=RYD_TIMEOUT_SECONDS, follow_redirects=False, headers=headers) as client:
+    with outbound.client(timeout=RYD_TIMEOUT_SECONDS, follow_redirects=False, headers=headers) as client:
         for video_id in wanted:
             try:
                 votes = fetch_one(video_id, client)

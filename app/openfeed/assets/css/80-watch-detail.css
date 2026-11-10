@@ -1,0 +1,180 @@
+/* ---------- theater mode ---------- */
+/* Same shape YouTube uses: the player widens to span both columns at its
+   natural 16:9, and everything below it keeps the two-column split so up-next
+   sits beside the description, not under it. The width is fitted to the
+   viewport height, so on short windows the player shrinks (centered on the
+   page background) instead of running off-screen; on tall windows it takes
+   the full width. Either way the shell itself stays 16:9, so the video never
+   letterboxes inside it. Unlike the full-bleed attempt, the player stays
+   inside the page gutter with its radius and border, so it reads as a bigger
+   player rather than a takeover. */
+body.theater .watch-layout { grid-template-areas: "stage stage" "content panel"; }
+/* The page normally holds a 20px gap below the header; in theater the player has to
+   meet it, so that breathing room is dropped for the duration. */
+body.theater .watch-main { padding-top: var(--header); }
+body.theater .watch-stage { background: transparent;
+  margin: 0 0 14px; }
+/* The stage already spaces the player from what follows, so the title's own top
+   margin would stack on top of it — and because the up-next rail has no such margin,
+   that extra 16px also knocked the two columns out of line. Dropping it fixes the
+   gap and the alignment together: both columns now start on the same row. */
+body.theater .watch-title { margin-top: 0; }
+/* Natural 16:9 spanning both columns, but fitted to the viewport with just the
+   title block peeking below: width is the smaller of full width and what leaves
+   ~120px under the player, so the title, channel row and actions sit at the
+   bottom edge — the way YouTube's theater does — with the description and the
+   rest of up-next one scroll away. The shell itself stays 16:9 either
+   way, so the video never letterboxes inside it; on short windows the player just
+   shrinks and centers on the page background. The player is square-cornered like
+   YouTube's theater — any round here visibly eats into the video edges. */
+body.theater .watch-player-shell { width: min(100%, calc((100vh - var(--header) - 120px) * 16 / 9)); max-width: 100%; margin-inline: auto;
+  height: auto; aspect-ratio: 16 / 9; border-radius: 0; }
+/* The iframe follows the shell exactly. Height comes from the shell (which has
+   the ratio), not from a second ratio computation on the frame itself — two
+   competing aspect-ratios is what made resizing stutter. */
+body.theater .player-frame { width: 100%; height: 100%; }
+/* A 9:16 short letterboxed into a wide box would be almost entirely black, so cap
+   its width and keep it in its own ratio. */
+body.theater .watch-player-shell.is-short { height: auto; aspect-ratio: 9 / 16; margin-inline: auto;
+  max-width: min(430px, calc((100vh - var(--header) - 120px) * 9 / 16)); }
+/* Sidebar open/close animates the player width elsewhere on the site; in theater
+   the shell tracks the window live, so transitioning it there only rubber-bands. */
+body.nav-ready:not(.theater) .watch-player-shell { transition: max-width .2s var(--ease-press), border-radius .2s ease; }
+.theater-toggle .icon { transition: transform var(--dur-fade) ease; }
+.theater-toggle.is-selected { background: var(--surface-3); border-color: var(--border-soft); }
+.theater-toggle.is-selected .icon { transform: scaleX(1.15); }
+@media (max-width: 900px) { .watch-main { --watch-gutter: 16px; } }
+@media (prefers-reduced-motion: reduce) {
+  .watch-subscribe, .download-option { transition: none; }
+  .watch-subscribe:active, .download-option:active { transform: none; }
+  .reaction-action.is-bumped .icon { animation: none; }
+}
+
+/* ---------- comment replies ---------- */
+.reply-toggle { position: relative; display: inline-flex; align-items: center; gap: 6px; min-height: 28px; margin: 6px 0 0 -8px; padding: 0 10px 0 8px;
+  border: 0; border-radius: 999px; background: transparent; color: var(--text); font-size: 12.5px; font-weight: 550; cursor: pointer; font-variant-numeric: tabular-nums; }
+.reply-toggle:hover { background: var(--surface-2); }
+.reply-toggle .icon { width: 15px; height: 15px; transition: transform var(--dur-fade) var(--ease-press); }
+.reply-toggle.is-open .icon { transform: rotate(180deg); }
+.comment-replies { display: grid; gap: 14px; margin: 10px 0 0 4px; padding-left: 14px; border-left: 1px solid var(--border-soft); }
+.comment-replies[hidden] { display: none; }
+.comment-replies .comment { gap: 10px; }
+.comment-replies .comment.reply-depth-1 { margin-left: 20px; }
+.comment-replies .comment.reply-depth-2 { margin-left: 40px; }
+.comment-replies .comment.reply-depth-3 { margin-left: 60px; }
+.comment-replies .avatar { width: 26px; height: 26px; font-size: 9.5px; }
+@media (prefers-reduced-motion: reduce) { .reply-toggle .icon { transition: none; } }
+.watch-description { border: 1px solid var(--border-soft); border-radius: var(--r-thumb); background: var(--surface); padding: 12px; color: var(--text); line-height: 1.6; font-size: 13px; transition: background var(--dur-press) ease; }
+.watch-description.is-collapsed { cursor: pointer; }
+.watch-description.is-collapsed:hover { background: var(--surface-2); }
+.watch-description p { margin: 0; }
+.watch-description p + p { margin-top: 8px; }
+.watch-description-meta { color: var(--text); font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; margin-bottom: 6px !important; }
+.watch-description-body { overflow: hidden; }
+/* line-clamp rather than a max-height: clamping by ems cut the last line through
+   its descenders, so g and p lost their tails. */
+.watch-description.is-collapsed .watch-description-body { display: -webkit-box;
+  -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  /* A hair of extra line-height so descenders on the clamped line are not shaved. */
+  line-height: 1.62; }
+.description-toggle { position: relative; display: block; margin-top: 6px; min-height: 24px; border: 0; border-radius: 6px; background: transparent; color: var(--text); font-size: 12.5px; font-weight: 600; cursor: pointer; padding: 0; }
+.description-toggle:hover { text-decoration: underline; }
+.description-empty { color: var(--muted-2); }
+.transcript-row { width: 100%; border: 0; border-radius: 8px; background: transparent; color: var(--text); display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 10px; padding: 8px; text-align: left; cursor: pointer; }
+.transcript-row:hover { background: var(--surface-2); }
+.transcript-row span { color: var(--muted-2); font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.transcript-row p { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.45; }
+.watch-panel { position: sticky; top: calc(var(--header) + 20px); max-height: calc(100dvh - var(--header) - 36px); overflow: auto; padding: 0 2px 12px 0; min-width: 0; max-width: 100%; scrollbar-width: thin; display: grid; align-content: start; gap: 12px; }
+.watch-panel-head { display: none; }
+.upnext-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 34px; }
+.upnext-head h2 { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; letter-spacing: -.014em; }
+.upnext-head .tabbar { margin: 0; }
+.watch-panel:has(#tab-transcript.active) .upnext-filters { display: none; }
+.watch-panel .media-row[hidden] { display: none; }
+#tab-suggestions.tab-panel.active { gap: 8px; }
+.watch-panel .media-row { grid-template-columns: 168px minmax(0, 1fr) 22px; gap: 10px; padding: 0; border-radius: var(--r-thumb); }
+.watch-panel .media-row .thumb { border-radius: var(--r-thumb); }
+.watch-panel .media-row h2 { font-size: 13px; font-weight: 550; line-height: 1.4; -webkit-line-clamp: 2; }
+.watch-panel .media-row p { margin-top: 4px; font-size: 11.5px; line-height: 1.35; }
+.watch-panel .menu-trigger { width: 22px; height: 22px; }
+/* Narrow panel windows keep the text readable before the thumbnail keeps its width. */
+@media (max-width: 1300px) { .watch-panel .media-row { grid-template-columns: 136px minmax(0, 1fr) 22px; } }
+
+/* ---------- chapters ---------- */
+.chapter-card { border: 1px solid var(--border-soft); border-radius: var(--r-thumb); background: var(--surface); overflow: hidden; }
+.chapter-head { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 0 12px; cursor: pointer; list-style: none; }
+.chapter-head::-webkit-details-marker { display: none; }
+.chapter-head h2 { margin: 0; font-size: 13.5px; font-weight: 600; }
+.chapter-count { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.chapter-head .icon { width: 15px; height: 15px; margin-left: auto; color: var(--muted); transition: transform var(--dur-fade) var(--ease-press); }
+.chapter-card[open] .chapter-head .icon { transform: rotate(180deg); }
+.chapter-head:focus-visible { outline: 0; box-shadow: inset var(--focus); }
+.chapter-list { margin: 0; padding: 0 4px 4px; list-style: none; max-height: 228px; overflow-y: auto; scrollbar-width: thin; }
+.chapter-row { width: 100%; min-height: 44px; display: grid; grid-template-columns: 12px 50px minmax(0, 1fr); align-items: center; gap: 8px; padding: 4px 8px; border: 0; border-radius: var(--r-control); background: transparent; color: var(--text); font-size: 13px; line-height: 1.3; text-align: left; cursor: pointer; transition: background var(--dur-press) ease; }
+.chapter-row:hover { background: var(--surface-2); }
+.chapter-row:focus-visible { outline: 0; box-shadow: var(--focus); }
+.chapter-row[aria-current="true"] { background: var(--surface-3); font-weight: 550; }
+.chapter-glyph { display: grid; color: var(--accent); opacity: 0; }
+.chapter-glyph .icon { width: 12px; height: 12px; fill: currentColor; }
+.chapter-row[aria-current="true"] .chapter-glyph { opacity: 1; }
+.chapter-time { color: var(--muted); font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.chapter-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+@media (prefers-reduced-motion: reduce) { .chapter-head .icon, .chapter-row { transition: none; } }
+
+/* ---------- list playback (?list=): the playlist or Liked list, in play order ---------- */
+.watch-list { border: 1px solid var(--border-soft); border-radius: var(--r-thumb); background: var(--surface); overflow: hidden; }
+.watch-list-head { padding: 10px 12px 8px; border-bottom: 1px solid var(--border-soft); }
+.watch-list-head h2 { margin: 0; font-size: 14px; font-weight: 600; line-height: 1.3; }
+.watch-list-head h2 a { color: var(--text); }
+.watch-list-head h2 a:hover { text-decoration: underline; }
+.watch-list-meta { margin: 2px 0 0; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.watch-list-items { margin: 0; padding: 4px; list-style: none; max-height: 340px; overflow-y: auto; scrollbar-width: thin; }
+.watch-list-item a { display: grid; grid-template-columns: 22px 96px minmax(0, 1fr); align-items: center; gap: 8px; min-height: 44px;
+  padding: 4px 6px 4px 2px; border-radius: var(--r-control); color: var(--text); transition: background var(--dur-press) ease; }
+.watch-list-item a:hover { background: var(--surface-2); }
+.watch-list-item a:focus-visible { outline: 0; box-shadow: var(--focus); }
+.watch-list-item.is-current a { background: var(--surface-3); }
+.watch-list-index { display: grid; place-items: center; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.watch-list-item.is-current .watch-list-index { color: var(--accent); }
+.watch-list-index .icon { width: 12px; height: 12px; fill: currentColor; }
+.watch-list-thumb { position: relative; aspect-ratio: 16 / 9; border-radius: 6px; background: var(--surface-2); overflow: hidden; }
+.watch-list-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.watch-list-thumb .duration { position: absolute; right: 3px; bottom: 3px; padding: 0 3px; border-radius: 3px; background: var(--badge); color: #fff; font-size: 10.5px; line-height: 15px; }
+.watch-list-copy { display: grid; gap: 2px; min-width: 0; }
+.watch-list-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-size: 13px; font-weight: 550; line-height: 1.35; }
+.watch-list-channel { overflow: hidden; color: var(--muted); font-size: 11.5px; white-space: nowrap; text-overflow: ellipsis; }
+@media (prefers-reduced-motion: reduce) { .watch-list-item a { transition: none; } }
+
+/* ---------- chat (live and replay), shown only with Live chat on in Settings ---------- */
+.chat-card[hidden] { display: none; }
+.chat-state { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.chat-card[data-mode="live"] .chat-state:not(:empty)::before { content: ""; display: inline-block; width: 6px; height: 6px; margin: 0 6px 1px 0; border-radius: 999px; background: var(--muted-2); vertical-align: middle; }
+.chat-list { margin: 0; padding: 2px 4px 4px; list-style: none; height: min(380px, 46dvh); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.chat-msg { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 8px; align-items: start; padding: 5px 8px; border-radius: var(--r-control); }
+.chat-msg .avatar { width: 24px; height: 24px; font-size: 9px; }
+.chat-msg p { margin: 0; font-size: 13px; line-height: 1.45; color: var(--text); overflow-wrap: anywhere; }
+.chat-author { margin-right: 6px; color: var(--muted); font-weight: 550; }
+.chat-msg[data-role="owner"] .chat-author, .chat-msg[data-role="moderator"] .chat-author { color: var(--text); }
+.chat-role, .chat-amount { display: inline-block; margin-right: 6px; padding: 0 6px; border-radius: 999px; background: var(--surface-3); color: var(--text); font-size: 11px; font-weight: 600; line-height: 18px; vertical-align: 1px; }
+.chat-amount { background: var(--bone); color: var(--on-bone); }
+.chat-paid, .chat-member { background: var(--surface-2); }
+.chat-note { margin: 0; padding: 4px 12px 8px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.chat-note[hidden] { display: none; }
+.chat-foot { margin: 0; padding: 8px 12px 10px; border-top: 1px solid var(--border-soft); color: var(--muted-2); font-size: 11.5px; line-height: 1.45; }
+.tabbar { display: flex; align-items: center; gap: 6px; margin-bottom: 14px; overflow-x: auto; scrollbar-width: none; }
+.tabbar::-webkit-scrollbar { display: none; }
+.tab { flex: 0 0 auto; min-height: 34px; border: 0; border-radius: 999px; background: var(--surface-2); color: var(--text); cursor: pointer; padding: 0 14px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.tab:hover { background: var(--surface-3); }
+.tab.active { background: var(--bone); color: var(--on-bone); font-weight: 500; }
+.tab-panel { display: none; }
+.tab-panel.active { display: grid; gap: 6px; }
+.details-list { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; color: var(--text); font-size: 12.5px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface); padding: 14px; }
+.details-list dt { color: var(--muted-2); }
+.details-list dd { margin: 0; overflow-wrap: anywhere; }
+.chat-placeholder { color: var(--muted); line-height: 1.6; padding: 8px; font-size: 12.5px; }
+.empty-copy { padding: 18px; border: 1px solid var(--border-soft); border-radius: var(--r-panel); background: var(--surface); color: var(--muted); font-size: 13px; line-height: 1.55; }
+.empty-copy a, .empty-copy .link-action { color: var(--link); }
+.empty-copy a:hover, .empty-copy .link-action:hover { color: var(--link-hover); }
+.channel-grid > .empty-copy, .video-grid > .empty-copy, .timeline > .empty-copy, .playlist-grid > .empty-copy { grid-column: 1 / -1; }
+.mobile-bottom-nav { display: none; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }

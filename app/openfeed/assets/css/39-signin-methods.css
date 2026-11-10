@@ -1,0 +1,26 @@
+/* Phase 2 sign-in methods: passkeys, OIDC provider buttons and the trusted proxy
+   (passkeys.py, oidc.py, trusted_header.py, account_pages.py). Builds on 38-accounts.css. */
+
+/* The passkey script's scope wraps the card's contents; it must not become a grid item. */
+.auth-passkeys, .pk-scope { display: contents; }
+.auth-method[hidden], [data-passkey-add-button][hidden], .pk-add input[hidden] { display: none; }
+.auth-method-form { display: contents; }
+
+/* One sentence under the methods: why passkeys are off here, or what went wrong. */
+.auth-note { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.5; overflow-wrap: anywhere; }
+.auth-note[hidden], .pk-note[hidden] { display: none; }
+.auth-note.is-error, .pk-note.is-error { color: var(--ember-text); }
+
+/* Account & security, Passkeys group. */
+.pk-row .set-copy strong { overflow-wrap: anywhere; }
+.pk-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.pk-actions > form { display: contents; }
+.pk-rename[open] { flex-basis: 100%; }
+.pk-rename .acct-manage-panel { display: flex; justify-content: flex-end; }
+.pk-add { padding: 0; }
+.pk-note { margin: 0 14px 12px; }
+
+@media (max-width: 700px) {
+  .pk-actions { justify-content: flex-start; }
+  .pk-rename .acct-manage-panel { justify-content: flex-start; }
+}

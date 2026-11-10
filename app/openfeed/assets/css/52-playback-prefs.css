@@ -1,0 +1,56 @@
+/* ---------- Share dialog (watch page) ----------
+   YouTube's: the link and Copy on one line, "Start at" with its time under it. At 600px
+   and below it becomes the bottom sheet every .feed-dialog becomes. */
+.share-dialog[open] { width: min(480px, calc(100vw - 32px)); }
+.share-body { display: grid; gap: 14px; padding: 16px 20px 20px; }
+.share-body .segmented { justify-self: start; }
+.share-link { display: flex; gap: 8px; align-items: center; }
+.share-link .field-input { flex: 1 1 auto; min-width: 0; font-variant-numeric: tabular-nums; text-overflow: ellipsis; }
+.share-link .btn { flex: 0 0 auto; min-width: 76px; justify-content: center; }
+.share-start { display: flex; align-items: center; gap: 10px; padding-top: 14px; border-top: 1px solid var(--border-soft); }
+.share-start-toggle { display: inline-flex; align-items: center; gap: 10px; font-size: 13.5px; font-weight: 500; cursor: pointer; }
+.share-start .share-start-time { width: 92px; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.share-start .share-start-time:disabled { color: var(--muted-2); cursor: default; }
+.share-start .share-start-time[aria-invalid="true"] { border-color: var(--ember-text); }
+.share-error { margin: -6px 0 0; color: var(--ember-text); font-size: 12.5px; }
+.share-error[hidden] { display: none; }
+@media (max-width: 600px) {
+  .share-body { padding: 8px 16px calc(20px + var(--safe-bottom, 0px)); }
+  .share-link .field-input, .share-start .share-start-time { min-height: 44px; font-size: 16px; }
+}
+
+/* ---------- Autoplay countdown (over the player) ----------
+   The frame is the content's own surface, so the card sits on the flat scrim with the
+   menu panel's fill. The draining line is a progress fill, the one Ember use here. */
+.autoplay-card { position: absolute; inset: 0; z-index: 3; display: grid; place-items: center; padding: 12px; background: var(--scrim); }
+.autoplay-panel { box-sizing: border-box; width: min(440px, 100%); display: grid; gap: 10px; padding: 14px; border: 1px solid var(--border);
+  border-radius: var(--r-panel); background: var(--menu); box-shadow: var(--shadow); }
+.autoplay-eyebrow { margin: 0; color: var(--muted); font-size: 12.5px; font-weight: 550; }
+.autoplay-eyebrow [data-autoplay-count] { color: var(--text); font-variant-numeric: tabular-nums; }
+.autoplay-meter { display: block; height: 2px; margin-top: -4px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
+.autoplay-meter::after { content: ""; display: block; height: 100%; background: var(--accent); transform-origin: left;
+  animation: autoplay-drain var(--autoplay-seconds, 8s) linear forwards; }
+@keyframes autoplay-drain { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+.autoplay-next { display: grid; grid-template-columns: 136px minmax(0, 1fr); gap: 12px; align-items: start; color: var(--text); text-decoration: none; border-radius: var(--r-control); }
+.autoplay-thumb { position: relative; display: block; aspect-ratio: 16 / 9; border-radius: var(--r-thumb); background: #000; overflow: hidden; }
+.autoplay-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.autoplay-copy { display: grid; gap: 4px; min-width: 0; }
+.autoplay-copy strong { font-size: 14.5px; font-weight: 550; line-height: 1.4; letter-spacing: -.008em;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.autoplay-copy small { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.autoplay-next:hover strong { text-decoration: underline; text-underline-offset: 2px; }
+.autoplay-actions { display: flex; justify-content: flex-end; gap: 8px; }
+@media (prefers-reduced-motion: reduce) { .autoplay-meter::after { animation: none; } }
+/* A phone frame is about 390x219: the title and the two buttons, nothing that would clip. */
+@media (max-width: 600px), (max-height: 520px) {
+  .autoplay-card { padding: 8px; }
+  .autoplay-panel { gap: 8px; padding: 10px 12px; }
+  .autoplay-next { grid-template-columns: 96px minmax(0, 1fr); gap: 10px; }
+  .autoplay-copy strong { font-size: 13.5px; }
+  .autoplay-actions .btn { min-height: 36px; }
+}
+@media (max-width: 420px) {
+  .autoplay-next { grid-template-columns: minmax(0, 1fr); }
+  .autoplay-thumb { display: none; }
+  .autoplay-meter { margin-top: -2px; }
+}

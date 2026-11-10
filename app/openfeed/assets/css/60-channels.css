@@ -1,0 +1,132 @@
+/* ---------- channel page ----------
+   Short on purpose: a full row of videos has to clear the fold at 1440px. The banner is
+   a strip, the bio stops at two lines, and everything else lives in the About dialog. */
+.ch-identity { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto;
+  grid-template-areas: "avatar copy actions" "avatar bio actions"; gap: 4px 16px; align-items: start; margin: 16px 0 0; }
+.ch-avatar { grid-area: avatar; width: 72px; height: 72px; font-size: 22px; }
+.ch-identity-copy { grid-area: copy; min-width: 0; display: grid; gap: 2px; }
+.ch-identity h1 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -.02em; display: flex; align-items: center; gap: 6px; line-height: 1.25; }
+.ch-identity h1 span { min-width: 0; overflow-wrap: anywhere; }
+.ch-identity h1 .verified { flex: none; width: 16px; height: 16px; color: var(--muted); }
+.ch-meta { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.45; font-variant-numeric: tabular-nums; }
+.ch-handle { color: var(--text); font-weight: 550; }
+.ch-dot { color: var(--muted-2); }
+.ch-bio { grid-area: bio; min-width: 0; max-width: 680px; display: grid; gap: 2px; }
+.ch-bio:empty { display: none; }
+/* Two clamped lines with "...more" beside the last of them. The whole text is in the
+   dialog: this block sits in the page header, so growing it in place moves everything. */
+.ch-about { display: flex; align-items: flex-end; gap: 6px; min-width: 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+.ch-about p { margin: 0; }
+.ch-about-short { min-width: 0; overflow: hidden; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.ch-about-more, .ch-links-more { position: relative; flex: none; border: 0; background: none; padding: 0; color: var(--text); font-size: 13px;
+  font-weight: 600; cursor: pointer; }
+.ch-links-more { color: var(--muted); font-weight: 500; }
+.ch-about-more:hover, .ch-links-more:hover { text-decoration: underline; }
+.ch-about a { color: var(--link); }
+.ch-links { display: flex; align-items: center; gap: 7px; min-width: 0; margin: 0; font-size: 13px; line-height: 1.45; }
+.ch-links .icon { width: 14px; height: 14px; color: var(--muted); flex: none; }
+.ch-links a { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--link); }
+
+/* Scoped to [open]: a bare `display: flex` on a dialog beats the browser's own
+   "closed dialogs are hidden" rule, and the panel renders inline on page load. */
+.ch-about-dialog[open] { width: min(560px, calc(100vw - 32px)); max-height: min(86dvh, 780px);
+  display: flex; flex-direction: column; }
+.ch-about-dialog .fc-head { align-items: center; }
+.ch-about-dialog .fc-head h2 { margin: 0; font-size: 19px; font-weight: 650; letter-spacing: -.016em; overflow-wrap: anywhere; }
+.ch-about-dialog .fc-body { overflow-y: auto; padding: 4px 22px 22px; display: grid; gap: 0; }
+.ch-about-section { padding: 18px 0 0; }
+.ch-about-section h3 { margin: 0 0 10px; font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+.ch-about-text { color: var(--text); font-size: 14px; line-height: 1.5; white-space: pre-line;
+  overflow-wrap: anywhere; }
+.ch-about-text a { color: var(--link); }
+.ch-link-list, .ch-info-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
+.ch-link-list li, .ch-info-list li { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.ch-link-list .icon, .ch-info-list .icon { width: 20px; height: 20px; color: var(--muted); flex: none; }
+.ch-link-list div { min-width: 0; display: grid; gap: 1px; }
+.ch-link-name { font-size: 14px; font-weight: 550; }
+.ch-link-list a, .ch-info-list a { color: var(--link); font-size: 14px; overflow-wrap: anywhere; }
+.ch-info-list span { font-size: 14px; }
+.ch-actions { grid-area: actions; display: flex; align-items: center; gap: 8px; }
+.ch-menu { display: inline-flex; }
+.ch-menu .menu-panel { left: auto; right: 0; top: 40px; }
+
+.ch-tabs { display: flex; align-items: stretch; justify-content: space-between; gap: 28px; margin: 10px 0 0;
+  padding: 0 2px; border-bottom: 1px solid var(--border-soft); }
+.ch-tab-row { display: flex; align-items: center; gap: 28px; min-width: 0; overflow-x: auto;
+  scrollbar-width: none; }
+.ch-tab-row::-webkit-scrollbar { display: none; }
+.ch-tab { position: relative; flex: none; padding: 12px 0; color: var(--muted); font-size: 15px; font-weight: 550; letter-spacing: -.005em; }
+.ch-tab:hover { color: var(--text); }
+.ch-tab.active { color: var(--text); }
+.ch-tab.active::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: var(--text); }
+/* YouTube's channel search is a bare magnifier that grows into an underlined field.
+   The old pill drew a small outlined box floating in the middle of the tab row. */
+.ch-search { flex: none; display: flex; align-items: center; gap: 10px; align-self: center; }
+.ch-search-toggle { display: inline-flex; align-items: center; justify-content: center; width: max(34px, var(--hit)); height: max(34px, var(--hit));
+  padding: 0; border: 0; border-radius: 50%; background: none; color: var(--muted); cursor: pointer;
+  transition: background var(--dur-press) ease, color var(--dur-press) ease; }
+.ch-search-toggle:hover { background: var(--surface-2); color: var(--text); }
+.ch-search-toggle .icon { width: 20px; height: 20px; }
+.ch-search.is-open .ch-search-toggle { color: var(--text); }
+.ch-search input { width: 0; padding: 5px 0; border: 0; border-bottom: 1px solid transparent;
+  background: none; color: var(--text); font-size: 14px; outline: none; opacity: 0;
+  transition: width var(--dur-fade) ease, opacity var(--dur-press) ease; }
+.ch-search.is-open input { width: min(240px, 34vw); opacity: 1; border-bottom-color: var(--border); }
+.ch-search.is-open input:focus { border-bottom-color: var(--text); }
+.ch-search input:focus-visible { box-shadow: none; } /* The underline is the focus mark here. */
+.ch-search input::-webkit-search-cancel-button { filter: invert(.6); }
+
+.channel-main .video-grid { margin-top: 14px; }
+.ch-filters { display: flex; gap: 8px; margin: 14px 0 0; }
+.ch-chip { position: relative; flex: none; display: inline-flex; align-items: center; min-height: 34px; padding: 0 14px; border-radius: 999px;
+  background: var(--surface-2); color: var(--text); font-size: 13.5px; font-weight: 500; white-space: nowrap; }
+.ch-chip:hover { background: var(--surface-3); }
+.ch-chip.active { background: var(--text); color: var(--bg); }
+.ch-playlists { margin-top: 14px; }
+
+/* ---------- search ---------- */
+/* The header field is hidden at phone width, where this one takes over. */
+.search-page-form { display: none; }
+.search-head h1 { min-width: 0; overflow-wrap: anywhere; }
+.search-toolbar { display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; max-width: 1080px; margin-bottom: 16px; }
+.search-types { display: flex; gap: 8px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.search-types::-webkit-scrollbar { display: none; }
+.search-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+.search-note { max-width: 1080px; margin: 0 0 12px; color: var(--muted); font-size: 12.5px; line-height: 1.45; }
+.search-suggestions { display: flex; flex-wrap: wrap; gap: 8px; }
+.search-channels { display: grid; gap: 2px; max-width: 1080px; padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px solid var(--border-soft); }
+
+/* A pill that opens a menu of links. */
+.filter-menu { flex: none; }
+.filter-chip { gap: 4px; padding: 0 10px 0 14px; }
+.filter-chip .icon { width: 14px; height: 14px; color: var(--muted); }
+.filter-chip.active .icon { color: var(--on-bone); }
+.filter-menu[open] > .filter-chip:not(.active) { background: var(--surface-3); }
+.filter-menu .menu-panel { width: min(220px, calc(100vw - 24px)); top: 40px; right: 0; left: auto; }
+.filter-menu .menu-row { grid-template-columns: minmax(0, 1fr) auto; }
+.filter-menu .menu-icon { display: none; }
+
+/* A channel in search results. One Bone primary per view is the rule, and a results page
+   can hold twenty of these, so the pill sits at Graphite here. */
+.channel-result { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: center; padding: 8px; border-radius: 10px; }
+.channel-result:hover { background: var(--surface); }
+.channel-result[hidden] { display: none; }
+.channel-result-main { display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 14px; align-items: center; min-width: 0; }
+.channel-result .avatar, .channel-result-skeleton { width: 56px; height: 56px; font-size: 17px; }
+.channel-result-copy { min-width: 0; }
+.channel-result-copy h2 { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 14.5px; font-weight: 600; line-height: 1.35; letter-spacing: -.008em; }
+.channel-result-copy h2 span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.channel-result-copy h2 .verified { flex: none; width: 14px; height: 14px; color: var(--muted); }
+.channel-result-copy p { margin: 3px 0 0; overflow: hidden; color: var(--muted); font-size: 12.5px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.channel-result .watch-subscribe:not(.subscribed) { background: var(--surface-2); color: var(--text); font-weight: 550; }
+.channel-result .watch-subscribe:not(.subscribed):hover { background: var(--surface-3); filter: none; }
+
+/* ---------- touch ----------
+   The subscribe group is a real 44px on a coarse pointer, not an expanded hit area:
+   it is the one control on these pages people aim at with a thumb. */
+@media (pointer: coarse) {
+  :is(.ch-actions, .channel-result) :is(.watch-subscribe, .notify-trigger) { min-height: var(--hit); }
+  .ch-actions .pill-icon { width: var(--hit); height: var(--hit); min-height: var(--hit); }
+  .ch-about-more::after, .ch-links-more::after { content: ""; position: absolute; inset: -12px -6px; }
+  .ch-links a { padding-block: 12px; margin-block: -12px; }
+}
