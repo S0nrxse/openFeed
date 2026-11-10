@@ -302,7 +302,8 @@ class MigrationDatabaseTests(unittest.TestCase):
         before = self._catalog()
         snapshot = self._fetch("SELECT user_key, feed_id, created_at FROM user_subscriptions ORDER BY 1, 2")
         second = db.init_db()
-        self.assertEqual(second, {"renamed": [], "seeded_users": 0, "seeded_rows": 0, "stars_moved": 0})
+        self.assertEqual(second, {"renamed": [], "seeded_users": 0, "seeded_rows": 0, "stars_moved": 0,
+                                  "catalog_scope": {"shared": {"changed": False}}})
         self.assertEqual(self._catalog(), before)
         self.assertEqual(self._fetch("SELECT user_key, feed_id, created_at FROM user_subscriptions ORDER BY 1, 2"), snapshot)
 
